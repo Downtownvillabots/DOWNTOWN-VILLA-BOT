@@ -72,6 +72,8 @@ def has_permission(user_id, level="admin"):
 STORAGE_CHANNELS = [int(c) if c.isdigit() else c for c in environ.get('STORAGE_CHANNELS', '').split()]
 SEARCH_CHANNELS = [int(c) if c.isdigit() else c for c in environ.get('SEARCH_CHANNELS', '').split()]
 LOG_CHANNELS     = [int(c) if c.isdigit() else c for c in environ.get('LOG_CHANNELS', '').split()]
+# Backward compatibility: singular LOG_CHANNEL (first entry if exists)
+LOG_CHANNEL = LOG_CHANNELS[0] if LOG_CHANNELS else None
 BROADCAST_CHANNELS = [int(c) if c.isdigit() else c for c in environ.get('BROADCAST_CHANNELS', '').split()]
 FORCE_SUB_CHANNELS = [int(c) if c.isdigit() else c for c in environ.get('FORCE_SUB_CHANNELS', '').split()]
 UPDATE_CHANNELS  = [int(c) if c.isdigit() else c for c in environ.get('UPDATE_CHANNELS', '').split()]
