@@ -1,9 +1,8 @@
 import time
-from config import SESSION_TIMEOUT
 
 _sessions = {}
 
-def set_session(user_id, data, timeout=SESSION_TIMEOUT):
+def set_session(user_id, data, timeout=1800):
     data["created_at"] = time.time()
     data["timeout"] = timeout
     _sessions[user_id] = data
