@@ -1,4 +1,4 @@
-\"""
+"""
 Main entry point.
 
 Initialises the bot, loads plugins, starts the web server,
