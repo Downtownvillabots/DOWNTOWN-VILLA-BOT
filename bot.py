@@ -29,11 +29,11 @@ async def start_web_server():
     logger.info(f"Web server started on port {PORT}")
 
 # ------------------------------------------------------------
-# UNIVERSAL DEBUG HANDLER – logs EVERY update
+# UNIVERSAL DEBUG HANDLER – logs EVERY message and responds
 # ------------------------------------------------------------
 @downtownvilla.on_message(filters.private)
 async def debug_all_private(client, message: Message):
-    print(f"🔥 DEBUG: Got private message from {message.from_user.id}: {message.text if message.text else 'non-text'}")
+    print(f"🔥 GOT: {message.from_user.id} -> {message.text if message.text else 'non-text'}")
     if message.text == "/start":
         await message.reply_text(
             script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
@@ -44,7 +44,7 @@ async def debug_all_private(client, message: Message):
         await message.reply_text("I received your message! (Debug bot)")
 
 # ------------------------------------------------------------
-# Background task to print "still running" every 10 seconds
+# HEARTBEAT – prints every 10 seconds so we know it's alive
 # ------------------------------------------------------------
 async def heartbeat():
     while True:
@@ -71,7 +71,7 @@ async def main():
     logger.info(f"Bot started as {me.first_name} (Pyrogram v{__version__})")
     print(script.LOGO)
 
-    # Send startup message to owner
+    # Send startup notification to owner (optional)
     try:
         if OWNER_IDS:
             owner_id = OWNER_IDS[0]
@@ -79,7 +79,7 @@ async def main():
                 owner_id,
                 "✅ Bot is online. Debug mode enabled."
             )
-            print("✅ Sent startup PM to owner")
+            print("✅ Startup PM sent")
     except Exception as e:
         print(f"❌ Startup PM error: {e}")
 
