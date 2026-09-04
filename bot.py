@@ -2,7 +2,6 @@ import speed_boost
 
 import asyncio
 import logging
-import os
 
 from pyrogram import idle, __version__, filters
 from pyrogram.types import Message
@@ -29,23 +28,26 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server started on port {PORT}")
 
-# ---- DEBUG: /ping command (direct on client) ----
-@downtownvilla.on_message(filters.command("ping") & filters.private)
-async def ping_command(client, message: Message):
-    await message.reply_text("Pong! 🏓")
-    print(f"PING RECEIVED from {message.from_user.id}")
-
-# ---- DEBUG: /start command (fallback) ----
-@downtownvilla.on_message(filters.command("start") & filters.private)
-async def fallback_start(client, message: Message):
-    await message.reply_text(
-        script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
-        parse_mode="HTML"
-    )
-    print(f"START RECEIVED from {message.from_user.id}")
+# ------------------------------------------------------------
+# UNIVERSAL DEBUG HANDLER – logs every private message
+# ------------------------------------------------------------
+@downtownvilla.on_message(filters.private)
+async def debug_all_private(client: downtownvilla, message: Message):
+    print(f"🔥 DEBUG: Got private message from {message.from_user.id}: {message.text if message.text else 'non-text'}")
+    if message.text and message.text.startswith("/start"):
+        await message.reply_text(
+            script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
+            parse_mode="HTML"
+        )
+        print(f"✅ START RESPONDED to {message.from_user.id}")
+    elif message.text and message.text.startswith("/ping"):
+        await message.reply_text("Pong! 🏓")
+        print(f"✅ PING RESPONDED to {message.from_user.id}")
+    else:
+        await message.reply_text("I received your message! (This is a debug bot – features not added yet)")
 
 async def main():
-    print("DEBUG: bot.py is running")
+    print("🚀 DEBUG: bot.py started")
     validate_config()
     logger.info("Config validated ✅")
 
@@ -54,19 +56,19 @@ async def main():
     logger.info("Starting DOWNTOWN VILLA BOT...")
     await downtownvilla.start()
 
-    print("DEBUG: Client started – listening for updates")
+    print("✅ DEBUG: Client started – listening for updates")
 
-    # Send a startup message to owner (to confirm bot is alive)
+    # Send startup message to owner (to confirm bot is alive)
     try:
         if OWNER_IDS:
             owner_id = OWNER_IDS[0]
             await downtownvilla.send_message(
                 owner_id,
-                "✅ DOWNTOWN VILLA BOT is now online and running."
+                "✅ DOWNTOWN VILLA BOT is online. Debug mode enabled."
             )
-            print(f"DEBUG: Sent startup notification to owner {owner_id}")
+            print(f"✅ DEBUG: Sent startup notification to owner {owner_id}")
     except Exception as e:
-        print(f"DEBUG: Could not send startup notification: {e}")
+        print(f"❌ DEBUG: Could not send startup notification: {e}")
 
     me = await downtownvilla.get_me()
     temp.ME = me.id
