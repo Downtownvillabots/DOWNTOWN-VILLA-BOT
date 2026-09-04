@@ -10,4 +10,4 @@ async def start_command(client: Client, message: Message):
         script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
         parse_mode="HTML"
     )
-    print(f"PLUGIN START TRIGGERED by user {message.from_user.id}")
+    print(f"PLUGIN START TRIGGERED by {message.from_user.id}")
