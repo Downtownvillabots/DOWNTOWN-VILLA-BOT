@@ -5,6 +5,7 @@ Initialises the bot, loads plugins, starts the web server,
 and keeps the process running.
 """
 
+import bot.core.speed_boost  
 import asyncio
 import logging
 import sys
