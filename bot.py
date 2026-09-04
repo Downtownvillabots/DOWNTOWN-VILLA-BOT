@@ -2,12 +2,13 @@ import speed_boost
 
 import asyncio
 import logging
+import os
 
 from pyrogram import idle, __version__, filters
 from pyrogram.types import Message
 from aiohttp import web
 
-from config import validate_config, PORT, BOT_NAME
+from config import validate_config, PORT, BOT_NAME, OWNER_IDS
 from core.logging import setup_logging
 from downtownvilla.Bot import downtownvilla
 from utils import temp
@@ -28,16 +29,23 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server started on port {PORT}")
 
-# Fallback /start (in case plugin loading fails)
+# ---- DEBUG: /ping command (direct on client) ----
+@downtownvilla.on_message(filters.command("ping") & filters.private)
+async def ping_command(client, message: Message):
+    await message.reply_text("Pong! 🏓")
+    print(f"PING RECEIVED from {message.from_user.id}")
+
+# ---- DEBUG: /start command (fallback) ----
 @downtownvilla.on_message(filters.command("start") & filters.private)
 async def fallback_start(client, message: Message):
     await message.reply_text(
         script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
         parse_mode="HTML"
     )
-    print(f"Fallback Start triggered by user {message.from_user.id}")
+    print(f"START RECEIVED from {message.from_user.id}")
 
 async def main():
+    print("DEBUG: bot.py is running")
     validate_config()
     logger.info("Config validated ✅")
 
@@ -45,14 +53,20 @@ async def main():
 
     logger.info("Starting DOWNTOWN VILLA BOT...")
     await downtownvilla.start()
-    print("DEBUG: Bot is running, checking updates...")
 
-    # Explicitly load plugins (if they exist)
+    print("DEBUG: Client started – listening for updates")
+
+    # Send a startup message to owner (to confirm bot is alive)
     try:
-        await downtownvilla.load_plugins()
-        print("Plugins loaded successfully")
+        if OWNER_IDS:
+            owner_id = OWNER_IDS[0]
+            await downtownvilla.send_message(
+                owner_id,
+                "✅ DOWNTOWN VILLA BOT is now online and running."
+            )
+            print(f"DEBUG: Sent startup notification to owner {owner_id}")
     except Exception as e:
-        print(f"Plugin loading error: {e}")
+        print(f"DEBUG: Could not send startup notification: {e}")
 
     me = await downtownvilla.get_me()
     temp.ME = me.id
