@@ -17,6 +17,12 @@ BOT_NAME = environ.get("BOT_NAME", "DOWNTOWN VILLA")
 BOT_LINK = environ.get("BOT_LINK", "https://t.me/DownTownVillaBot")
 
 # ============================
+# Performance (safe for Render)
+# ============================
+WORKERS = int(environ.get("WORKERS", "4"))
+PORT = int(environ.get("PORT", "8080"))
+
+# ============================
 # Computer Storage (OPTIONAL – for future features)
 # This will be used later when you add database-dependent features.
 # Set it in Render as COMPUTER_STORAGE (or any name you prefer).
