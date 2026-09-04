@@ -7,6 +7,7 @@ and keeps the process running forever.
 
 import asyncio
 import logging
+import re
 import sys
 
 # Optional speed: uvloop
@@ -53,6 +54,12 @@ async def start_web_server() -> None:
     logging.getLogger("web").info(f"Web server started on {Config.HOST}:{Config.PORT}")
 
 
+def get_flood_wait(error_message: str) -> int:
+    """Parse the wait time from a FLOOD_WAIT error message."""
+    match = re.search(r"wait of (\d+) seconds", error_message)
+    return int(match.group(1)) if match else 60  # fallback to 60 seconds
+
+
 async def main() -> None:
     """Main async routine."""
     global app
@@ -79,7 +86,7 @@ async def main() -> None:
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workers=Config.WORKERS,
-        workdir="/tmp",  # ⬅️ prevents read-only filesystem errors
+        workdir="/tmp",  # prevents read‑only filesystem errors
     )
 
     # Load plugins
@@ -92,28 +99,34 @@ async def main() -> None:
     # Start heartbeat task
     heartbeat_task = asyncio.create_task(heartbeat())
 
-    # Main client loop with automatic restart
+    # Main client loop with proper FLOOD_WAIT handling
     logger.info("Starting Telegram client...")
     while True:
         try:
             await app.start()
-            # Wait forever (or until client is stopped by a signal)
+            # Wait forever (or until the client is stopped)
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             logger.info("Stopping bot...")
             break
         except Exception as e:
-            logger.error(f"Client error: {e}. Restarting in 5 seconds...")
-            await asyncio.sleep(5)
-        finally:
-            # Clean up tasks before restart
-            heartbeat_task.cancel()
+            error_message = str(e)
+            if "FLOOD_WAIT" in error_message:
+                wait_seconds = get_flood_wait(error_message)
+                logger.error(f"FLOOD_WAIT – waiting {wait_seconds} seconds before retry...")
+                await asyncio.sleep(wait_seconds + 5)  # add a small buffer
+            else:
+                logger.error(f"Client error: {error_message}. Restarting in 10 seconds...")
+                await asyncio.sleep(10)
+            # Attempt to stop the client before restarting (ignore errors)
             try:
                 await app.stop()
             except Exception:
                 pass
-            # Recreate heartbeat task for next run
+            # Recreate heartbeat task (may already be running – cancel and restart)
+            heartbeat_task.cancel()
             heartbeat_task = asyncio.create_task(heartbeat())
+            continue
 
     # Final cleanup (only on KeyboardInterrupt)
     heartbeat_task.cancel()
