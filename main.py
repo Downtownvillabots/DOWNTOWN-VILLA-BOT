@@ -72,13 +72,14 @@ async def main() -> None:
     else:
         logger.info("Database not configured; running without storage.")
 
-    # Create Pyrogram client
+    # Create Pyrogram client (session file in /tmp)
     app = Client(
         "my_bot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workers=Config.WORKERS,
+        workdir="/tmp",  # ⬅️ prevents read-only filesystem errors
     )
 
     # Load plugins
@@ -91,17 +92,33 @@ async def main() -> None:
     # Start heartbeat task
     heartbeat_task = asyncio.create_task(heartbeat())
 
+    # Main client loop with automatic restart
     logger.info("Starting Telegram client...")
-    try:
-        await app.start()
-        await asyncio.Event().wait()   # ⬅️ blocks forever – keeps bot alive
-    except KeyboardInterrupt:
-        logger.info("Stopping bot...")
-    finally:
-        heartbeat_task.cancel()
-        await database.close()
-        await app.stop()
+    while True:
+        try:
+            await app.start()
+            # Wait forever (or until client is stopped by a signal)
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+            break
+        except Exception as e:
+            logger.error(f"Client error: {e}. Restarting in 5 seconds...")
+            await asyncio.sleep(5)
+        finally:
+            # Clean up tasks before restart
+            heartbeat_task.cancel()
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            # Recreate heartbeat task for next run
+            heartbeat_task = asyncio.create_task(heartbeat())
 
+    # Final cleanup (only on KeyboardInterrupt)
+    heartbeat_task.cancel()
+    await database.close()
+    await app.stop()
     logger.info("Bot stopped.")
 
 
@@ -111,4 +128,3 @@ if __name__ == "__main__":
     except Exception as e:
         logging.getLogger("main").error(f"Fatal error: {e}")
         sys.exit(1)
-        
