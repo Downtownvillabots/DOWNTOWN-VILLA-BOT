@@ -29,25 +29,30 @@ async def start_web_server():
     logger.info(f"Web server started on port {PORT}")
 
 # ------------------------------------------------------------
-# UNIVERSAL DEBUG HANDLER – logs every private message
+# UNIVERSAL DEBUG HANDLER – logs EVERY update
 # ------------------------------------------------------------
 @downtownvilla.on_message(filters.private)
-async def debug_all_private(client: downtownvilla, message: Message):
+async def debug_all_private(client, message: Message):
     print(f"🔥 DEBUG: Got private message from {message.from_user.id}: {message.text if message.text else 'non-text'}")
-    if message.text and message.text.startswith("/start"):
+    if message.text == "/start":
         await message.reply_text(
             script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
             parse_mode="HTML"
         )
-        print(f"✅ START RESPONDED to {message.from_user.id}")
-    elif message.text and message.text.startswith("/ping"):
-        await message.reply_text("Pong! 🏓")
-        print(f"✅ PING RESPONDED to {message.from_user.id}")
+        print("✅ START RESPONDED")
     else:
-        await message.reply_text("I received your message! (This is a debug bot – features not added yet)")
+        await message.reply_text("I received your message! (Debug bot)")
+
+# ------------------------------------------------------------
+# Background task to print "still running" every 10 seconds
+# ------------------------------------------------------------
+async def heartbeat():
+    while True:
+        print("💓 Bot is alive, waiting for updates...")
+        await asyncio.sleep(10)
 
 async def main():
-    print("🚀 DEBUG: bot.py started")
+    print("🚀 bot.py started")
     validate_config()
     logger.info("Config validated ✅")
 
@@ -56,19 +61,8 @@ async def main():
     logger.info("Starting DOWNTOWN VILLA BOT...")
     await downtownvilla.start()
 
-    print("✅ DEBUG: Client started – listening for updates")
-
-    # Send startup message to owner (to confirm bot is alive)
-    try:
-        if OWNER_IDS:
-            owner_id = OWNER_IDS[0]
-            await downtownvilla.send_message(
-                owner_id,
-                "✅ DOWNTOWN VILLA BOT is online. Debug mode enabled."
-            )
-            print(f"✅ DEBUG: Sent startup notification to owner {owner_id}")
-    except Exception as e:
-        print(f"❌ DEBUG: Could not send startup notification: {e}")
+    # Start heartbeat
+    asyncio.create_task(heartbeat())
 
     me = await downtownvilla.get_me()
     temp.ME = me.id
@@ -76,6 +70,18 @@ async def main():
     temp.B_NAME = me.first_name
     logger.info(f"Bot started as {me.first_name} (Pyrogram v{__version__})")
     print(script.LOGO)
+
+    # Send startup message to owner
+    try:
+        if OWNER_IDS:
+            owner_id = OWNER_IDS[0]
+            await downtownvilla.send_message(
+                owner_id,
+                "✅ Bot is online. Debug mode enabled."
+            )
+            print("✅ Sent startup PM to owner")
+    except Exception as e:
+        print(f"❌ Startup PM error: {e}")
 
     await idle()
 
