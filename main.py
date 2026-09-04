@@ -1,11 +1,10 @@
-"""
+\"""
 Main entry point.
 
 Initialises the bot, loads plugins, starts the web server,
-and keeps the process running.
+and keeps the process running forever.
 """
 
-import bot.core.speed_boost  
 import asyncio
 import logging
 import sys
@@ -45,7 +44,7 @@ async def start_web_server() -> None:
 
     web_app = web.Application()
     web_app.router.add_get("/", handle)
-    web_app.router.add_get("/health", handle)  # optional
+    web_app.router.add_get("/health", handle)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -80,8 +79,6 @@ async def main() -> None:
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workers=Config.WORKERS,
-        # Speed: use tgcrypto if installed
-        # Pyrogram auto‑detects and uses tgcrypto when available.
     )
 
     # Load plugins
@@ -96,13 +93,11 @@ async def main() -> None:
 
     logger.info("Starting Telegram client...")
     try:
-        # run until disconnected
         await app.start()
-        await app.idle()
+        await asyncio.Event().wait()   # ⬅️ blocks forever – keeps bot alive
     except KeyboardInterrupt:
         logger.info("Stopping bot...")
     finally:
-        # Cleanup
         heartbeat_task.cancel()
         await database.close()
         await app.stop()
@@ -114,6 +109,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        # Catch all to keep the process alive (Render requirement)
         logging.getLogger("main").error(f"Fatal error: {e}")
         sys.exit(1)
+        
