@@ -39,13 +39,6 @@ async def start_web_server():
 # ------------------------------------------------------------
 # Basic /start command
 # ------------------------------------------------------------
-@downtownvilla.on_message(filters.command("start") & filters.private)
-async def start_command(client, message: Message):
-    await message.reply_text(
-        script.START_TEXT.format(message.from_user.first_name, BOT_NAME),
-        parse_mode="HTML"
-    )
-    logger.info("User %s started", message.from_user.id)
 
 # ------------------------------------------------------------
 # Main
