@@ -98,6 +98,7 @@ async def main() -> None:
     try:
         # run until disconnected
         await app.start()
+        await app.idle()
     except KeyboardInterrupt:
         logger.info("Stopping bot...")
     finally:
