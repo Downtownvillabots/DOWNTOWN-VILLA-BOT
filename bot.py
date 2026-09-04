@@ -45,6 +45,7 @@ async def main():
 
     logger.info("Starting DOWNTOWN VILLA BOT...")
     await downtownvilla.start()
+    print("DEBUG: Bot is running, checking updates...")
 
     # Explicitly load plugins (if they exist)
     try:
