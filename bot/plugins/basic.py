@@ -2,26 +2,20 @@
 Basic plugin to prove the engine works.
 
 Handles /start in private chats and logs all private messages.
-This can be replaced or extended later by other plugins.
 """
 
-import logging  # Added for proper logging
+import logging
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from bot.config import Config
-from bot.core.helpers import human_readable_size  # not used here, but imported as example
-
-logger = logging.getLogger(__name__)  # Added
+logger = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "Hello {first_name}! I am {bot_name}.\n"
     "Engine is running."
 )
 
-
-# Register handlers using the decorator style
 def setup(app: Client) -> None:
     """Register the message handlers."""
 
@@ -37,11 +31,10 @@ def setup(app: Client) -> None:
 
     @app.on_message(filters.private & ~filters.command("start"))
     async def log_private(client: Client, message: Message):
-        """Log every private message for debugging (will be removed later)."""
+        """Log every private message for debugging."""
         logger.info(
             "Private message from %s (id=%d): %s",
             message.from_user.first_name,
             message.from_user.id,
             message.text or "[non-text]",
         )
-        # You could add more logic here later
