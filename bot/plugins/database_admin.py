@@ -19,12 +19,10 @@ from bot.core.helpers import human_readable_size
 
 logger = logging.getLogger("plugins.database_admin")
 
-# Global references (set during setup)
+# Global references
 manager: DatabaseManager = None
 registry: DatabaseRegistry = None
 analytics: DatabaseAnalytics = None
-
-# --- Handler functions (defined at module level so they can be added later) ---
 
 async def database_command(client: Client, message: Message):
     """Handle /database command."""
@@ -63,30 +61,12 @@ async def database_callback(client: Client, callback_query: CallbackQuery):
     elif action == "totals":
         await show_totals(client, callback_query, edit=True)
 
-
+# Setup function (empty – we'll register handlers in main.py)
 def setup(app: Client):
-    """Register handlers explicitly."""
-    global manager, registry, analytics
-
-    logger.info("Setting up database_admin plugin...")
-
-    from bot.database import db_manager, db_registry, db_analytics
-    manager = db_manager
-    registry = db_registry
-    analytics = db_analytics
-
-    # Explicitly add the message handler
-    app.add_handler(MessageHandler(database_command, filters.text))
-    logger.info("Added MessageHandler for /database")
-
-    # Explicitly add the callback handler
-    app.add_handler(CallbackQueryHandler(database_callback, filters.regex(r"^db:")))
-    logger.info("Added CallbackQueryHandler for db:*")
-
-    logger.info("Setup completed for database_admin plugin")
+    pass
 
 # ------------------------------------------------------------------
-# Helper functions (UI rendering)
+# Helper functions (UI rendering) – SAME as before
 # ------------------------------------------------------------------
 async def show_overview(client, message_or_query, edit=False):
     """Display the main control center."""
