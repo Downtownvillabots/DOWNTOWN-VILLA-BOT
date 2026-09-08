@@ -8,6 +8,7 @@ Only privileged users (owner/admin/sudo) can access.
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 from bot.config import Config
 from bot.core.permissions import Permissions
@@ -23,8 +24,48 @@ manager: DatabaseManager = None
 registry: DatabaseRegistry = None
 analytics: DatabaseAnalytics = None
 
+# --- Handler functions (defined at module level so they can be added later) ---
+
+async def database_command(client: Client, message: Message):
+    """Handle /database command."""
+    logger.info("database_admin handler triggered for message: %s", message.text)
+    if not message.text or not message.text.lower().startswith("/database"):
+        return
+    logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
+    if not Permissions.is_privileged(message.from_user.id):
+        logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
+        await message.reply_text("❌ You do not have permission to access this.")
+        return
+    logger.info("User %d is privileged. Showing database overview.", message.from_user.id)
+    try:
+        await show_overview(client, message)
+    except Exception as e:
+        logger.error("Database command failed: %s", e)
+        await message.reply_text("⚠️ An error occurred while fetching database info.")
+
+async def database_callback(client: Client, callback_query: CallbackQuery):
+    """Handle inline button presses."""
+    data = callback_query.data
+    user_id = callback_query.from_user.id
+    if not Permissions.is_privileged(user_id):
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+
+    parts = data.split(":")
+    action = parts[1]
+    if action == "refresh":
+        await refresh_data(client, callback_query)
+    elif action == "view":
+        key = parts[2]
+        await show_database_detail(client, callback_query, key)
+    elif action == "back":
+        await show_overview(client, callback_query, edit=True)
+    elif action == "totals":
+        await show_totals(client, callback_query, edit=True)
+
+
 def setup(app: Client):
-    """Register the /database command and callback handlers."""
+    """Register handlers explicitly."""
     global manager, registry, analytics
 
     logger.info("Setting up database_admin plugin...")
@@ -34,48 +75,18 @@ def setup(app: Client):
     registry = db_registry
     analytics = db_analytics
 
-    # No filter – catch everything, then check manually
-    @app.on_message()
-    async def database_command(client: Client, message: Message):
-        logger.info("database_admin handler triggered for message: %s", message.text)
-        # Check if it's /database
-        if not message.text or not message.text.lower().startswith("/database"):
-            return
-        logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
-        if not Permissions.is_privileged(message.from_user.id):
-            logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
-            await message.reply_text("❌ You do not have permission to access this.")
-            return
-        logger.info("User %d is privileged. Showing database overview.", message.from_user.id)
-        try:
-            await show_overview(client, message)
-        except Exception as e:
-            logger.error("Database command failed: %s", e)
-            await message.reply_text("⚠️ An error occurred while fetching database info.")
+    # Explicitly add the message handler
+    app.add_handler(MessageHandler(database_command, filters.text))
+    logger.info("Added MessageHandler for /database")
 
-    # Callback handler for buttons (unchanged)
-    @app.on_callback_query(filters.regex(r"^db:"))
-    async def database_callback(client: Client, callback_query: CallbackQuery):
-        data = callback_query.data
-        user_id = callback_query.from_user.id
-        if not Permissions.is_privileged(user_id):
-            await callback_query.answer("❌ Access denied.", show_alert=True)
-            return
+    # Explicitly add the callback handler
+    app.add_handler(CallbackQueryHandler(database_callback, filters.regex(r"^db:")))
+    logger.info("Added CallbackQueryHandler for db:*")
 
-        parts = data.split(":")
-        action = parts[1]
-        if action == "refresh":
-            await refresh_data(client, callback_query)
-        elif action == "view":
-            key = parts[2]
-            await show_database_detail(client, callback_query, key)
-        elif action == "back":
-            await show_overview(client, callback_query, edit=True)
-        elif action == "totals":
-            await show_totals(client, callback_query, edit=True)
+    logger.info("Setup completed for database_admin plugin")
 
 # ------------------------------------------------------------------
-# Helper functions (same as before)
+# Helper functions (UI rendering)
 # ------------------------------------------------------------------
 async def show_overview(client, message_or_query, edit=False):
     """Display the main control center."""
