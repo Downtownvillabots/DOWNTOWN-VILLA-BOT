@@ -27,14 +27,15 @@ def setup(app: Client):
     """Register the /database command and callback handlers."""
     global manager, registry, analytics
 
-    # Initialize the database system (should already be done in main.py, but ensure)
-    # For simplicity, we assume they are set elsewhere. We'll import from a central location.
+    logger.info("Setting up database_admin plugin...")
+
+    # Import singletons from bot.database (already initialized in main.py)
     from bot.database import db_manager, db_registry, db_analytics
     manager = db_manager
     registry = db_registry
     analytics = db_analytics
 
-    @app.on_message(filters.command("database") & filters.private)
+    @app.on_message(filters.command("database"))
     async def database_command(client: Client, message: Message):
         """Show the database control center."""
         logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
