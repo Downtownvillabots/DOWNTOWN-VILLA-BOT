@@ -28,6 +28,13 @@ class DatabaseManager:
         self._databases: Dict[str, Any] = {}    # db_key -> (client, db_name)
         self._lock = asyncio.Lock()             # prevent race conditions
 
+    async def initialize(self):
+        """
+        Prepare the manager for use.
+        Currently a no-op but keeps the API consistent for future setup.
+        """
+        logger.debug("DatabaseManager initialized.")
+
     def _get_client(self, uri: str):
         """
         Get or create a Motor client for the given URI.
