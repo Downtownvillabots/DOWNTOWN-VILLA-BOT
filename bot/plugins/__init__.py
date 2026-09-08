@@ -8,8 +8,10 @@ Each plugin can register handlers using the @app.on_message decorator.
 import importlib
 import inspect
 import pkgutil
+import logging
 from typing import List
 
+logger = logging.getLogger("plugins.loader")
 
 def load_plugins(app) -> List[str]:
     """
@@ -21,10 +23,18 @@ def load_plugins(app) -> List[str]:
 
     for module_info in pkgutil.iter_modules(package_path):
         module_name = f"{__name__}.{module_info.name}"
-        module = importlib.import_module(module_name)
-        # Optional: call a setup function if defined
-        if hasattr(module, "setup"):
-            module.setup(app)
-        imported.append(module_name)
+        try:
+            module = importlib.import_module(module_name)
+            # Call setup function if defined, and log it
+            if hasattr(module, "setup"):
+                logger.info("Calling setup for %s", module_name)
+                module.setup(app)
+                logger.info("Setup completed for %s", module_name)
+            else:
+                logger.warning("Module %s has no setup function.", module_name)
+            imported.append(module_name)
+        except Exception as e:
+            logger.exception("Failed to load plugin %s: %s", module_name, e)
+            raise  # or continue? Better to crash so we know.
 
     return imported
