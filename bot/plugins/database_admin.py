@@ -37,15 +37,17 @@ def setup(app: Client):
     @app.on_message(filters.command("database") & filters.private)
     async def database_command(client: Client, message: Message):
         """Show the database control center."""
-        if not Permissions.is_privileged(message.from_user.id):
-            await message.reply_text("❌ You do not have permission to access this.")
-            return
-        try:
-            await show_overview(client, message)
-        except Exception as e:
-            logger.error("Database command failed: %s", e)
-            await message.reply_text("⚠️ An error occurred while fetching database info.")
-
+    logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
+    if not Permissions.is_privileged(message.from_user.id):
+        logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
+        await message.reply_text("❌ You do not have permission to access this.")
+        return
+    logger.info("User %d is privileged. Showing database overview.", message.from_user.id)
+    try:
+        await show_overview(client, message)
+    except Exception as e:
+        logger.error("Database command failed: %s", e)
+        await message.reply_text("⚠️ An error occurred while fetching database info.")
     @app.on_callback_query(filters.regex(r"^db:"))
     async def database_callback(client: Client, callback_query: CallbackQuery):
         """Handle button presses."""
