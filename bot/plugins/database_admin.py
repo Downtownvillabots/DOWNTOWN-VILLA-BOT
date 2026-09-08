@@ -35,21 +35,20 @@ def setup(app: Client):
     analytics = db_analytics
 
     @app.on_message(filters.command("database") & filters.private)
-async def database_command(client: Client, message: Message):
-    """Show the database control center."""
-    logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
-    if not Permissions.is_privileged(message.from_user.id):
-        logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
-        await message.reply_text("❌ You do not have permission to access this.")
-        return
-    logger.info("User %d is privileged. Showing database overview.", message.from_user.id)
-    try:
-        await show_overview(client, message)
-    except Exception as e:
-        logger.error("Database command failed: %s", e)
-        await message.reply_text("⚠️ An error occurred while fetching database info.")
+    async def database_command(client: Client, message: Message):
+        """Show the database control center."""
+        logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
+        if not Permissions.is_privileged(message.from_user.id):
+            logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
+            await message.reply_text("❌ You do not have permission to access this.")
+            return
+        logger.info("User %d is privileged. Showing database overview.", message.from_user.id)
+        try:
+            await show_overview(client, message)
+        except Exception as e:
+            logger.error("Database command failed: %s", e)
+            await message.reply_text("⚠️ An error occurred while fetching database info.")
 
-    
     @app.on_callback_query(filters.regex(r"^db:"))
     async def database_callback(client: Client, callback_query: CallbackQuery):
         """Handle button presses."""
@@ -71,6 +70,7 @@ async def database_command(client: Client, message: Message):
             await show_overview(client, callback_query, edit=True)
         elif action == "totals":
             await show_totals(client, callback_query, edit=True)
+
 
 # Helper functions
 async def show_overview(client, message_or_query, edit=False):
@@ -121,6 +121,7 @@ async def show_overview(client, message_or_query, edit=False):
     else:
         await message_or_query.reply_text(text, reply_markup=reply_markup)
 
+
 async def show_database_detail(client, callback_query, key):
     """Show details for a specific database."""
     info = registry.get_info(key)
@@ -151,6 +152,7 @@ async def show_database_detail(client, callback_query, key):
 
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
+
 async def show_totals(client, callback_query, edit=True):
     """Show aggregated totals."""
     totals = await analytics.get_total_stats()
@@ -178,6 +180,7 @@ async def show_totals(client, callback_query, edit=True):
 
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data="db:back")]]
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
 
 async def refresh_data(client, callback_query):
     """Re-fetch stats and update UI."""
