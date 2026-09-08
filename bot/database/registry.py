@@ -1,3 +1,4 @@
+# bot/database/registry.py
 """
 Database registry.
 
@@ -6,6 +7,7 @@ assigns friendly IDs (e.g., SYSTEM-DB, USER-DB-01, FILE-DB-02),
 and tracks their status.
 """
 
+import asyncio  # <-- ADDED THIS LINE
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
