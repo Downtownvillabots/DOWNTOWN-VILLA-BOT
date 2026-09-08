@@ -34,10 +34,11 @@ def setup(app: Client):
     registry = db_registry
     analytics = db_analytics
 
-    # Use a direct text check – guaranteed to match /database in any chat
-    @app.on_message(filters.text)
+    # No filter – catch everything, then check manually
+    @app.on_message()
     async def database_command(client: Client, message: Message):
-        # Check if the message starts with /database (case-insensitive)
+        logger.info("database_admin handler triggered for message: %s", message.text)
+        # Check if it's /database
         if not message.text or not message.text.lower().startswith("/database"):
             return
         logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
