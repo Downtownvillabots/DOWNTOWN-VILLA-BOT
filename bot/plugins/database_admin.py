@@ -27,17 +27,19 @@ def setup(app: Client):
     """Register the /database command and callback handlers."""
     global manager, registry, analytics
 
-    logger.info("Setting up database_admin plugin...")  # This will show in logs!
+    logger.info("Setting up database_admin plugin...")
 
-    # Import singletons from bot.database (already initialized in main.py)
     from bot.database import db_manager, db_registry, db_analytics
     manager = db_manager
     registry = db_registry
     analytics = db_analytics
 
-    @app.on_message(filters.command("database"))
+    # Use a direct text check – guaranteed to match /database in any chat
+    @app.on_message(filters.text)
     async def database_command(client: Client, message: Message):
-        """Show the database control center."""
+        # Check if the message starts with /database (case-insensitive)
+        if not message.text or not message.text.lower().startswith("/database"):
+            return
         logger.info("Received /database from user %s (id=%d)", message.from_user.first_name, message.from_user.id)
         if not Permissions.is_privileged(message.from_user.id):
             logger.warning("User %d tried /database but lacks permission.", message.from_user.id)
@@ -50,16 +52,15 @@ def setup(app: Client):
             logger.error("Database command failed: %s", e)
             await message.reply_text("⚠️ An error occurred while fetching database info.")
 
+    # Callback handler for buttons (unchanged)
     @app.on_callback_query(filters.regex(r"^db:"))
     async def database_callback(client: Client, callback_query: CallbackQuery):
-        """Handle button presses."""
         data = callback_query.data
         user_id = callback_query.from_user.id
         if not Permissions.is_privileged(user_id):
             await callback_query.answer("❌ Access denied.", show_alert=True)
             return
 
-        # Parse action
         parts = data.split(":")
         action = parts[1]
         if action == "refresh":
@@ -72,10 +73,11 @@ def setup(app: Client):
         elif action == "totals":
             await show_totals(client, callback_query, edit=True)
 
-# Helper functions
+# ------------------------------------------------------------------
+# Helper functions (same as before)
+# ------------------------------------------------------------------
 async def show_overview(client, message_or_query, edit=False):
     """Display the main control center."""
-    # Gather stats
     totals = await analytics.get_total_stats()
     user_totals = await analytics.get_total_stats("user")
     file_totals = await analytics.get_total_stats("file")
@@ -100,7 +102,6 @@ async def show_overview(client, message_or_query, edit=False):
         "Choose a database for details:"
     )
 
-    # Buttons list
     buttons = []
     for info in registry.get_all():
         buttons.append([InlineKeyboardButton(
@@ -108,7 +109,6 @@ async def show_overview(client, message_or_query, edit=False):
             callback_data=f"db:view:{info.key}"
         )])
 
-    # Navigation buttons
     nav_buttons = [
         [InlineKeyboardButton("🔄 Refresh", callback_data="db:refresh"),
          InlineKeyboardButton("📊 Totals", callback_data="db:totals")]
@@ -143,7 +143,6 @@ async def show_database_detail(client, callback_query, key):
         f"Avg object size: {human_readable_size(stats.get('avg_object_size', 0))}\n"
     )
 
-    # Buttons
     buttons = [
         [InlineKeyboardButton("⬅️ Back", callback_data="db:back"),
          InlineKeyboardButton("🔄 Refresh", callback_data=f"db:refresh")]
