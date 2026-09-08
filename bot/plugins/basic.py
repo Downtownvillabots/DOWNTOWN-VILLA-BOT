@@ -5,7 +5,7 @@ Handles /start in private chats and logs all private messages.
 This can be replaced or extended later by other plugins.
 """
 
-import logging  # <-- ADD THIS IMPORT
+import logging  # Added for proper logging
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -13,7 +13,7 @@ from pyrogram.types import Message
 from bot.config import Config
 from bot.core.helpers import human_readable_size  # not used here, but imported as example
 
-logger = logging.getLogger(__name__)  # <-- ADD THIS
+logger = logging.getLogger(__name__)  # Added
 
 HELP_TEXT = (
     "Hello {first_name}! I am {bot_name}.\n"
@@ -38,7 +38,6 @@ def setup(app: Client) -> None:
     @app.on_message(filters.private & ~filters.command("start"))
     async def log_private(client: Client, message: Message):
         """Log every private message for debugging (will be removed later)."""
-        # Use the module logger (not app.logger)
         logger.info(
             "Private message from %s (id=%d): %s",
             message.from_user.first_name,
