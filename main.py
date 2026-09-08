@@ -24,6 +24,10 @@ from bot.core.logging import setup_logging
 from bot.core.database import database
 from bot.plugins import load_plugins
 
+# NEW: Database system imports
+from bot.database import db_manager, db_registry, db_analytics
+from bot.database.health import HealthMonitor
+
 # Global app reference
 app = None
 
@@ -72,12 +76,19 @@ async def main() -> None:
     logger = logging.getLogger("main")
     logger.info("Starting Telegram bot engine...")
 
-    # Optional database connection (lazy)
+    # Optional legacy database connection (keep for backward compatibility)
     await database.connect()
     if database.is_connected:
-        logger.info("Database connection established.")
+        logger.info("Legacy database connection established.")
     else:
-        logger.info("Database not configured; running without storage.")
+        logger.info("Legacy database not configured; running without storage.")
+
+    # Initialize new database system (if any URIs are configured)
+    await db_manager.initialize()   # we'll add initialize() method to manager
+    await db_registry.discover()
+    await db_registry.update_all_stats()
+    health_monitor = HealthMonitor(db_manager, db_registry)
+    await health_monitor.start()
 
     # Create Pyrogram client (session file in /tmp)
     app = Client(
@@ -130,6 +141,8 @@ async def main() -> None:
 
     # Final cleanup (only on KeyboardInterrupt)
     heartbeat_task.cancel()
+    await health_monitor.stop()
+    await db_manager.close_all()
     await database.close()
     await app.stop()
     logger.info("Bot stopped.")
