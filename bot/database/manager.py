@@ -18,7 +18,7 @@ from bot.database.exceptions import DatabaseConnectionError
 logger = logging.getLogger("database.manager")
 
 # Default database name if not specified in URI
-DEFAULT_DB_NAME = "DOWNTOWN VILLA DATABASE"
+DEFAULT_DB_NAME = "DOWNTOWN-VILLA-DATABASE"
 
 class DatabaseManager:
     """
