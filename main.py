@@ -1,16 +1,11 @@
 """
 Main entry point.
-
-Initialises the bot, loads plugins, starts the web server,
-and keeps the process running forever.
 """
-
 import asyncio
 import logging
 import re
 import sys
 
-# Optional speed: uvloop
 try:
     import uvloop
     uvloop.install()
@@ -18,117 +13,127 @@ except ImportError:
     pass
 
 from pyrogram import Client, filters
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 from bot.config import Config, validate_required
 from bot.core.logging import setup_logging
 from bot.core.database import database
 from bot.plugins import load_plugins
+from bot.core.helpers import human_readable_size
+from bot.core.permissions import Permissions
 
-# NEW: Database system imports
+# Database imports
 from bot.database import db_manager, db_registry, db_analytics
 from bot.database.health import HealthMonitor
 
-# Global app reference
+# Import UI helpers from database_admin plugin
+from bot.plugins.database_admin import show_overview, show_database_detail, show_totals, refresh_data, set_globals
+
+# Set globals
+set_globals(db_manager, db_registry, db_analytics)
+
 app = None
+logger = logging.getLogger("main")
 
-
-async def heartbeat() -> None:
-    """Print a heartbeat message every HEARTBEAT_INTERVAL seconds."""
-    interval = Config.HEARTBEAT_INTERVAL
+async def heartbeat():
     while True:
         logging.getLogger("heartbeat").info("Bot is alive.")
-        await asyncio.sleep(interval)
+        await asyncio.sleep(Config.HEARTBEAT_INTERVAL)
 
-
-async def start_web_server() -> None:
-    """Start a minimal aiohttp web server on the assigned port."""
+async def start_web_server():
     from aiohttp import web
-
     async def handle(request):
         return web.Response(text="OK")
-
     web_app = web.Application()
     web_app.router.add_get("/", handle)
     web_app.router.add_get("/health", handle)
-
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, host=Config.HOST, port=Config.PORT)
     await site.start()
     logging.getLogger("web").info(f"Web server started on {Config.HOST}:{Config.PORT}")
 
-
 def get_flood_wait(error_message: str) -> int:
-    """Parse the wait time from a FLOOD_WAIT error message."""
     match = re.search(r"wait of (\d+) seconds", error_message)
-    return int(match.group(1)) if match else 60  # fallback to 60 seconds
+    return int(match.group(1)) if match else 60
 
+# Direct handler for /database
+async def database_command_handler(client: Client, message: Message):
+    logger.info("database_command_handler triggered: %s", message.text)
+    if not message.text or not message.text.lower().startswith("/database"):
+        return
+    logger.info("Received /database from %s (id=%d)", message.from_user.first_name, message.from_user.id)
+    if not Permissions.is_privileged(message.from_user.id):
+        logger.warning("User %d lacks permission", message.from_user.id)
+        await message.reply_text("❌ You do not have permission.")
+        return
+    await show_overview(client, message)
 
-async def main() -> None:
-    """Main async routine."""
+# Direct handler for callbacks
+async def database_callback_handler(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    user_id = callback_query.from_user.id
+    if not Permissions.is_privileged(user_id):
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    parts = data.split(":")
+    action = parts[1]
+    if action == "refresh":
+        await refresh_data(client, callback_query)
+    elif action == "view":
+        key = parts[2]
+        await show_database_detail(client, callback_query, key)
+    elif action == "back":
+        await show_overview(client, callback_query, edit=True)
+    elif action == "totals":
+        await show_totals(client, callback_query, edit=True)
+
+async def main():
     global app
-
-    # Validate required config
     validate_required()
-
-    # Setup logging
     setup_logging()
-    logger = logging.getLogger("main")
     logger.info("Starting Telegram bot engine...")
 
-    # Optional legacy database connection (keep for backward compatibility)
+    # Legacy database
     await database.connect()
     if database.is_connected:
         logger.info("Legacy database connection established.")
     else:
         logger.info("Legacy database not configured; running without storage.")
 
-    # Initialize new database system (if any URIs are configured)
-    await db_manager.initialize()   # we'll add initialize() method to manager
+    # New database system
+    await db_manager.initialize()
     await db_registry.discover()
     await db_registry.update_all_stats()
     health_monitor = HealthMonitor(db_manager, db_registry)
     await health_monitor.start()
 
-    # Create Pyrogram client (session file in /tmp)
     app = Client(
         "my_bot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workers=Config.WORKERS,
-        workdir="/tmp",  # prevents read‑only filesystem errors
+        workdir="/tmp",
     )
 
-    # Load plugins
+    # Load plugins (basic only)
     loaded = load_plugins(app)
     logger.info(f"Loaded plugins: {loaded}")
 
-    # Import database admin handlers
-    from bot.plugins.database_admin import database_command, database_callback
-    # Set global references in database_admin module
-    import bot.plugins.database_admin as db_admin_module
-    db_admin_module.manager = db_manager
-    db_admin_module.registry = db_registry
-    db_admin_module.analytics = db_analytics
-    # Add handlers explicitly
-    app.add_handler(MessageHandler(database_command, filters.text))
-    app.add_handler(CallbackQueryHandler(database_callback, filters.regex(r"^db:")))
+    # Directly register database admin handlers
+    app.add_handler(MessageHandler(database_command_handler, filters.text))
+    app.add_handler(CallbackQueryHandler(database_callback_handler, filters.regex(r"^db:")))
     logger.info("Database admin handlers added directly.")
 
-    # Start web server (for Render)
     await start_web_server()
-
-    # Start heartbeat task
     heartbeat_task = asyncio.create_task(heartbeat())
 
-    # Main client loop with proper FLOOD_WAIT handling
     logger.info("Starting Telegram client...")
     while True:
         try:
             await app.start()
-            # Wait forever (or until the client is stopped)
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             logger.info("Stopping bot...")
@@ -138,28 +143,24 @@ async def main() -> None:
             if "FLOOD_WAIT" in error_message:
                 wait_seconds = get_flood_wait(error_message)
                 logger.error(f"FLOOD_WAIT – waiting {wait_seconds} seconds before retry...")
-                await asyncio.sleep(wait_seconds + 5)  # add a small buffer
+                await asyncio.sleep(wait_seconds + 5)
             else:
                 logger.error(f"Client error: {error_message}. Restarting in 10 seconds...")
                 await asyncio.sleep(10)
-            # Attempt to stop the client before restarting (ignore errors)
             try:
                 await app.stop()
             except Exception:
                 pass
-            # Recreate heartbeat task (may already be running – cancel and restart)
             heartbeat_task.cancel()
             heartbeat_task = asyncio.create_task(heartbeat())
             continue
 
-    # Final cleanup (only on KeyboardInterrupt)
     heartbeat_task.cancel()
     await health_monitor.stop()
     await db_manager.close_all()
     await database.close()
     await app.stop()
     logger.info("Bot stopped.")
-
 
 if __name__ == "__main__":
     try:
