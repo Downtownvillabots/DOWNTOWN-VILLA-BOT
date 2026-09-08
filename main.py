@@ -17,7 +17,8 @@ try:
 except ImportError:
     pass
 
-from pyrogram import Client
+from pyrogram import Client, filters
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 from bot.config import Config, validate_required
 from bot.core.logging import setup_logging
@@ -103,6 +104,18 @@ async def main() -> None:
     # Load plugins
     loaded = load_plugins(app)
     logger.info(f"Loaded plugins: {loaded}")
+
+    # Import database admin handlers
+    from bot.plugins.database_admin import database_command, database_callback
+    # Set global references in database_admin module
+    import bot.plugins.database_admin as db_admin_module
+    db_admin_module.manager = db_manager
+    db_admin_module.registry = db_registry
+    db_admin_module.analytics = db_analytics
+    # Add handlers explicitly
+    app.add_handler(MessageHandler(database_command, filters.text))
+    app.add_handler(CallbackQueryHandler(database_callback, filters.regex(r"^db:")))
+    logger.info("Database admin handlers added directly.")
 
     # Start web server (for Render)
     await start_web_server()
