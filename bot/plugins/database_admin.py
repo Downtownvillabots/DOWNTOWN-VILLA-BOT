@@ -27,7 +27,7 @@ def setup(app: Client):
     """Register the /database command and callback handlers."""
     global manager, registry, analytics
 
-    logger.info("Setting up database_admin plugin...")
+    logger.info("Setting up database_admin plugin...")  # This will show in logs!
 
     # Import singletons from bot.database (already initialized in main.py)
     from bot.database import db_manager, db_registry, db_analytics
@@ -71,7 +71,6 @@ def setup(app: Client):
             await show_overview(client, callback_query, edit=True)
         elif action == "totals":
             await show_totals(client, callback_query, edit=True)
-
 
 # Helper functions
 async def show_overview(client, message_or_query, edit=False):
@@ -122,7 +121,6 @@ async def show_overview(client, message_or_query, edit=False):
     else:
         await message_or_query.reply_text(text, reply_markup=reply_markup)
 
-
 async def show_database_detail(client, callback_query, key):
     """Show details for a specific database."""
     info = registry.get_info(key)
@@ -153,7 +151,6 @@ async def show_database_detail(client, callback_query, key):
 
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-
 async def show_totals(client, callback_query, edit=True):
     """Show aggregated totals."""
     totals = await analytics.get_total_stats()
@@ -181,7 +178,6 @@ async def show_totals(client, callback_query, edit=True):
 
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data="db:back")]]
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
 
 async def refresh_data(client, callback_query):
     """Re-fetch stats and update UI."""
