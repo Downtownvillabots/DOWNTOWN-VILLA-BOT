@@ -6,8 +6,7 @@ No feature‑specific settings are here; only engine‑level ones.
 """
 
 import os
-from typing import Optional
-
+from typing import Optional, Dict, List
 
 class Config:
     """Static class holding configuration values."""
@@ -28,8 +27,34 @@ class Config:
         int(x) for x in os.getenv("SUDO_IDS", "").split(",") if x.strip()
     ]
 
-    # Database (optional)
-    STORAGE_URI: Optional[str] = os.getenv("STORAGE_URI")  # e.g. mongodb://...
+    # ---------- NEW DYNAMIC DATABASE CONFIGURATION ----------
+    # System database URI (single)
+    SYSTEM_DATABASE_URI: Optional[str] = os.getenv("SYSTEM_DATABASE_URI")
+
+    # User databases – unlimited (scan env for USER_DATABASE_URI_*)
+    @staticmethod
+    def _get_all_uris(prefix: str) -> List[str]:
+        """
+        Returns a list of URIs whose environment variable name starts with `prefix`.
+        Example: prefix="USER_DATABASE_URI_" returns values for
+                 USER_DATABASE_URI_1, USER_DATABASE_URI_2, ... in order.
+        """
+        uris = []
+        i = 1
+        while True:
+            key = f"{prefix}{i}"
+            val = os.getenv(key)
+            if val is None:
+                break
+            uris.append(val.strip())
+            i += 1
+        return uris
+
+    USER_DATABASE_URIS: List[str] = _get_all_uris("USER_DATABASE_URI_")
+    FILE_DATABASE_URIS: List[str] = _get_all_uris("FILE_DATABASE_URI_")
+
+    # Legacy (optional) – kept for backward compatibility with old code
+    STORAGE_URI: Optional[str] = os.getenv("STORAGE_URI")
 
     # Web server (Render)
     PORT: int = int(os.getenv("PORT", "8080"))
