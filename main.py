@@ -23,14 +23,11 @@ from bot.plugins import load_plugins
 from bot.core.helpers import human_readable_size
 from bot.core.permissions import Permissions
 
-# Database imports
 from bot.database import db_manager, db_registry, db_analytics
 from bot.database.health import HealthMonitor
 
-# Import UI helpers from database_admin plugin
 from bot.plugins.database_admin import show_overview, show_database_detail, show_totals, refresh_data, set_globals
 
-# Set globals
 set_globals(db_manager, db_registry, db_analytics)
 
 app = None
@@ -58,7 +55,6 @@ def get_flood_wait(error_message: str) -> int:
     match = re.search(r"wait of (\d+) seconds", error_message)
     return int(match.group(1)) if match else 60
 
-# Direct handler for /database
 async def database_command_handler(client: Client, message: Message):
     logger.info("database_command_handler triggered: %s", message.text)
     if not message.text or not message.text.lower().startswith("/database"):
@@ -70,7 +66,6 @@ async def database_command_handler(client: Client, message: Message):
         return
     await show_overview(client, message)
 
-# Direct handler for callbacks
 async def database_callback_handler(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
