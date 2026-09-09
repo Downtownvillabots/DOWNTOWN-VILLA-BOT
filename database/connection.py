@@ -13,7 +13,6 @@ class DatabaseManager:
     - Reads all environment variables for System/User/Media databases.
     - Creates and manages reusable MongoDB clients.
     - Provides access to individual databases.
-    - Keeps health state and supports basic failover (in later steps).
     """
 
     def __init__(self):
@@ -25,7 +24,7 @@ class DatabaseManager:
         self._active_media_db: Optional[int] = None
         self._media_threshold_mb: Optional[int] = None
         self._initialized = False
-        self._db_enabled = False   # will be True if at least one URI is set
+        self._db_enabled = False
 
     async def initialize(self):
         """Create all clients and database handles from environment variables."""
@@ -36,23 +35,26 @@ class DatabaseManager:
         sys_uris = DatabaseConfig.get_system_databases()
         for idx, uri in sys_uris.items():
             client = self._get_client(uri)
-            self._system_dbs[idx] = client.get_database()
-            logger.info(f"System database {idx} connected.")
+            db_name = DatabaseConfig.get_database_name("SYSTEM", idx, "downtown_villa_system")
+            self._system_dbs[idx] = client[db_name]
+            logger.info(f"System database {idx} connected (db: {db_name}).")
 
         # User databases
         user_uris = DatabaseConfig.get_user_databases()
         for idx, uri in user_uris.items():
             client = self._get_client(uri)
-            self._user_dbs[idx] = client.get_database()
-            logger.info(f"User database {idx} connected.")
+            db_name = DatabaseConfig.get_database_name("USER", idx, "downtown_villa_users")
+            self._user_dbs[idx] = client[db_name]
+            logger.info(f"User database {idx} connected (db: {db_name}).")
 
         # Media databases
         media_uris = DatabaseConfig.get_media_databases()
         self._media_db_order = sorted(media_uris.keys())
         for idx, uri in media_uris.items():
             client = self._get_client(uri)
-            self._media_dbs[idx] = client.get_database()
-            logger.info(f"Media database {idx} connected.")
+            db_name = DatabaseConfig.get_database_name("DATABASE", idx, "downtown_villa_media")
+            self._media_dbs[idx] = client[db_name]
+            logger.info(f"Media database {idx} connected (db: {db_name}).")
 
         # Set active media db to first available
         if self._media_db_order:
@@ -61,7 +63,7 @@ class DatabaseManager:
         # Threshold
         self._media_threshold_mb = DatabaseConfig.get_media_threshold_mb()
         if self._media_threshold_mb is None:
-            self._media_threshold_mb = 400  # safe default (can be overridden)
+            self._media_threshold_mb = 400
 
         # If no databases were configured, mark as disabled
         if not sys_uris and not user_uris and not media_uris:
@@ -133,10 +135,6 @@ class DatabaseManager:
             except Exception:
                 status["media"][idx] = False
         return status
-
-    # ----- Future: media switching logic (will be implemented later) -----
-    # async def check_and_switch_media_db(self):
-    #     ...
 
     async def close(self):
         """Close all MongoDB clients."""
