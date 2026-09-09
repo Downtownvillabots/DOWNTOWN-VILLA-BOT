@@ -17,7 +17,7 @@ class DatabaseManager:
     """
 
     def __init__(self):
-        self._clients: Dict[str, AsyncIOMotorClient] = {}  # keyed by URI
+        self._clients: Dict[str, AsyncIOMotorClient] = {}
         self._system_dbs: Dict[int, AsyncIOMotorDatabase] = {}
         self._user_dbs: Dict[int, AsyncIOMotorDatabase] = {}
         self._media_dbs: Dict[int, AsyncIOMotorDatabase] = {}
@@ -25,6 +25,7 @@ class DatabaseManager:
         self._active_media_db: Optional[int] = None
         self._media_threshold_mb: Optional[int] = None
         self._initialized = False
+        self._db_enabled = False   # will be True if at least one URI is set
 
     async def initialize(self):
         """Create all clients and database handles from environment variables."""
@@ -35,7 +36,7 @@ class DatabaseManager:
         sys_uris = DatabaseConfig.get_system_databases()
         for idx, uri in sys_uris.items():
             client = self._get_client(uri)
-            self._system_dbs[idx] = client.get_database()  # use default DB from URI
+            self._system_dbs[idx] = client.get_database()
             logger.info(f"System database {idx} connected.")
 
         # User databases
@@ -62,14 +63,26 @@ class DatabaseManager:
         if self._media_threshold_mb is None:
             self._media_threshold_mb = 400  # safe default (can be overridden)
 
+        # If no databases were configured, mark as disabled
+        if not sys_uris and not user_uris and not media_uris:
+            self._db_enabled = False
+            logger.warning("No database URIs configured. Database features are disabled.")
+        else:
+            self._db_enabled = True
+
         self._initialized = True
-        logger.info("Database manager initialized.")
+        logger.info("Database manager initialization complete.")
 
     def _get_client(self, uri: str) -> AsyncIOMotorClient:
         """Get or create a client for the given URI."""
         if uri not in self._clients:
             self._clients[uri] = AsyncIOMotorClient(uri)
         return self._clients[uri]
+
+    @property
+    def is_db_enabled(self) -> bool:
+        """Return whether any database is configured."""
+        return self._db_enabled
 
     # ----- Accessors for system databases -----
     def get_system_db(self, index: int = 1) -> Optional[AsyncIOMotorDatabase]:
@@ -97,7 +110,7 @@ class DatabaseManager:
     def get_media_threshold(self) -> int:
         return self._media_threshold_mb or 400
 
-    # ----- Health check (basic for now) -----
+    # ----- Basic health check -----
     async def check_health(self) -> Dict:
         """Check connectivity of all databases."""
         status = {"system": {}, "user": {}, "media": {}}
