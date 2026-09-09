@@ -1,24 +1,23 @@
+# core/startup.py
 import asyncio
 import logging
 from pyrogram import idle
 from core.logging import setup_logging
 from core.client import VillaClient
-from core.config import LOG_CHANNEL
+from plugins.log_channel import set_bot, bot_started
 
 async def start_bot():
     setup_logging()
     logging.info("Starting DOWNTOWN VILLA BOT ENGINE...")
     bot = VillaClient()
+    set_bot(bot)  # allow log channel plugin to use this client
     await bot.start()
     me = await bot.get_me()
     bot.username = me.username
     logging.info(f"Bot started: {me.first_name} (@{me.username})")
 
-    # Send a start notification to the log channel (optional)
-    try:
-        await bot.send_message(LOG_CHANNEL, "DOWNTOWN VILLA BOT is now online.")
-    except Exception as e:
-        logging.warning(f"Could not send start message to log channel: {e}")
+    # Send startup notification to Telegram logging channel (only if LOG_CHANNEL_ID is set)
+    await bot_started()
 
     logging.info("Bot idle. Waiting for commands...")
     await idle()
