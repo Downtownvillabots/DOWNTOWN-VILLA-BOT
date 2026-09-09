@@ -1,3 +1,4 @@
+import os
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from database.config import DatabaseConfig
@@ -17,7 +18,7 @@ class DatabaseManager:
 
         uri = DatabaseConfig.get_database_uri()
         if not uri:
-            # Additional debug: list env vars that might contain database config
+            # Print environment variables containing "DATABASE" for debugging
             db_env_keys = [k for k in os.environ if "DATABASE" in k.upper() or "MONGO" in k.upper()]
             logger.warning(f"Database environment variables found: {db_env_keys}")
             self._initialized = True
