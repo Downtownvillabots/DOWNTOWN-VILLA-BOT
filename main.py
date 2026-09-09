@@ -1,5 +1,5 @@
 """
-Main entry point.
+Main entry point – handles /database directly.
 """
 import asyncio
 import logging
@@ -26,37 +26,22 @@ from bot.core.permissions import Permissions
 from bot.database import db_manager, db_registry, db_analytics
 from bot.database.health import HealthMonitor
 
+# Import UI helpers from database_admin.py
 from bot.plugins.database_admin import show_overview, show_database_detail, show_totals, refresh_data, set_globals
 
+# Set globals so database_admin.py functions can access them
 set_globals(db_manager, db_registry, db_analytics)
 
 app = None
 logger = logging.getLogger("main")
 
-async def heartbeat():
-    while True:
-        logging.getLogger("heartbeat").info("Bot is alive.")
-        await asyncio.sleep(Config.HEARTBEAT_INTERVAL)
+# --- Database Admin UI Functions (we keep them here for direct access) ---
+# (If you prefer, you can keep them in database_admin.py – we'll use the imports above.)
 
-async def start_web_server():
-    from aiohttp import web
-    async def handle(request):
-        return web.Response(text="OK")
-    web_app = web.Application()
-    web_app.router.add_get("/", handle)
-    web_app.router.add_get("/health", handle)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host=Config.HOST, port=Config.PORT)
-    await site.start()
-    logging.getLogger("web").info(f"Web server started on {Config.HOST}:{Config.PORT}")
-
-def get_flood_wait(error_message: str) -> int:
-    match = re.search(r"wait of (\d+) seconds", error_message)
-    return int(match.group(1)) if match else 60
-
+# --- Handler for /database (NO FILTER – catches everything) ---
 async def database_command_handler(client: Client, message: Message):
-    logger.info("database_command_handler triggered: %s", message.text)
+    # Log EVERY message to see if handler is called
+    logger.info("Handler called for message: %s", message.text)
     if not message.text or not message.text.lower().startswith("/database"):
         return
     logger.info("Received /database from %s (id=%d)", message.from_user.first_name, message.from_user.id)
@@ -84,20 +69,41 @@ async def database_callback_handler(client: Client, callback_query: CallbackQuer
     elif action == "totals":
         await show_totals(client, callback_query, edit=True)
 
+# --- Standard bot startup ---
+async def heartbeat():
+    while True:
+        logging.getLogger("heartbeat").info("Bot is alive.")
+        await asyncio.sleep(Config.HEARTBEAT_INTERVAL)
+
+async def start_web_server():
+    from aiohttp import web
+    async def handle(request):
+        return web.Response(text="OK")
+    web_app = web.Application()
+    web_app.router.add_get("/", handle)
+    web_app.router.add_get("/health", handle)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=Config.HOST, port=Config.PORT)
+    await site.start()
+    logging.getLogger("web").info(f"Web server started on {Config.HOST}:{Config.PORT}")
+
+def get_flood_wait(error_message: str) -> int:
+    match = re.search(r"wait of (\d+) seconds", error_message)
+    return int(match.group(1)) if match else 60
+
 async def main():
     global app
     validate_required()
     setup_logging()
     logger.info("Starting Telegram bot engine...")
 
-    # Legacy database
     await database.connect()
     if database.is_connected:
         logger.info("Legacy database connection established.")
     else:
         logger.info("Legacy database not configured; running without storage.")
 
-    # New database system
     await db_manager.initialize()
     await db_registry.discover()
     await db_registry.update_all_stats()
@@ -113,14 +119,16 @@ async def main():
         workdir="/tmp",
     )
 
-    # Load plugins (basic only)
     loaded = load_plugins(app)
     logger.info(f"Loaded plugins: {loaded}")
 
-    # Directly register database admin handlers
-    app.add_handler(MessageHandler(database_command_handler, filters.text))
+    # ✅ Add handler with NO FILTER – catches every message
+    app.add_handler(MessageHandler(database_command_handler))
+    logger.info("Added MessageHandler (no filter) for /database")
+
+    # Add callback handler for buttons
     app.add_handler(CallbackQueryHandler(database_callback_handler, filters.regex(r"^db:")))
-    logger.info("Database admin handlers added directly.")
+    logger.info("Added CallbackQueryHandler for db:*")
 
     await start_web_server()
     heartbeat_task = asyncio.create_task(heartbeat())
