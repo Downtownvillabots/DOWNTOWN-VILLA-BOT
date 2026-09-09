@@ -1,0 +1,132 @@
+import asyncio
+import logging
+from typing import Dict, Optional, List, Union
+
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from database.config import DatabaseConfig
+
+logger = logging.getLogger(__name__)
+
+class DatabaseManager:
+    """
+    Central database connection manager for DOWNTOWN VILLA BOT.
+    - Reads all environment variables for System/User/Media databases.
+    - Creates and manages reusable MongoDB clients.
+    - Provides access to individual databases.
+    - Keeps health state and supports basic failover (in later steps).
+    """
+
+    def __init__(self):
+        self._clients: Dict[str, AsyncIOMotorClient] = {}  # keyed by URI
+        self._system_dbs: Dict[int, AsyncIOMotorDatabase] = {}
+        self._user_dbs: Dict[int, AsyncIOMotorDatabase] = {}
+        self._media_dbs: Dict[int, AsyncIOMotorDatabase] = {}
+        self._media_db_order: List[int] = []
+        self._active_media_db: Optional[int] = None
+        self._media_threshold_mb: Optional[int] = None
+        self._initialized = False
+
+    async def initialize(self):
+        """Create all clients and database handles from environment variables."""
+        if self._initialized:
+            return
+
+        # System databases
+        sys_uris = DatabaseConfig.get_system_databases()
+        for idx, uri in sys_uris.items():
+            client = self._get_client(uri)
+            self._system_dbs[idx] = client.get_database()  # use default DB from URI
+            logger.info(f"System database {idx} connected.")
+
+        # User databases
+        user_uris = DatabaseConfig.get_user_databases()
+        for idx, uri in user_uris.items():
+            client = self._get_client(uri)
+            self._user_dbs[idx] = client.get_database()
+            logger.info(f"User database {idx} connected.")
+
+        # Media databases
+        media_uris = DatabaseConfig.get_media_databases()
+        self._media_db_order = sorted(media_uris.keys())
+        for idx, uri in media_uris.items():
+            client = self._get_client(uri)
+            self._media_dbs[idx] = client.get_database()
+            logger.info(f"Media database {idx} connected.")
+
+        # Set active media db to first available
+        if self._media_db_order:
+            self._active_media_db = self._media_db_order[0]
+
+        # Threshold
+        self._media_threshold_mb = DatabaseConfig.get_media_threshold_mb()
+        if self._media_threshold_mb is None:
+            self._media_threshold_mb = 400  # safe default (can be overridden)
+
+        self._initialized = True
+        logger.info("Database manager initialized.")
+
+    def _get_client(self, uri: str) -> AsyncIOMotorClient:
+        """Get or create a client for the given URI."""
+        if uri not in self._clients:
+            self._clients[uri] = AsyncIOMotorClient(uri)
+        return self._clients[uri]
+
+    # ----- Accessors for system databases -----
+    def get_system_db(self, index: int = 1) -> Optional[AsyncIOMotorDatabase]:
+        return self._system_dbs.get(index)
+
+    # ----- Accessors for user databases -----
+    def get_user_db(self, index: int = 1) -> Optional[AsyncIOMotorDatabase]:
+        return self._user_dbs.get(index)
+
+    # ----- Accessors for media databases -----
+    def get_media_db(self, index: int) -> Optional[AsyncIOMotorDatabase]:
+        return self._media_dbs.get(index)
+
+    def get_active_media_db(self) -> Optional[AsyncIOMotorDatabase]:
+        if self._active_media_db is not None:
+            return self._media_dbs.get(self._active_media_db)
+        return None
+
+    def get_active_media_db_index(self) -> Optional[int]:
+        return self._active_media_db
+
+    def get_media_db_list(self) -> List[int]:
+        return list(self._media_db_order)
+
+    def get_media_threshold(self) -> int:
+        return self._media_threshold_mb or 400
+
+    # ----- Health check (basic for now) -----
+    async def check_health(self) -> Dict:
+        """Check connectivity of all databases."""
+        status = {"system": {}, "user": {}, "media": {}}
+        for idx, db in self._system_dbs.items():
+            try:
+                await db.command("ping")
+                status["system"][idx] = True
+            except Exception:
+                status["system"][idx] = False
+        for idx, db in self._user_dbs.items():
+            try:
+                await db.command("ping")
+                status["user"][idx] = True
+            except Exception:
+                status["user"][idx] = False
+        for idx, db in self._media_dbs.items():
+            try:
+                await db.command("ping")
+                status["media"][idx] = True
+            except Exception:
+                status["media"][idx] = False
+        return status
+
+    # ----- Future: media switching logic (will be implemented later) -----
+    # async def check_and_switch_media_db(self):
+    #     ...
+
+    async def close(self):
+        """Close all MongoDB clients."""
+        for client in self._clients.values():
+            client.close()
+        logger.info("Database connections closed.")
