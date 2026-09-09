@@ -1,163 +1,120 @@
-# bot/plugins/database_admin.py
 """
-Admin /database command – fully self-contained plugin.
+Main entry point.
 """
-
+import asyncio
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from bot.core.helpers import human_readable_size
-from bot.core.permissions import Permissions
+import re
+import sys
+
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
+from pyrogram import Client
+
+from bot.config import Config, validate_required
+from bot.core.logging import setup_logging
+from bot.core.database import database
+from bot.plugins import load_plugins
 from bot.database import db_manager, db_registry, db_analytics
+from bot.database.health import HealthMonitor
 
-logger = logging.getLogger("plugins.database_admin")
+app = None
+logger = logging.getLogger("main")
 
-# ---------- UI Helper Functions ----------
-async def show_overview(client, message_or_query, edit=False):
-    totals = await db_analytics.get_total_stats()
-    user_totals = await db_analytics.get_total_stats("user")
-    file_totals = await db_analytics.get_total_stats("file")
+async def heartbeat():
+    while True:
+        logging.getLogger("heartbeat").info("Bot is alive.")
+        await asyncio.sleep(Config.HEARTBEAT_INTERVAL)
 
-    text = (
-        "📊 **DATABASE CONTROL CENTER**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Total databases: {len(db_registry.get_all())}\n"
-        f"📦 Total documents: {totals['documents']:,}\n"
-        f"💾 Total storage: {human_readable_size(totals['storage_size'])}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 **USER DATABASES**\n"
-        f"• Count: {user_totals['databases']}\n"
-        f"• Documents: {user_totals['documents']:,}\n"
-        f"• Storage: {human_readable_size(user_totals['storage_size'])}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎬 **FILE DATABASES**\n"
-        f"• Count: {file_totals['databases']}\n"
-        f"• Documents: {file_totals['documents']:,}\n"
-        f"• Storage: {human_readable_size(file_totals['storage_size'])}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Choose a database for details:"
-    )
+async def start_web_server():
+    from aiohttp import web
+    async def handle(request):
+        return web.Response(text="OK")
+    web_app = web.Application()
+    web_app.router.add_get("/", handle)
+    web_app.router.add_get("/health", handle)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=Config.HOST, port=Config.PORT)
+    await site.start()
+    logging.getLogger("web").info(f"Web server started on {Config.HOST}:{Config.PORT}")
 
-    buttons = []
-    for info in db_registry.get_all():
-        buttons.append([InlineKeyboardButton(
-            text=f"{info.friendly_name} • {info.status}",
-            callback_data=f"db:view:{info.key}"
-        )])
+def get_flood_wait(error_message: str) -> int:
+    match = re.search(r"wait of (\d+) seconds", error_message)
+    return int(match.group(1)) if match else 60
 
-    nav_buttons = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data="db:refresh"),
-         InlineKeyboardButton("📊 Totals", callback_data="db:totals")]
-    ]
+async def main():
+    global app
+    validate_required()
+    setup_logging()
+    logger.info("Starting Telegram bot engine...")
 
-    reply_markup = InlineKeyboardMarkup(buttons + nav_buttons)
-
-    if edit:
-        await message_or_query.edit_message_text(text, reply_markup=reply_markup)
+    await database.connect()
+    if database.is_connected:
+        logger.info("Legacy database connection established.")
     else:
-        await message_or_query.reply_text(text, reply_markup=reply_markup)
+        logger.info("Legacy database not configured; running without storage.")
 
-async def show_database_detail(client, callback_query, key):
-    info = db_registry.get_info(key)
-    if not info:
-        await callback_query.answer("Unknown database.", show_alert=True)
-        return
-    stats = await db_analytics.get_database_stats(key)
-
-    text = (
-        f"📦 **{info.friendly_name}**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗄️ Type: {info.type.upper()}\n"
-        f"Status: {stats.get('status', '⚠️ UNKNOWN')}\n"
-        f"Collections: {stats.get('collections', 0)}\n"
-        f"Documents: {stats.get('documents', 0):,}\n"
-        f"Data size: {human_readable_size(stats.get('data_size', 0))}\n"
-        f"Storage size: {human_readable_size(stats.get('storage_size', 0))}\n"
-        f"Index size: {human_readable_size(stats.get('index_size', 0))}\n"
-        f"Total size: {human_readable_size(stats.get('total_size', 0))}\n"
-        f"Avg object size: {human_readable_size(stats.get('avg_object_size', 0))}\n"
-    )
-
-    buttons = [
-        [InlineKeyboardButton("⬅️ Back", callback_data="db:back"),
-         InlineKeyboardButton("🔄 Refresh", callback_data=f"db:refresh")]
-    ]
-
-    await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-async def show_totals(client, callback_query, edit=True):
-    totals = await db_analytics.get_total_stats()
-    user_totals = await db_analytics.get_total_stats("user")
-    file_totals = await db_analytics.get_total_stats("file")
-
-    text = (
-        "📊 **ALL DATABASES TOTAL**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗄️ Databases: {totals['databases']}\n"
-        f"📦 Documents: {totals['documents']:,}\n"
-        f"💾 Storage: {human_readable_size(totals['storage_size'])}\n"
-        f"🧩 Indexes: {human_readable_size(totals['index_size'])}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 **USER DATABASES**\n"
-        f"• Databases: {user_totals['databases']}\n"
-        f"• Documents: {user_totals['documents']:,}\n"
-        f"• Storage: {human_readable_size(user_totals['storage_size'])}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎬 **FILE DATABASES**\n"
-        f"• Databases: {file_totals['databases']}\n"
-        f"• Documents: {file_totals['documents']:,}\n"
-        f"• Storage: {human_readable_size(file_totals['storage_size'])}\n"
-    )
-
-    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data="db:back")]]
-    await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-async def refresh_data(client, callback_query):
+    await db_manager.initialize()
+    await db_registry.discover()
     await db_registry.update_all_stats()
-    await show_overview(client, callback_query, edit=True)
+    health_monitor = HealthMonitor(db_manager, db_registry)
+    await health_monitor.start()
 
-# ---------- Handlers ----------
-async def database_command(client: Client, message: Message):
-    # Log every message to confirm handler is called
-    logger.info("database_admin handler triggered for: %s", message.text)
-    if not message.text or not message.text.lower().startswith("/database"):
-        return
-    logger.info("Received /database from %s (id=%d)", message.from_user.first_name, message.from_user.id)
-    if not Permissions.is_privileged(message.from_user.id):
-        await message.reply_text("❌ You do not have permission.")
-        return
-    await show_overview(client, message)
+    app = Client(
+        "my_bot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        bot_token=Config.BOT_TOKEN,
+        workers=Config.WORKERS,
+        workdir="/tmp",
+    )
 
-async def database_callback(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    if not Permissions.is_privileged(user_id):
-        await callback_query.answer("❌ Access denied.", show_alert=True)
-        return
-    parts = data.split(":")
-    action = parts[1]
-    if action == "refresh":
-        await refresh_data(client, callback_query)
-    elif action == "view":
-        key = parts[2]
-        await show_database_detail(client, callback_query, key)
-    elif action == "back":
-        await show_overview(client, callback_query, edit=True)
-    elif action == "totals":
-        await show_totals(client, callback_query, edit=True)
+    # Load all plugins – database_admin will register its own handlers
+    loaded = load_plugins(app)
+    logger.info(f"Loaded plugins: {loaded}")
 
-# ---------- Plugin Setup ----------
-def setup(app: Client):
-    logger.info("Setting up database_admin plugin...")
+    await start_web_server()
+    heartbeat_task = asyncio.create_task(heartbeat())
 
-    # Register handler for ALL messages (we filter manually)
-    @app.on_message(filters.all)
-    async def message_handler(client, message):
-        await database_command(client, message)
+    logger.info("Starting Telegram client...")
+    while True:
+        try:
+            await app.start()
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+            break
+        except Exception as e:
+            error_message = str(e)
+            if "FLOOD_WAIT" in error_message:
+                wait_seconds = get_flood_wait(error_message)
+                logger.error(f"FLOOD_WAIT – waiting {wait_seconds} seconds before retry...")
+                await asyncio.sleep(wait_seconds + 5)
+            else:
+                logger.error(f"Client error: {error_message}. Restarting in 10 seconds...")
+                await asyncio.sleep(10)
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            heartbeat_task.cancel()
+            heartbeat_task = asyncio.create_task(heartbeat())
+            continue
 
-    # Register callback handler for inline buttons
-    @app.on_callback_query(filters.regex(r"^db:"))
-    async def callback_handler(client, callback_query):
-        await database_callback(client, callback_query)
+    heartbeat_task.cancel()
+    await health_monitor.stop()
+    await db_manager.close_all()
+    await database.close()
+    await app.stop()
+    logger.info("Bot stopped.")
 
-    logger.info("database_admin plugin setup complete.")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.getLogger("main").error(f"Fatal error: {e}")
+        sys.exit(1)
