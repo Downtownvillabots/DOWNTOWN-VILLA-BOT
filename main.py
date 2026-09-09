@@ -1,5 +1,5 @@
 """
-Main entry point – handles /database directly.
+Main entry point.
 """
 import asyncio
 import logging
@@ -12,64 +12,18 @@ try:
 except ImportError:
     pass
 
-from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram import Client
 
 from bot.config import Config, validate_required
 from bot.core.logging import setup_logging
 from bot.core.database import database
 from bot.plugins import load_plugins
-from bot.core.helpers import human_readable_size
-from bot.core.permissions import Permissions
-
 from bot.database import db_manager, db_registry, db_analytics
 from bot.database.health import HealthMonitor
-
-# Import UI helpers from database_admin.py
-from bot.plugins.database_admin import show_overview, show_database_detail, show_totals, refresh_data, set_globals
-
-# Set globals so database_admin.py functions can access them
-set_globals(db_manager, db_registry, db_analytics)
 
 app = None
 logger = logging.getLogger("main")
 
-# --- Database Admin UI Functions (we keep them here for direct access) ---
-# (If you prefer, you can keep them in database_admin.py – we'll use the imports above.)
-
-# --- Handler for /database (NO FILTER – catches everything) ---
-async def database_command_handler(client: Client, message: Message):
-    # Log EVERY message to see if handler is called
-    logger.info("Handler called for message: %s", message.text)
-    if not message.text or not message.text.lower().startswith("/database"):
-        return
-    logger.info("Received /database from %s (id=%d)", message.from_user.first_name, message.from_user.id)
-    if not Permissions.is_privileged(message.from_user.id):
-        logger.warning("User %d lacks permission", message.from_user.id)
-        await message.reply_text("❌ You do not have permission.")
-        return
-    await show_overview(client, message)
-
-async def database_callback_handler(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    if not Permissions.is_privileged(user_id):
-        await callback_query.answer("❌ Access denied.", show_alert=True)
-        return
-    parts = data.split(":")
-    action = parts[1]
-    if action == "refresh":
-        await refresh_data(client, callback_query)
-    elif action == "view":
-        key = parts[2]
-        await show_database_detail(client, callback_query, key)
-    elif action == "back":
-        await show_overview(client, callback_query, edit=True)
-    elif action == "totals":
-        await show_totals(client, callback_query, edit=True)
-
-# --- Standard bot startup ---
 async def heartbeat():
     while True:
         logging.getLogger("heartbeat").info("Bot is alive.")
@@ -119,16 +73,9 @@ async def main():
         workdir="/tmp",
     )
 
+    # Load all plugins – database_admin will register its own handlers
     loaded = load_plugins(app)
     logger.info(f"Loaded plugins: {loaded}")
-
-    # ✅ Add handler with NO FILTER – catches every message
-    app.add_handler(MessageHandler(database_command_handler))
-    logger.info("Added MessageHandler (no filter) for /database")
-
-    # Add callback handler for buttons
-    app.add_handler(CallbackQueryHandler(database_callback_handler, filters.regex(r"^db:")))
-    logger.info("Added CallbackQueryHandler for db:*")
 
     await start_web_server()
     heartbeat_task = asyncio.create_task(heartbeat())
