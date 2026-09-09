@@ -1,35 +1,27 @@
 # bot/plugins/database_admin.py
 """
-Helper functions for database admin UI.
-(Handlers are registered directly in main.py)
+Admin /database command – fully self-contained plugin.
 """
+
 import logging
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram import Client, filters
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from bot.core.helpers import human_readable_size
+from bot.core.permissions import Permissions
+from bot.database import db_manager, db_registry, db_analytics
 
 logger = logging.getLogger("plugins.database_admin")
 
-# These globals will be set from main.py
-manager = None
-registry = None
-analytics = None
-
-def set_globals(mgr, reg, ana):
-    global manager, registry, analytics
-    manager = mgr
-    registry = reg
-    analytics = ana
-
+# ---------- UI Helper Functions ----------
 async def show_overview(client, message_or_query, edit=False):
-    """Display the main control center."""
-    totals = await analytics.get_total_stats()
-    user_totals = await analytics.get_total_stats("user")
-    file_totals = await analytics.get_total_stats("file")
+    totals = await db_analytics.get_total_stats()
+    user_totals = await db_analytics.get_total_stats("user")
+    file_totals = await db_analytics.get_total_stats("file")
 
     text = (
         "📊 **DATABASE CONTROL CENTER**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Total databases: {len(registry.get_all())}\n"
+        f"🟢 Total databases: {len(db_registry.get_all())}\n"
         f"📦 Total documents: {totals['documents']:,}\n"
         f"💾 Total storage: {human_readable_size(totals['storage_size'])}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -47,7 +39,7 @@ async def show_overview(client, message_or_query, edit=False):
     )
 
     buttons = []
-    for info in registry.get_all():
+    for info in db_registry.get_all():
         buttons.append([InlineKeyboardButton(
             text=f"{info.friendly_name} • {info.status}",
             callback_data=f"db:view:{info.key}"
@@ -66,12 +58,11 @@ async def show_overview(client, message_or_query, edit=False):
         await message_or_query.reply_text(text, reply_markup=reply_markup)
 
 async def show_database_detail(client, callback_query, key):
-    """Show details for a specific database."""
-    info = registry.get_info(key)
+    info = db_registry.get_info(key)
     if not info:
         await callback_query.answer("Unknown database.", show_alert=True)
         return
-    stats = await analytics.get_database_stats(key)
+    stats = await db_analytics.get_database_stats(key)
 
     text = (
         f"📦 **{info.friendly_name}**\n"
@@ -95,10 +86,9 @@ async def show_database_detail(client, callback_query, key):
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def show_totals(client, callback_query, edit=True):
-    """Show aggregated totals."""
-    totals = await analytics.get_total_stats()
-    user_totals = await analytics.get_total_stats("user")
-    file_totals = await analytics.get_total_stats("file")
+    totals = await db_analytics.get_total_stats()
+    user_totals = await db_analytics.get_total_stats("user")
+    file_totals = await db_analytics.get_total_stats("file")
 
     text = (
         "📊 **ALL DATABASES TOTAL**\n"
@@ -123,6 +113,51 @@ async def show_totals(client, callback_query, edit=True):
     await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def refresh_data(client, callback_query):
-    """Re-fetch stats and update UI."""
-    await registry.update_all_stats()
+    await db_registry.update_all_stats()
     await show_overview(client, callback_query, edit=True)
+
+# ---------- Handlers ----------
+async def database_command(client: Client, message: Message):
+    # Log every message to confirm handler is called
+    logger.info("database_admin handler triggered for: %s", message.text)
+    if not message.text or not message.text.lower().startswith("/database"):
+        return
+    logger.info("Received /database from %s (id=%d)", message.from_user.first_name, message.from_user.id)
+    if not Permissions.is_privileged(message.from_user.id):
+        await message.reply_text("❌ You do not have permission.")
+        return
+    await show_overview(client, message)
+
+async def database_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    user_id = callback_query.from_user.id
+    if not Permissions.is_privileged(user_id):
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    parts = data.split(":")
+    action = parts[1]
+    if action == "refresh":
+        await refresh_data(client, callback_query)
+    elif action == "view":
+        key = parts[2]
+        await show_database_detail(client, callback_query, key)
+    elif action == "back":
+        await show_overview(client, callback_query, edit=True)
+    elif action == "totals":
+        await show_totals(client, callback_query, edit=True)
+
+# ---------- Plugin Setup ----------
+def setup(app: Client):
+    logger.info("Setting up database_admin plugin...")
+
+    # Register handler for ALL messages (we filter manually)
+    @app.on_message(filters.all)
+    async def message_handler(client, message):
+        await database_command(client, message)
+
+    # Register callback handler for inline buttons
+    @app.on_callback_query(filters.regex(r"^db:"))
+    async def callback_handler(client, callback_query):
+        await database_callback(client, callback_query)
+
+    logger.info("database_admin plugin setup complete.")
