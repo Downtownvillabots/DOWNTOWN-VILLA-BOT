@@ -18,3 +18,8 @@ ADMINS = [int(admin) if admin.isdigit() else admin for admin in environ.get('ADM
 # Logging
 # ============================
 LOG_CHANNEL = int(environ.get('LOG_CHANNEL', '-100'))
+
+# ============================
+# Server / Render
+# ============================
+PORT = int(environ.get('PORT', '8080'))
