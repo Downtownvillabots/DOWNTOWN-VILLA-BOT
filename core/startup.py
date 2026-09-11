@@ -5,7 +5,7 @@ from pyrogram import idle
 from core.logging import setup_logging
 from core.client import VillaClient
 from plugins.log_channel import set_bot, bot_started, send_log
-from database import db_manager
+from database import db_manager, db_registry
 from core.config import LOG_CHANNEL, PORT
 
 async def start_bot():
@@ -20,7 +20,7 @@ async def start_bot():
     bot.username = me.username
     logging.info(f"Bot started: {me.first_name} (@{me.username})")
 
-    # Minimal web server to satisfy Render's port check
+    # Minimal web server for Render
     app = web.Application()
     app.router.add_get("/", lambda request: web.Response(text="DOWNTOWN VILLA BOT is running."))
     runner = web.AppRunner(app)
@@ -29,14 +29,15 @@ async def start_bot():
     await site.start()
     logging.info(f"Web server started on port {PORT}")
 
-    # Database connection (already working)
+    # Initialize database layer
     try:
         await db_manager.initialize()
         if db_manager.is_db_enabled:
-            logging.info("Database connected.")
-            await send_log("🗄️ Database connected.")
+            shard_count = db_registry.get_media_shard_count()
+            logging.info(f"Database connected. Media shards: {shard_count}")
+            await send_log(f"🗄️ Database connected. Media shards: {shard_count}")
         else:
-            logging.warning("Database not enabled. Check DATABASE_URI setting.")
+            logging.warning("Database not enabled. Check DATABASE_URI.")
     except Exception as e:
         logging.error(f"Database initialization failed: {e}")
 
@@ -45,7 +46,6 @@ async def start_bot():
     logging.info("Bot idle. Waiting for commands...")
     await idle()
 
-    # Cleanup
     await runner.cleanup()
     await db_manager.close()
     await bot.stop()
