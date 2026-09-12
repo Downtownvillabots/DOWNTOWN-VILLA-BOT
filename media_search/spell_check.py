@@ -1,14 +1,7 @@
 """
-🔤 Spell check + suggestion engine.
-Suggestions come from:
-  1. IMDb (via services.imdb)  ← primary, no API key
-  2. TMDB (via media_search.metadata)  ← fallback if IMDb fails
-
-Two flows:
-  - ai_spell_check: auto-correct if DB-verified (used only when SPELL_CHECK_REPLY=True)
-  - get_suggestions: manual picker (always available)
+🔤 DOWNTOWN VILLA — Spell check + suggestions.
+Uses IMDb (via services.imdb) as primary source.
 """
-import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,31 +12,20 @@ from core.config import (
 from media_search.engine import engine
 from media_search.metadata import metadata_provider
 from media_search.normalizer import normalize
-try:
-    from services import imdb as imdb_service
-    _HAS_IMDB_SERVICE = True
-except Exception as e:
-    import logging as _log
-    _log.getLogger(__name__).warning(
-        f"[SPELL] services.imdb unavailable: {type(e).__name__}: {e}"
-    )
-    imdb_service = None
-    _HAS_IMDB_SERVICE = False
+from services import imdb as imdb_service
 
 logger = logging.getLogger(__name__)
 
-
-# ── Fuzzy matcher ──
 try:
     from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
-    _HAS_RAPIDFUZZ = True
+    _HAS_RF = True
 except ImportError:
-    _HAS_RAPIDFUZZ = False
+    _HAS_RF = False
     from difflib import SequenceMatcher
 
 
 def _score(a: str, b: str) -> int:
-    if _HAS_RAPIDFUZZ:
+    if _HAS_RF:
         return int(_rf_fuzz.ratio(a.lower(), b.lower()))
     return int(SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100)
 
@@ -51,31 +33,37 @@ def _score(a: str, b: str) -> int:
 def _best_match(query: str, candidates: List[str]) -> Optional[Tuple[str, int]]:
     if not candidates:
         return None
-    if _HAS_RAPIDFUZZ:
+    if _HAS_RF:
         r = _rf_process.extractOne(query, candidates)
         return (r[0], int(r[1])) if r else None
-    best_title, best_score = None, -1
+    best_t, best_s = None, -1
     for c in candidates:
         s = _score(query, c)
-        if s > best_score:
-            best_score, best_title = s, c
-    return (best_title, best_score) if best_title else None
+        if s > best_s:
+            best_s, best_t = s, c
+    return (best_t, best_s) if best_t else None
 
 
-# ═══════════════════════ SUGGESTION SOURCES ═══════════════════════
-async def _get_imdb_suggestions(query: str) -> List[Dict[str, Any]]:
-    """Primary source — IMDb via IMDBKit."""
-    if not _HAS_IMDB_SERVICE or imdb_service is None:
+# ═══════════════════════ SUGGESTIONS ═══════════════════════
+async def _imdb_suggestions(query: str) -> List[Dict[str, Any]]:
+    """Fetch brief titles from IMDb."""
+    if not imdb_service.is_available():
+        logger.info("[SPELL] IMDb not available")
         return []
     try:
-        if not imdb_service.is_available():
-            return []
-    except Exception:
+        briefs = await imdb_service.get_poster(query, bulk=True)
+    except Exception as e:
+        logger.warning(f"[SPELL] IMDb get_poster failed: {type(e).__name__}: {e}")
         return []
-    if not briefs:
+
+    if not briefs or not isinstance(briefs, list):
+        logger.info(f"[SPELL] IMDb returned no briefs for {query!r}")
         return []
-    out = []
-    for b in briefs[:MAX_LIST_ELM]:
+
+    out: List[Dict[str, Any]] = []
+    for b in briefs:
+        if not isinstance(b, dict):
+            continue
         title = b.get("title")
         if not title:
             continue
@@ -86,54 +74,50 @@ async def _get_imdb_suggestions(query: str) -> List[Dict[str, Any]]:
             "metadata_source": "imdb",
             "poster": None,
         })
+        if len(out) >= (MAX_LIST_ELM or 10):
+            break
+    logger.info(f"[SPELL] IMDb returned {len(out)} suggestions for {query!r}")
     return out
 
 
-async def _get_tmdb_suggestions(query: str, is_series: bool = False) -> List[Dict[str, Any]]:
-    """Fallback — TMDB via our metadata provider."""
+async def _tmdb_suggestions(query: str, is_series: bool = False) -> List[Dict[str, Any]]:
     try:
         raw = await metadata_provider.search(query, year=None, is_series=is_series)
     except Exception as e:
-        logger.warning(f"[SPELL] TMDB suggestions failed: {e}")
+        logger.warning(f"[SPELL] TMDB failed: {type(e).__name__}: {e}")
         return []
     if not raw:
         return []
     out = []
-    for s in raw[:MAX_LIST_ELM]:
-        title = s.get("title")
-        if not title:
+    for s in raw:
+        t = s.get("title")
+        if not t:
             continue
         out.append({
-            "title": title,
+            "title": t,
             "year": s.get("year"),
             "metadata_id": s.get("metadata_id"),
             "metadata_source": s.get("metadata_source"),
             "poster": s.get("poster"),
         })
+        if len(out) >= (MAX_LIST_ELM or 10):
+            break
     return out
 
 
 async def get_suggestions(query: str, is_series: bool = False) -> List[Dict[str, Any]]:
-    """
-    Return a list of {title, year, metadata_id, metadata_source, poster} candidates.
-    IMDb first, TMDB fallback.
-    """
+    """IMDb first, TMDB fallback."""
     if not query:
         return []
-    imdb_list = await _get_imdb_suggestions(query)
+    imdb_list = await _imdb_suggestions(query)
     if imdb_list:
         return imdb_list
-    return await _get_tmdb_suggestions(query, is_series=is_series)
+    return await _tmdb_suggestions(query, is_series=is_series)
 
 
-# ═══════════════════════ STAGE 1 — AUTO CORRECT ═══════════════════════
+# ═══════════════════════ AUTO-CORRECT (DB-verified) ═══════════════════════
 async def ai_spell_check(wrong_name: str, is_series: bool = False) -> Optional[str]:
-    """
-    DB-verified auto-correct.
-    Returns corrected title only if:
-      - fuzzy score >= SPELL_CHECK_THRESHOLD
-      - AND engine finds files for that title.
-    """
+    """Return corrected title only if score >= threshold AND title exists in DB."""
     if not wrong_name:
         return None
 
@@ -152,16 +136,13 @@ async def ai_spell_check(wrong_name: str, is_series: bool = False) -> Optional[s
             break
         candidate, score = match
         if score < SPELL_CHECK_THRESHOLD:
-            logger.info(f"[SPELL] best {candidate!r} score {score} < {SPELL_CHECK_THRESHOLD}")
             break
         tried.append(candidate)
-        # DB-verify
         norm = normalize(candidate)
         result = await engine.search_any(norm)
         if result.hits:
-            logger.info(f"[SPELL] auto {wrong_name!r} → {candidate!r} (score={score})")
+            logger.info(f"[SPELL] corrected {wrong_name!r} → {candidate!r} (score={score})")
             return candidate
-        logger.info(f"[SPELL] {candidate!r} not in DB — trying next")
     return None
 
 
