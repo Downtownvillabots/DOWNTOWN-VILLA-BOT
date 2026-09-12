@@ -684,35 +684,57 @@ async def _live_updater(client: Client, job_id: str) -> None:
 
 # ═══════════════════════ PARALLEL BATCH PROCESSOR ═══════════════════════
 async def _process_one(msg, st, stats, lock):
-    """Process a single message and update stats safely."""
+    """Process a single message and update stats safely, with live logs."""
+    msg_id = getattr(msg, "id", "?")
     try:
         result = await process_message(msg, mode="manual")
         s = result["status"]
         rec = result.get("record") or {}
+        title = rec.get("title") or rec.get("series_title") or "?"
+        rtype = rec.get("type") or "?"
+        quality = rec.get("quality") or "-"
+        codec = rec.get("codec") or "-"
+        audio = ",".join(rec.get("audio_languages") or []) or "-"
+
         async with lock:
             stats["processed"] += 1
+            st["current_message_id"] = msg.id
             if s == "saved":
                 stats["indexed"] += 1
-                rtype = rec.get("type")
                 if rtype == "movie":
                     stats["movies"] += 1
                 elif rtype == "series":
                     stats["series"] += 1
+                shard = result.get("shard_index")
+                logger.info(
+                    f"[IDX] ✅ SAVED msg={msg_id} type={rtype} "
+                    f"title='{title}' q={quality} c={codec} a={audio} "
+                    f"shard=DB{shard+1 if isinstance(shard, int) else shard}"
+                )
             elif s == "duplicate":
                 stats["duplicates"] += 1
+                reason = result.get("reason") or "unknown"
+                shard = result.get("shard_index")
+                logger.info(
+                    f"[IDX] ♻️ DUPLICATE msg={msg_id} reason={reason} "
+                    f"title='{title}' shard=DB{shard+1 if isinstance(shard, int) else shard}"
+                )
             elif s == "skipped":
                 stats["skipped"] += 1
+                reason = result.get("reason") or "no_reason"
+                logger.info(f"[IDX] ⏭️ SKIPPED msg={msg_id} reason={reason}")
             else:
                 stats["failed"] += 1
-            st["current_message_id"] = msg.id
+                reason = result.get("reason") or "unknown"
+                logger.warning(f"[IDX] ❌ FAILED msg={msg_id} reason={reason}")
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.warning(f"Message {getattr(msg, 'id', '?')} failed: {e}")
+        logger.warning(f"[IDX] ❌ ERROR msg={msg_id}: {type(e).__name__}: {e}")
         async with lock:
             stats["processed"] += 1
             stats["failed"] += 1
-
+            st["current_message_id"] = msg.id
 
 async def _process_batch(msgs, st, stats, concurrency: int = 20):
     """Process a batch of messages with bounded concurrency."""
