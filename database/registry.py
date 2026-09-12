@@ -1,14 +1,29 @@
-import logging
-from typing import Optional
+from typing import List
 from database.connection import DatabaseManager
-
-logger = logging.getLogger(__name__)
 
 class DatabaseRegistry:
     def __init__(self, manager: DatabaseManager):
         self._manager = manager
-        self._media_shard_index = 0
 
+    def system_entries(self) -> List:
+        return self._manager.get_system_entries()
+
+    def user_entries(self) -> List:
+        return self._manager.get_user_entries()
+
+    def media_entries(self) -> List:
+        return self._manager.get_media_entries()
+
+    def system_dbs(self) -> List:
+        return [e.db for e in self._manager.get_system_entries()]
+
+    def user_dbs(self) -> List:
+        return [e.db for e in self._manager.get_user_entries()]
+
+    def media_dbs(self) -> List:
+        return [e.db for e in self._manager.get_media_entries()]
+
+    # Legacy accessors kept for other modules
     def get_system_db(self):
         return self._manager.get_system_db()
 
@@ -18,15 +33,8 @@ class DatabaseRegistry:
     def get_catalog_db(self):
         return self._manager.get_catalog_db()
 
-    def get_media_db(self, shard_index: Optional[int] = None):
-        if shard_index is not None:
-            return self._manager.get_media_db(shard_index)
-        count = self._manager.get_media_db_count()
-        if count == 0:
-            return self._manager.get_user_db()
-        db = self._manager.get_media_db(self._media_shard_index)
-        self._media_shard_index = (self._media_shard_index + 1) % count
-        return db
+    def get_media_db(self, i: int = 0):
+        return self._manager.get_media_db(i)
 
     def get_media_shard_count(self) -> int:
         return self._manager.get_media_db_count()
