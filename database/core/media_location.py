@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional
 from database import db_registry
 
 class MediaLocationRepository:
@@ -7,7 +7,7 @@ class MediaLocationRepository:
 
     def _get_collection(self):
         if self._collection is None:
-            db = db_registry.get_core_db()
+            db = db_registry.get_system_db()
             self._collection = db["media_location_registry"]
         return self._collection
 
