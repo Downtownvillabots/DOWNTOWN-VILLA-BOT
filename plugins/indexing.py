@@ -834,6 +834,14 @@ async def _run_job(client: Client, job_id: str) -> None:
 
                 # Process current batch in parallel
                 await _process_batch(msgs, st, stats, concurrency=CONCURRENCY)
+                                # Periodic status log every batch
+                logger.info(
+                    f"[IDX] batch done — current={current} "
+                    f"processed={stats['processed']} saved={stats['indexed']} "
+                    f"dups={stats['duplicates']} skipped={stats['skipped']} "
+                    f"failed={stats['failed']} "
+                    f"movies={stats['movies']} series={stats['series']}"
+                )
 
                 current = next_current
                 if current < 1:
