@@ -308,5 +308,38 @@ async def cb_spol(client: Client, q: CallbackQuery):
             pass
 
 
+# ═══════════════════════ SAFETY NET HANDLER ═══════════════════════
+# Fires if the main handler crashed. Diagnoses and reports.
+@Client.on_message(filters.private & filters.text, group=100)
+async def _safety_net(client: Client, message: Message):
+    """Only fires if no other handler responded. Confirms we're alive."""
+    try:
+        txt = (message.text or "").strip()
+        if not txt or txt.startswith("/"):
+            return
+        logger.info(f"[SAFETY] caught: {txt!r}")
+        # Try to import handlers and report the exact failure
+        try:
+            from media_search import handlers as h
+            # If we can import, call search
+            try:
+                await h._handle_search(client, message, txt, is_group=False)
+            except TypeError:
+                await h._handle_search(client, message, txt)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"[SAFETY] handlers import failed:\n{tb}")
+            try:
+                await message.reply_text(
+                    f"⚠️ ᴀᴜᴛᴏ-ꜰɪʟᴛᴇʀ ᴇʀʀᴏʀ:\n<code>{type(e).__name__}: {e}</code>",
+                    parse_mode="html",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception(f"[SAFETY] failed: {e}")
+
+
 # ═══════════════════════ STARTUP ═══════════════════════
 logger.info("[AUTO-FILTER] handlers registered (PM + callbacks)")
