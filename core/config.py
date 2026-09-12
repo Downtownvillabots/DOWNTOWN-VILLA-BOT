@@ -174,3 +174,10 @@ SPELL_CHECK_THRESHOLD = int(environ.get("SPELL_CHECK_THRESHOLD", "80"))   # 0-10
 SPELL_CHECK_CANDIDATES = int(environ.get("SPELL_CHECK_CANDIDATES", "5"))  # max retries
 MAX_LIST_ELM = int(environ.get("MAX_LIST_ELM", "10"))
 SUGGESTION_TTL = int(environ.get("SUGGESTION_TTL", "60"))                 # auto-delete seconds
+
+# ═══════════════════════ REQUEST CHANNEL ═══════════════════════
+_req_raw = environ.get("REQST_CHANNEL", "0")
+try:
+    REQST_CHANNEL = int(_req_raw) if _req_raw and _req_raw.lstrip("-").isdigit() and int(_req_raw) != 0 else None
+except (TypeError, ValueError):
+    REQST_CHANNEL = None
