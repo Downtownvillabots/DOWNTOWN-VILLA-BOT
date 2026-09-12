@@ -513,14 +513,15 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
     stats = st["stats"]
     total_range = max(1, st["start_message_id"])
     current = st["current_message_id"]
-    done = st["start_message_id"] - current
+    done = max(0, st["start_message_id"] - current)
     pct = min(100.0, (done / total_range) * 100.0)
     elapsed = max(0.0, now - st["start_time"])
     speed = stats["processed"] / (elapsed / 60.0) if elapsed > 0 else 0.0
     remaining = total_range - done
     eta = (remaining / speed) if speed > 0 else None
 
-    mode_label = {"movies": "🎬 MOVIES", "series": "📺 SERIES", "both": "🎬 + 📺 BOTH"}.get(st["mode"], st["mode"].upper())
+    mode_label = {"movies": "🎬 MOVIES", "series": "📺 SERIES",
+                  "both": "🎬 + 📺 BOTH"}.get(st["mode"], st["mode"].upper())
     status_icon = {"running": "🟢 ʀᴜɴɴɪɴɢ", "paused": "🟡 ᴘᴀᴜꜱᴇᴅ",
                    "stopped": "🔴 ꜱᴛᴏᴘᴘᴇᴅ", "completed": "🟢 ᴄᴏᴍᴘʟᴇᴛᴇ",
                    "error": "🔴 ᴇʀʀᴏʀ"}.get(st["status"], st["status"].upper())
@@ -530,12 +531,27 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
         f"📚 <b>{fb('CHANNEL INDEXING')}</b>",
         DIV, "",
         f"📢 {sc('channel')} · <code>{st['channel_title']}</code>",
+        f"🆔 {sc('channel id')} · <code>{st['channel_id']}</code>",
         f"🎬 {sc('mode')} · {mode_label}",
         f"🔄 {sc('direction')} · ɴᴇᴡᴇꜱᴛ → ᴏʟᴅᴇꜱᴛ",
         f"🆔 {sc('start')} · <code>{st['start_message_id']}</code>",
         f"🆔 {sc('current')} · <code>{current}</code>",
         f"⚙️ {sc('status')} · {status_icon}",
         "",
+    ]
+
+    # ── Show error details when the job failed ──
+    if st["status"] == "error" and st.get("error"):
+        lines.extend([
+            DIV,
+            f"🔴 <b>{fb('ERROR DETAILS')}</b>",
+            f"<code>{st['error'][:400]}</code>",
+            "",
+            "💡 ᴍᴀᴋᴇ ꜱᴜʀᴇ ᴛʜᴇ ʙᴏᴛ ɪꜱ ᴀɴ <b>ADMIN</b> ɪɴ ᴛʜᴇ ꜱᴏᴜʀᴄᴇ ᴄʜᴀɴɴᴇʟ.",
+            "",
+        ])
+
+    lines.extend([
         DIV,
         f"📦 {sc('processed')} · <code>{fmt_int(stats['processed'])}</code>",
         f"✅ {sc('indexed')} · <code>{fmt_int(stats['indexed'])}</code>",
@@ -552,7 +568,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
         f"⚡ {sc('speed')} · <code>{speed:.1f} ꜰɪʟᴇꜱ/ᴍɪɴ</code>",
         f"🕒 {sc('eta')} · <code>{fmt_duration(eta) if eta else '—'}</code>",
         f"⏱️ {sc('elapsed')} · <code>{fmt_duration(elapsed)}</code>",
-    ]
+    ])
     text = "\n".join(lines)
 
     is_final = st["status"] in ("completed", "stopped", "error")
@@ -581,14 +597,12 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
     except Exception:
         pass
 
-
 # ═══════════════════════ JOB WORKER ═══════════════════════
 async def _run_job(client: Client, job_id: str) -> None:
     st = jobs.get(job_id)
     if not st:
         return
     stats = st["stats"]
-    mode = st["mode"]
     channel_id = st["channel_id"]
 
     async def _finish(status: str):
@@ -600,13 +614,32 @@ async def _run_job(client: Client, job_id: str) -> None:
                 "end_time": datetime.utcnow(),
                 "stats": stats,
                 "current_message_id": st["current_message_id"],
+                "error": st.get("error"),
             })
 
     try:
-        # Start from start_message_id + 1 so Pyrogram includes start_message_id
+        # ── Verify bot can access the channel BEFORE iterating ──
+        try:
+            chat = await client.get_chat(channel_id)
+            st["channel_title"] = chat.title or st.get("channel_title")
+        except Exception as e:
+            st["error"] = (
+                f"Cannot access channel {channel_id}: {type(e).__name__}: {e}\n"
+                f"👉 Add the bot as ADMIN in that channel."
+            )
+            await _finish("error")
+            return
+
+        # ── Iterate from start_message_id downward ──
         offset = st["start_message_id"] + 1
-        async for msg in client.get_chat_history(channel_id, offset_id=offset):
-            # Cooperative pause
+        try:
+            history = client.get_chat_history(channel_id, offset_id=offset)
+        except Exception as e:
+            st["error"] = f"get_chat_history failed: {type(e).__name__}: {e}"
+            await _finish("error")
+            return
+
+        async for msg in history:
             while st["status"] == "paused":
                 await asyncio.sleep(1.0)
 
@@ -619,18 +652,18 @@ async def _run_job(client: Client, job_id: str) -> None:
 
             try:
                 result = await process_message(msg, mode="manual")
-                status = result["status"]
+                s = result["status"]
                 rec = result.get("record") or {}
-                if status == "saved":
+                if s == "saved":
                     stats["indexed"] += 1
                     rtype = rec.get("type")
                     if rtype == "movie":
                         stats["movies"] += 1
                     elif rtype == "series":
                         stats["series"] += 1
-                elif status == "duplicate":
+                elif s == "duplicate":
                     stats["duplicates"] += 1
-                elif status == "skipped":
+                elif s == "skipped":
                     stats["skipped"] += 1
                 else:
                     stats["failed"] += 1
@@ -640,21 +673,19 @@ async def _run_job(client: Client, job_id: str) -> None:
                 logger.warning(f"Message {msg.id} failed: {e}")
                 stats["failed"] += 1
 
-            # Throttled progress render
             await _render_progress(client, job_id, force=False)
 
-        # Completed
         await _finish("completed")
+
     except asyncio.CancelledError:
         st["status"] = "stopped"
         raise
     except Exception as e:
         logger.exception("Job failed")
-        st["error"] = str(e)
+        st["error"] = f"{type(e).__name__}: {e}"
         await _finish("error")
     finally:
         jobs.drop(job_id)
-
 
 # ═══════════════════════ PAUSE / RESUME / STOP ═══════════════════════
 @Client.on_callback_query(filters.regex(r"^idx_pause:(.+)$"))
