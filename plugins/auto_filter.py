@@ -293,6 +293,20 @@ async def cb_check_sub(client: Client, q: CallbackQuery):
         logger.warning(f"[CB] check_sub failed: {e}")
         await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
 
+# ═══════════════════════ CALLBACK — Spell suggestion picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^spol:([a-f0-9]+):(\d+)$"))
+async def cb_spol(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_suggestion(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] spol failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
 
 # ═══════════════════════ STARTUP ═══════════════════════
 logger.info("[AUTO-FILTER] handlers registered (PM + callbacks)")
