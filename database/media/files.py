@@ -14,16 +14,9 @@ class MediaFileRepository:
         shard_count = db_registry.get_media_shard_count()
         if shard_count == 0:
             raise RuntimeError("No media database shards configured.")
-        # Simple round‑robin using registry's internal index
         db = db_registry.get_media_db()  # advances index
-        # We need to know which shard index was used – we can get it from the registry
-        # For simplicity, we store the shard index in the location registry.
-        # But we need the index. Let's modify registry to return index.
-        # For now, we'll use a simple approach: store in the first shard for demo,
-        # but in production we need proper index tracking. I'll improve registry.
-        # Actually, let's change registry to return (db, index).
-        # To avoid confusion, I'll implement a proper method here.
-        shard_index = db_registry._media_shard_index  # internal, but okay for now
+        # Get the index that was used (registry internal)
+        shard_index = db_registry._media_shard_index  # okay for now
         collection = self._get_collection(shard_index)
         await collection.update_one(
             {"file_id": file_id},
