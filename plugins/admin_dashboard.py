@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -38,8 +39,8 @@ BAR_EMPTY = "░"
 BAR_WIDTH = 20
 MAX_LATENCY_HISTORY = 30
 
-CACHE_TTL = 10                # seconds
-LIVE_REFRESH_DEFAULT = 10     # seconds
+CACHE_TTL = 10
+LIVE_REFRESH_DEFAULT = 10
 LIVE_REFRESH_OPTIONS = [5, 10, 15, 30, 60]
 RECENT_DOC_LIMITS = [5, 10, 20]
 COLLECTIONS_PAGE_SIZE = 25
@@ -170,21 +171,12 @@ class TTLCache:
         else:
             self._data.pop(key, None)
 
-    async def get_or_set(self, key: str, factory) -> Any:
-        cached = self.get(key)
-        if cached is not None:
-            return cached
-        value = await factory()
-        self.set(key, value)
-        return value
-
 
 cache = TTLCache()
 
 
 # ============================ AUDIT LOG ============================
 class DatabaseAuditLogger:
-    """In-memory audit log + optional channel message. Never logs secrets."""
     def __init__(self, max_entries: int = 200):
         self._entries: deque = deque(maxlen=max_entries)
 
@@ -503,7 +495,6 @@ duplicate_manager = DuplicateManager()
 
 # ============================ CONFIRMATION MANAGER ============================
 class ConfirmationManager:
-    """Tracks multi-step destructive confirmations per (admin, action)."""
     def __init__(self, ttl: int = 120):
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._ttl = ttl
@@ -555,7 +546,6 @@ confirmations = ConfirmationManager()
 
 # ============================ LIVE REFRESH MANAGER ============================
 class LiveRefreshManager:
-    """One shared background task per admin message, cancellable."""
     def __init__(self):
         self._tasks: Dict[int, asyncio.Task] = {}
         self._state: Dict[int, Dict[str, Any]] = {}
@@ -606,7 +596,7 @@ class LiveRefreshManager:
                             message_id=message_id,
                             text=text,
                             reply_markup=kb,
-                            parse_mode="html",
+                            parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
                     except Exception:
@@ -757,7 +747,7 @@ async def render_collection_detail(idx: int, coll_name: str) -> Tuple[str, Inlin
     db = entry["db"]
     stats = await MongoDiagnostics.coll_stats(db, coll_name)
     lines = [
-        f"🧱 <b>COLLECTION</b>",
+        "🧱 <b>COLLECTION</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📚 Name: <code>{escape(coll_name)}</code>",
     ]
@@ -1170,12 +1160,11 @@ def final_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
 
 # ============================ VIEW ROUTER ============================
 def render_view(view: str, data: Dict[str, Any], extra: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    """Synchronous render for live refresh. Falls back if needed."""
     try:
         if view == "main":
             return render_main(data)
         if view == "health":
-            return asyncio.get_event_loop().run_until_complete(render_health(data)) if False else render_health_sync(data)
+            return render_health_sync(data)
         if view == "perf":
             return render_perf_sync(data)
         if view == "dist":
@@ -1267,11 +1256,12 @@ async def cmd_database(client: Client, message: Message):
         data = await stats_manager.get_full_stats(force=True)
     except Exception as e:
         logger.exception("cmd_database failed")
-        await msg.edit_text(f"🔴 Failed: <code>{escape(e)}</code>", parse_mode="html")
+        await msg.edit_text(f"🔴 Failed: <code>{escape(e)}</code>",
+                            parse_mode=ParseMode.HTML)
         return
     text, kb = render_main(data)
     try:
-        await msg.edit_text(text, reply_markup=kb, parse_mode="html",
+        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True)
     except Exception as e:
         logger.warning(f"edit_text failed: {e}")
@@ -1285,7 +1275,7 @@ async def cb_main(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats(force=True)
     text, kb = render_main(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1300,7 +1290,7 @@ async def cb_refresh(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats(force=True)
     text, kb = render_main(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1318,7 +1308,7 @@ async def cb_detail(client: Client, q: CallbackQuery):
         await q.answer("Not found", show_alert=True); return
     text, kb = render_db_detail(db)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1337,7 +1327,7 @@ async def cb_colls(client: Client, q: CallbackQuery):
         await q.answer("Not found", show_alert=True); return
     text, kb = render_collections(idx, db, page)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1352,7 +1342,7 @@ async def cb_coll(client: Client, q: CallbackQuery):
     coll = q.matches[0].group(2)
     text, kb = await render_collection_detail(idx, coll)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1369,7 +1359,7 @@ async def cb_recent(client: Client, q: CallbackQuery):
     limit = int(limit_str) if limit_str else 5
     text, kb = await render_recent(idx, coll, limit)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1384,7 +1374,7 @@ async def cb_idx(client: Client, q: CallbackQuery):
     coll = q.matches[0].group(2)
     text, kb = await render_indexes(idx, coll)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1398,7 +1388,7 @@ async def cb_health(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats(force=True)
     text, kb = await render_health(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1412,7 +1402,7 @@ async def cb_perf(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats()
     text, kb = await render_performance(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1426,7 +1416,7 @@ async def cb_dist(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats()
     text, kb = await render_distribution(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1440,7 +1430,7 @@ async def cb_media(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats()
     text, kb = await render_media(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1453,7 +1443,7 @@ async def cb_user(client: Client, q: CallbackQuery):
         await q.answer("⛔ Unauthorized", show_alert=True); return
     text, kb = await render_user_db()
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1466,7 +1456,7 @@ async def cb_errors(client: Client, q: CallbackQuery):
         await q.answer("⛔ Unauthorized", show_alert=True); return
     text, kb = await render_errors()
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1479,7 +1469,7 @@ async def cb_audit(client: Client, q: CallbackQuery):
         await q.answer("⛔ Unauthorized", show_alert=True); return
     text, kb = await render_audit()
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1493,7 +1483,7 @@ async def cb_config(client: Client, q: CallbackQuery):
     data = await stats_manager.get_full_stats()
     text, kb = await render_config(data)
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1507,7 +1497,7 @@ async def cb_dups(client: Client, q: CallbackQuery):
     await q.answer("Scanning...")
     text, kb = await render_duplicates()
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
@@ -1527,7 +1517,7 @@ async def cb_duprem(client: Client, q: CallbackQuery):
     )
     try:
         await q.message.edit_text(text, reply_markup=confirm_keyboard(token, 1),
-                                  parse_mode="html")
+                                  parse_mode=ParseMode.HTML)
     except Exception:
         pass
     await q.answer()
@@ -1562,13 +1552,12 @@ async def cb_confirm(client: Client, q: CallbackQuery):
             )
             kb = final_confirm_keyboard(token)
         try:
-            await q.message.edit_text(text, reply_markup=kb, parse_mode="html")
+            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
             pass
         await q.answer()
         return
 
-    # Step 3 reached: execute
     confirmations.cancel(q.from_user.id, token)
     payload = entry["payload"]
     action = payload.get("action")
@@ -1584,7 +1573,7 @@ async def cb_confirm(client: Client, q: CallbackQuery):
         )
         try:
             await q.message.edit_text(text, reply_markup=back_keyboard("db_dups"),
-                                      parse_mode="html")
+                                      parse_mode=ParseMode.HTML)
         except Exception:
             pass
         await q.answer()
@@ -1627,7 +1616,7 @@ async def cb_maint(client: Client, q: CallbackQuery):
         ],
     ])
     try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html")
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception:
         pass
     await q.answer()
@@ -1659,7 +1648,7 @@ async def cb_live(client: Client, q: CallbackQuery):
         await q.message.edit_text(
             "🟢 <b>LIVE MONITORING</b>\nChoose refresh interval:",
             reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode="html",
+            parse_mode=ParseMode.HTML,
         )
     except Exception:
         pass
@@ -1678,7 +1667,7 @@ async def cb_livego(client: Client, q: CallbackQuery):
     try:
         data = await stats_manager.get_full_stats(force=True)
         text, kb = render_main(data)
-        await q.message.edit_text(text, reply_markup=kb, parse_mode="html",
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
