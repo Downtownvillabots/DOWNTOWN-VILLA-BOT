@@ -99,12 +99,12 @@ def pcolor(p: float) -> str:
     try:
         p = float(p)
     except (TypeError, ValueError):
-        return "⚪"
-    if p >= 100: return "🔴"
-    if p >= 90:  return "🔴"
-    if p >= 75:  return "🟠"
-    if p >= 60:  return "🟡"
-    return "🟢"
+        return "🔴"
+    if p >= 100: return "🟢"
+    if p >= 75:  return "🟢"
+    if p >= 50:  return "🟡"
+    if p >= 25:  return "🟠"
+    return "🔴"
 
 def progress_line(label: str, p: float, w: int = BAR_W) -> str:
     return f"{pcolor(p)} <b>{sc(label)}</b> · <code>{p:.1f}%</code>\n<code>{pbar(p, w)}</code>"
@@ -517,14 +517,99 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
     pct = min(100.0, (done / total_range) * 100.0)
     elapsed = max(0.0, now - st["start_time"])
     speed = stats["processed"] / (elapsed / 60.0) if elapsed > 0 else 0.0
-    remaining = total_range - done
-    eta = (remaining / speed) if speed > 0 else None
 
     mode_label = {"movies": "🎬 MOVIES", "series": "📺 SERIES",
                   "both": "🎬 + 📺 BOTH"}.get(st["mode"], st["mode"].upper())
-    status_icon = {"running": "🟢 ʀᴜɴɴɪɴɢ", "paused": "🟡 ᴘᴀᴜꜱᴇᴅ",
-                   "stopped": "🔴 ꜱᴛᴏᴘᴘᴇᴅ", "completed": "🟢 ᴄᴏᴍᴘʟᴇᴛᴇ",
-                   "error": "🔴 ᴇʀʀᴏʀ"}.get(st["status"], st["status"].upper())
+
+    # ────────── COMPLETED SCREEN ──────────
+    if st["status"] == "completed":
+        avg = speed
+        text = "\n".join([
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"✅ <b>{fb('INDEXING COMPLETE')}</b>",
+            DIV, "",
+            f"📢 {sc('channel')} · <code>{st['channel_title']}</code>",
+            f"🎬 {sc('mode')} · {mode_label}",
+            "",
+            DIV,
+            f"📦 {sc('total processed')} · <code>{fmt_int(stats['processed'])}</code>",
+            f"✅ {sc('files stored')} · <code>{fmt_int(stats['indexed'])}</code>",
+            f"⏭️ {sc('duplicates found')} · <code>{fmt_int(stats['duplicates'])}</code>",
+            f"⏭️ {sc('skipped')} · <code>{fmt_int(stats['skipped'])}</code>",
+            f"❌ {sc('errors')} · <code>{fmt_int(stats['failed'])}</code>",
+            "",
+            f"🎬 {sc('movies')} · <code>{fmt_int(stats['movies'])}</code>",
+            f"📺 {sc('series')} · <code>{fmt_int(stats['series'])}</code>",
+            "",
+            DIV,
+            f"{pcolor_progress(100.0)} <b>{sc('progress')}</b> · <code>100.0%</code>",
+            f"<code>{pbar(100.0)}</code>",
+            "",
+            f"⏱️ {sc('total time')} · <code>{fmt_duration(elapsed)}</code>",
+            f"⚡ {sc('avg speed')} · <code>{avg:.1f} ꜰɪʟᴇꜱ/ᴍɪɴ</code>",
+        ])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CLOSE", callback_data="idx_close")]])
+        try:
+            await client.edit_message_text(
+                chat_id=st["chat_id"], message_id=st["message_id"],
+                text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+        except Exception:
+            pass
+        return
+
+    # ────────── STOPPED SCREEN ──────────
+    if st["status"] == "stopped":
+        text = "\n".join([
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"🛑 <b>{fb('INDEXING STOPPED')}</b>",
+            DIV, "",
+            f"📢 {sc('channel')} · <code>{st['channel_title']}</code>",
+            "",
+            f"📦 {sc('processed')} · <code>{fmt_int(stats['processed'])}</code>",
+            f"✅ {sc('files stored')} · <code>{fmt_int(stats['indexed'])}</code>",
+            f"⏭️ {sc('duplicates')} · <code>{fmt_int(stats['duplicates'])}</code>",
+            f"❌ {sc('errors')} · <code>{fmt_int(stats['failed'])}</code>",
+        ])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CLOSE", callback_data="idx_close")]])
+        try:
+            await client.edit_message_text(
+                chat_id=st["chat_id"], message_id=st["message_id"],
+                text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+        except Exception:
+            pass
+        return
+
+    # ────────── ERROR SCREEN ──────────
+    if st["status"] == "error":
+        text = "\n".join([
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"🔴 <b>{fb('INDEXING ERROR')}</b>",
+            DIV, "",
+            f"📢 {sc('channel')} · <code>{st['channel_title']}</code>",
+            "",
+            f"<code>{(st.get('error') or 'Unknown error')[:400]}</code>",
+            "",
+            f"📦 {sc('processed')} · <code>{fmt_int(stats['processed'])}</code>",
+            f"✅ {sc('files stored')} · <code>{fmt_int(stats['indexed'])}</code>",
+        ])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CLOSE", callback_data="idx_close")]])
+        try:
+            await client.edit_message_text(
+                chat_id=st["chat_id"], message_id=st["message_id"],
+                text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+        except Exception:
+            pass
+        return
+
+    # ────────── RUNNING / PAUSED SCREEN ──────────
+    status_icon = {"running": "🟢 ʀᴜɴɴɪɴɢ", "paused": "🟡 ᴘᴀᴜꜱᴇᴅ"}.get(
+        st["status"], st["status"].upper())
 
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -538,20 +623,6 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
         f"🆔 {sc('current')} · <code>{current}</code>",
         f"⚙️ {sc('status')} · {status_icon}",
         "",
-    ]
-
-    # ── Show error details when the job failed ──
-    if st["status"] == "error" and st.get("error"):
-        lines.extend([
-            DIV,
-            f"🔴 <b>{fb('ERROR DETAILS')}</b>",
-            f"<code>{st['error'][:400]}</code>",
-            "",
-            "💡 ᴍᴀᴋᴇ ꜱᴜʀᴇ ᴛʜᴇ ʙᴏᴛ ɪꜱ ᴀɴ <b>ADMIN</b> ɪɴ ᴛʜᴇ ꜱᴏᴜʀᴄᴇ ᴄʜᴀɴɴᴇʟ.",
-            "",
-        ])
-
-    lines.extend([
         DIV,
         f"📦 {sc('processed')} · <code>{fmt_int(stats['processed'])}</code>",
         f"✅ {sc('indexed')} · <code>{fmt_int(stats['indexed'])}</code>",
@@ -563,19 +634,15 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
         f"📺 {sc('series')} · <code>{fmt_int(stats['series'])}</code>",
         "",
         DIV,
-        progress_line("progress", pct),
+        f"{pcolor_progress(pct)} <b>{sc('progress')}</b> · <code>{pct:.1f}%</code>",
+        f"<code>{pbar(pct)}</code>",
         "",
         f"⚡ {sc('speed')} · <code>{speed:.1f} ꜰɪʟᴇꜱ/ᴍɪɴ</code>",
-        f"🕒 {sc('eta')} · <code>{fmt_duration(eta) if eta else '—'}</code>",
         f"⏱️ {sc('elapsed')} · <code>{fmt_duration(elapsed)}</code>",
-    ])
+    ]
     text = "\n".join(lines)
 
-    is_final = st["status"] in ("completed", "stopped", "error")
-    if is_final:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏠 HOME", callback_data="idx_main")]])
-    elif st["status"] == "paused":
+    if st["status"] == "paused":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("▶️ RESUME", callback_data=f"idx_resume:{job_id}"),
              InlineKeyboardButton("❌ STOP", callback_data=f"idx_stop:{job_id}")],
@@ -590,8 +657,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
         await client.edit_message_text(
             chat_id=st["chat_id"], message_id=st["message_id"],
             text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            disable_web_page_preview=True)
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
     except Exception:
