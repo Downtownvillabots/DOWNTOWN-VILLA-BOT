@@ -1,4 +1,3 @@
-# database/config.py
 import os
 from typing import List, Optional
 
