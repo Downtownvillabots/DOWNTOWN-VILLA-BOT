@@ -663,3 +663,127 @@ async def _filter_hits(session) -> List[FileHit]:
     if session.selected_quality:
         hits = [h for h in hits if (h.quality or "").upper() == session.selected_quality.upper()]
     return hits
+# ═══════════════════════ NO-RESULTS + SPELL CHECK FLOW ═══════════════════════
+async def _handle_no_results(client: Client, message: Message, status,
+                             raw_query: str, norm: str, is_series: bool):
+    """Triggered when a search returns zero hits. Runs spell-check flow."""
+    from core.config import SPELL_CHECK_REPLY
+    from media_search.spell_check import ai_spell_check, get_suggestions, clean_query
+
+    # ── Stage 1: auto-correct (only if enabled) ──
+    if SPELL_CHECK_REPLY:
+        await _edit(status, "🤖 ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ, ᴀɪ ɪꜱ ᴄʜᴇᴄᴋɪɴɢ ʏᴏᴜʀ ꜱᴘᴇʟʟɪɴɢ...")
+        corrected = None
+        try:
+            corrected = await ai_spell_check(raw_query, is_series=is_series)
+        except Exception as e:
+            logger.warning(f"[SEARCH] ai_spell_check failed: {e}")
+
+        if corrected and normalize(corrected) != norm:
+            await _edit(
+                status,
+                f"✅ ᴀɪ ꜱᴜɢɢᴇꜱᴛᴇᴅ: <code>{corrected}</code>\n"
+                f"🔍 ꜱᴇᴀʀᴄʜɪɴɢ ꜰᴏʀ ɪᴛ...",
+            )
+            await asyncio.sleep(0.6)
+            # Recursive retry with corrected title
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            return await _handle_search(client, message, corrected, is_group=False)
+
+    # ── Stage 2: manual picker ──
+    cleaned = clean_query(raw_query)
+    suggestions: List[Dict] = []
+    try:
+        suggestions = await get_suggestions(cleaned, is_series=is_series)
+    except Exception as e:
+        logger.warning(f"[SEARCH] suggestion fetch failed: {e}")
+
+    if not suggestions:
+        # Nothing to suggest — log request + friendly message
+        try:
+            await request_repo.add(message.from_user.id, norm, raw_query,
+                                   "series" if is_series else "movie")
+        except Exception:
+            pass
+        await _edit(
+            status,
+            f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+            f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>\n\n"
+            f"📝 ʀᴇǫᴜᴇꜱᴛ ʀᴇᴄᴏʀᴅᴇᴅ.",
+        )
+        return
+
+    # Save suggestion session
+    session = await sessions.create(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        query=raw_query,
+        normalized_query=norm,
+        mode="series" if is_series else "movie",
+        candidates=suggestions,
+    )
+    if not session:
+        await _edit(status, "❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ. ᴛʀʏ ᴀɢᴀɪɴ.")
+        return
+
+    # Build picker buttons
+    rows: List[List[InlineKeyboardButton]] = []
+    for i, s in enumerate(suggestions[:10]):
+        title = s.get("title") or "?"
+        year = s.get("year")
+        label = f"🎬 {title}" + (f" ({year})" if year else "")
+        rows.append([InlineKeyboardButton(
+            label.upper(),
+            callback_data=f"spol:{session.session_id}:{i}",
+        )])
+    rows.append([InlineKeyboardButton("🔍 CHECK ON GOOGLE",
+                                      url=f"https://www.google.com/search?q={raw_query}")])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
+
+    text = "\n".join([
+        "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+        "🤔 <b>ᴅɪᴅ ʏᴏᴜ ᴍᴇᴀɴ?</b>",
+        DIV, "",
+        f"🔍 Yᴏᴜ ꜱᴇᴀʀᴄʜᴇᴅ: <code>{raw_query}</code>",
+        f"📝 ᴡᴇ ꜰᴏᴜɴᴅ <b>{len(suggestions)}</b> ᴘᴏꜱꜱɪʙʟᴇ ᴛɪᴛʟᴇꜱ:",
+        "",
+        "ᴘɪᴄᴋ ᴛʜᴇ ᴏɴᴇ ʏᴏᴜ ᴍᴇᴀɴᴛ:",
+    ])
+    await _edit(status, text, kb=InlineKeyboardMarkup(rows))
+
+
+# ═══════════════════════ SPOL CALLBACK IMPLEMENTATION ═══════════════════════
+async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int):
+    """Called from auto_filter.py's spol callback."""
+    session = await sessions.get(sid)
+    if not session or session.user_id != q.from_user.id:
+        await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        return
+    if idx >= len(session.candidates):
+        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        return
+
+    s = session.candidates[idx]
+    title = s.get("title") or ""
+    await q.answer("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
+
+    # Re-run the search with the suggested title
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    # Reuse the original user's message context: build a fake call
+    class _FakeMsg:
+        def __init__(self, msg, from_user, chat):
+            self._msg = msg
+            self.from_user = from_user
+            self.chat = chat
+            self.text = title
+            self.id = msg.id
+        async def reply_text(self, *a, **kw):
+            return await self._msg.reply_text(*a, **kw)
+    fake = _FakeMsg(q.message, q.from_user, q.message.chat)
+    await _handle_search(client, fake, title, is_group=False)
