@@ -30,6 +30,10 @@ class MediaFileRepository:
                           else "logical",
                 "record": existing,
             }
+                    logger.info(
+            f"[IDX] stored file='{record.get('file_name')}' "
+            f"title='{record.get('title')}' shard=DB{shard_index+1}"
+        )
 
         # 2. Route to correct shard
         try:
