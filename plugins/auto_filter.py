@@ -2,30 +2,30 @@
 """
 🏨 DOWNTOWN VILLA — AUTO-FILTER PLUGIN
 ======================================
-PM Search + Auto-Filter.
-Handlers are declared AT TOP LEVEL so Pyrogram's plugin loader finds them.
+PM Search handlers + all search callbacks, registered at top level
+so Pyrogram's plugin loader finds them.
 """
 import logging
-import re
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import CallbackQuery, Message
 
 logger = logging.getLogger(__name__)
 
-# ── Lazy-imported at handler runtime to avoid load-time circular issues ──
-_handle_search = None
+# Handler implementations live here for top-level registration
+_handlers_mod = None
 
 
-def _get_search_fn():
-    global _handle_search
-    if _handle_search is None:
-        from media_search.handlers import _handle_search as fn
-        _handle_search = fn
-    return _handle_search
+def _h():
+    """Lazy import to avoid load-order issues."""
+    global _handlers_mod
+    if _handlers_mod is None:
+        from media_search import handlers as h
+        _handlers_mod = h
+    return _handlers_mod
 
 
-# ═══════════════════════ PM SEARCH HANDLER ═══════════════════════
+# ═══════════════════════ PM TEXT HANDLER ═══════════════════════
 @Client.on_message(
     filters.private
     & filters.text
@@ -34,25 +34,19 @@ def _get_search_fn():
     & ~filters.regex(r"https?://")
 )
 async def pm_text(client: Client, message: Message):
-    """Every incoming PM text (not command, not URL) triggers a search."""
+    """Every PM text (not command, not URL) triggers a search."""
     try:
         query = (message.text or "").strip()
         if not query:
             return
-
         logger.info(f"[PM] from={message.from_user.id} text={query[:60]!r}")
-
         if len(query) < 2 or len(query) > 120:
-            logger.info(f"[PM] skipped length={len(query)}")
             return
-
-        fn = _get_search_fn()
+        h = _h()
         try:
-            await fn(client, message, query, is_group=False)
+            await h._handle_search(client, message, query, is_group=False)
         except TypeError:
-            # Older signature without is_group — fall back
-            await fn(client, message, query)
-
+            await h._handle_search(client, message, query)
     except Exception as e:
         logger.exception(f"[PM] handler failed: {type(e).__name__}: {e}")
 
@@ -68,7 +62,6 @@ async def cmd_pm_search(client: Client, message: Message):
         ]
     except Exception:
         is_admin = False
-
     if not is_admin:
         await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
         return
@@ -80,7 +73,6 @@ async def cmd_pm_search(client: Client, message: Message):
             parse_mode="html",
         )
         return
-
     enable = parts[1].lower().strip() in ("on", "true")
     try:
         from database import db_registry
@@ -92,16 +84,200 @@ async def cmd_pm_search(client: Client, message: Message):
         )
     except Exception as e:
         logger.warning(f"[PM] toggle failed: {e}")
-
     await message.reply_text(
         f"✅ ᴘᴍ ꜱᴇᴀʀᴄʜ: <b>{'ᴏɴ' if enable else 'ᴏꜰꜰ'}</b>",
         parse_mode="html",
     )
 
 
-# ═══════════════════════ SUBSCRIPTION CHECK BUTTON ═══════════════════════
+# ═══════════════════════ /autofilter STATUS ═══════════════════════
+@Client.on_message(filters.private & filters.command("autofilter"))
+async def cmd_autofilter(client: Client, message: Message):
+    try:
+        from core.config import ADMINS
+        if int(message.from_user.id) not in [
+            int(a) for a in ADMINS if str(a).lstrip("-").isdigit()
+        ]:
+            await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
+            return
+    except Exception:
+        await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
+        return
+    await message.reply_text(
+        "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+        "🔎 <b>AUTO-FILTER: ONLINE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "ᴛʏᴘᴇ ᴀɴʏ ᴛɪᴛʟᴇ ɪɴ ᴘᴍ ᴛᴏ ꜱᴇᴀʀᴄʜ.",
+        parse_mode="html",
+    )
+
+
+# ═══════════════════════ CALLBACK — Title picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:pick:([a-f0-9]+):(\d+)$"))
+async def cb_pick(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_title(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] pick failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Language picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:lang:([a-f0-9]+):(\d+)$"))
+async def cb_lang(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_lang(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] lang failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Season picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:seas:([a-f0-9]+):(\d+)$"))
+async def cb_season(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_season(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] season failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Episode picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:ep:([a-f0-9]+):(\d+)$"))
+async def cb_episode(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_episode(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] episode failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Episode page ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:ep_page:([a-f0-9]+):(\d+)$"))
+async def cb_ep_page(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        page = int(q.matches[0].group(2))
+        await _h()._episode_page(client, q, sid, page)
+    except Exception as e:
+        logger.exception(f"[CB] ep_page failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Quality picker ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:q:([a-f0-9]+):(\d+)$"))
+async def cb_quality(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_quality(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] quality failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — File picker (deliver) ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:file:([a-f0-9]+):(\d+)$"))
+async def cb_file(client: Client, q: CallbackQuery):
+    try:
+        sid = q.matches[0].group(1)
+        idx = int(q.matches[0].group(2))
+        await _h()._pick_file(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] file failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Back navigation ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:back:([a-f0-9]+)$"))
+async def cb_back(client: Client, q: CallbackQuery):
+    try:
+        await _h()._back_to_titles(client, q, q.matches[0].group(1))
+    except Exception as e:
+        logger.exception(f"[CB] back failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^sr:lang_back:([a-f0-9]+)$"))
+async def cb_lang_back(client: Client, q: CallbackQuery):
+    try:
+        await _h()._back_to_langs(client, q, q.matches[0].group(1))
+    except Exception as e:
+        logger.exception(f"[CB] lang_back failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^sr:q_back:([a-f0-9]+)$"))
+async def cb_q_back(client: Client, q: CallbackQuery):
+    try:
+        await _h()._back_to_quality(client, q, q.matches[0].group(1))
+    except Exception as e:
+        logger.exception(f"[CB] q_back failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^sr:seas_back:([a-f0-9]+)$"))
+async def cb_seas_back(client: Client, q: CallbackQuery):
+    try:
+        await _h()._back_to_seasons(client, q, q.matches[0].group(1))
+    except Exception as e:
+        logger.exception(f"[CB] seas_back failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════ CALLBACK — Close + Sub check ═══════════════════════
+@Client.on_callback_query(filters.regex(r"^sr:close$"))
+async def cb_close(client: Client, q: CallbackQuery):
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.answer("ᴄʟᴏꜱᴇᴅ")
+
+
 @Client.on_callback_query(filters.regex(r"^sr:check_sub$"))
-async def cb_check_sub(client: Client, q):
+async def cb_check_sub(client: Client, q: CallbackQuery):
     try:
         from media_search.subscription import subscription
         ok, _ = await subscription.is_subscribed(client, q.from_user.id)
@@ -114,152 +290,9 @@ async def cb_check_sub(client: Client, q):
         else:
             await q.answer("❌ ꜱᴛɪʟʟ ᴍɪꜱꜱɪɴɢ ᴄʜᴀɴɴᴇʟꜱ", show_alert=True)
     except Exception as e:
-        logger.warning(f"[PM] check_sub failed: {e}")
+        logger.warning(f"[CB] check_sub failed: {e}")
         await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
 
 
-@Client.on_callback_query(filters.regex(r"^sr:close$"))
-async def cb_close(client: Client, q):
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-    await q.answer("ᴄʟᴏꜱᴇᴅ")
-
-
-@Client.on_callback_query(filters.regex(r"^sr:pick:([a-f0-9]+):(\d+)$"))
-async def cb_pick(client: Client, q):
-    """Multi-match picker callback → re-search that exact title and deliver."""
-    try:
-        session_id = q.matches[0].group(1)
-        idx = int(q.matches[0].group(2))
-
-        from media_search.sessions import sessions
-        from media_search.engine import engine
-        from media_search.ranker import ranker
-        from media_search.delivery import delivery
-        from media_search.normalizer import parse_query
-        from media_search.subscription import subscription
-
-        session = await sessions.get(session_id)
-        if not session or session.user_id != q.from_user.id:
-            await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-            return
-        if idx >= len(session.candidates):
-            await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-            return
-
-        candidate = session.candidates[idx]
-        title = candidate["title"]
-        await q.answer("📤 ꜱᴇɴᴅɪɴɢ...")
-
-        norm, _, is_series = parse_query(title)
-        if candidate.get("type") == "series":
-            result = await engine.search_series(norm, year=candidate.get("year"))
-        else:
-            result = await engine.search_movie(norm, year=candidate.get("year"))
-
-        if not result.hits:
-            await q.message.edit_text("❌ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ.")
-            return
-
-        # Force-sub
-        ok, missing = await subscription.is_subscribed(client, q.from_user.id)
-        if not ok:
-            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            rows = []
-            for ch in missing[:5]:
-                try:
-                    cid = str(ch).replace("-100", "").replace("-", "")
-                    rows.append([InlineKeyboardButton("📢 JOIN CHANNEL",
-                                                      url=f"https://t.me/c/{cid}/1")])
-                except Exception:
-                    pass
-            rows.append([InlineKeyboardButton("🔄 CHECK AGAIN", callback_data="sr:check_sub")])
-            rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-            await q.message.edit_text(
-                "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-                "⚠️ ᴊᴏɪɴ ᴛʜᴇ ᴄʜᴀɴɴᴇʟꜱ ʙᴇʟᴏᴡ ᴛᴏ ɢᴇᴛ ʏᴏᴜʀ ꜰɪʟᴇ.",
-                reply_markup=InlineKeyboardMarkup(rows),
-                parse_mode="html",
-            )
-            return
-
-        best = (
-            ranker.best_for_episode(result.hits) if is_series
-            else ranker.rank(result.hits)[0]
-        )
-
-        ok, err = await delivery.send_file(client, q.from_user.id, best)
-        if ok:
-            try:
-                await q.message.delete()
-            except Exception:
-                pass
-        elif err:
-            await q.message.edit_text(err)
-
-    except Exception as e:
-        logger.exception(f"[PM] pick failed: {e}")
-        try:
-            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception:
-            pass
-
-
-# ═══════════════════════ STARTUP LOG ═══════════════════════
-logger.info("[AUTO-FILTER] PM search handlers registered")
-
-
-
-# ═══════════════════════ DIAGNOSTIC — count indexed files ═══════════════════════
-@Client.on_message(filters.private & filters.command("dbstats"))
-async def cmd_dbstats(client: Client, message: Message):
-    try:
-        from core.config import ADMINS
-        uid = message.from_user.id
-        if int(uid) not in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]:
-            await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
-            return
-    except Exception:
-        await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
-        return
-
-    try:
-        from database import db_registry
-        entries = db_registry.media_entries()
-        lines = [f"🗄️ ᴍᴇᴅɪᴀ ꜱʜᴀʀᴅꜱ: {len(entries)}", ""]
-        total = 0
-        for e in entries:
-            try:
-                count = await e.db["media_files"].estimated_document_count()
-                total += count
-                lines.append(f"  DB{e.index:02d} ({e.label}): <code>{count}</code>")
-            except Exception as ex:
-                lines.append(f"  DB{e.index:02d}: ⚠️ {type(ex).__name__}")
-        lines.append("")
-        lines.append(f"📦 ᴛᴏᴛᴀʟ: <code>{total}</code>")
-
-        # Show a few sample titles
-        if total > 0:
-            lines.append("")
-            lines.append("📋 ꜱᴀᴍᴘʟᴇ ᴛɪᴛʟᴇꜱ:")
-            shown = 0
-            for e in entries:
-                if shown >= 10:
-                    break
-                try:
-                    cursor = e.db["media_files"].find({}, {"title": 1, "type": 1}).limit(10)
-                    async for doc in cursor:
-                        if shown >= 10:
-                            break
-                        title = doc.get("title") or "?"
-                        t = doc.get("type") or "?"
-                        lines.append(f"  • <code>{title}</code> [{t}]")
-                        shown += 1
-                except Exception:
-                    pass
-
-        await message.reply_text("\n".join(lines), parse_mode="html")
-    except Exception as e:
-        await message.reply_text(f"❌ {type(e).__name__}: {e}")
+# ═══════════════════════ STARTUP ═══════════════════════
+logger.info("[AUTO-FILTER] handlers registered (PM + callbacks)")
