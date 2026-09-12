@@ -168,13 +168,31 @@ class _Jobs:
                 await task
             except Exception:
                 pass
+        self.drop(job_id)
         return True
 
+    def force_clear(self, job_id: str) -> None:
+        """Remove state without touching the task (for dead jobs)."""
+        self.state.pop(job_id, None)
+        self.tasks.pop(job_id, None)
+
     def has_running_for_channel(self, channel_id: int) -> Optional[str]:
-        for jid, st in self.state.items():
-            if st.get("channel_id") == channel_id and st["status"] in ("running", "paused"):
-                return jid
+        """Return job_id if a live task exists for this channel. Auto-cleans dead ones."""
+        for jid, st in list(self.state.items()):
+            if st.get("channel_id") != channel_id:
+                continue
+            if st["status"] not in ("running", "paused"):
+                continue
+            # Check task liveness
+            task = self.tasks.get(jid)
+            if task is None or task.done():
+                # Dead job — clean up silently
+                logger.warning(f"Cleaning up dead job {jid} for channel {channel_id}")
+                self.force_clear(jid)
+                continue
+            return jid
         return None
+
 
 jobs = _Jobs()
 
