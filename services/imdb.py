@@ -1,11 +1,6 @@
 """
 🎬 DOWNTOWN VILLA — IMDb service.
-IMDBKit singleton + get_poster() + search_movie() + get_movie().
-Mirrors the old bot's utils.py behavior.
-
-Fallback chain:
-  1. IMDBKit (from git) — no API key needed
-  2. TMDB (via media_search.metadata) — if IMDBKit fails
+IMDBKit singleton + get_poster() + search_titles() + get_movie_details().
 """
 import asyncio
 import logging
@@ -16,7 +11,7 @@ from core.config import MAX_LIST_ELM
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════ IMDBKit SINGLETON ═══════════════════════
+# ── IMDBKit singleton ──
 try:
     from imdbkit import IMDBKit  # type: ignore
     imdb = IMDBKit()
@@ -30,12 +25,11 @@ except Exception as e:
 
 # ═══════════════════════ HELPERS ═══════════════════════
 def _clean_query(q: str) -> str:
-    """Strip punctuation noise from a query."""
     if not q:
         return ""
     q = q.strip()
-    q = re.sub(r"@\w+", "", q)          # @mentions
-    q = re.sub(r"https?://\S+", "", q)  # URLs
+    q = re.sub(r"@\w+", "", q)
+    q = re.sub(r"https?://\S+", "", q)
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
@@ -47,29 +41,25 @@ def _extract_year(text: str) -> Optional[str]:
     return m[-1] if m else None
 
 
-# ═══════════════════════ SEARCH (brief) ═══════════════════════
+def is_available() -> bool:
+    return _HAS_IMDBKIT
+
+
+# ═══════════════════════ SEARCH (brief titles) ═══════════════════════
 async def search_titles(query: str) -> List[Dict[str, Any]]:
-    """
-    Return a list of brief movie/tv titles from IMDb.
-    Shape: [{title, year, imdb_id, kind}, ...]
-    Empty list if IMDBKit unavailable or no matches.
-    """
+    """Return brief list: [{title, year, imdb_id, kind}, ...]"""
     if not _HAS_IMDBKIT or not query:
         return []
-
     q = _clean_query(query)
     if not q:
         return []
-
     try:
         result = await asyncio.to_thread(imdb.search_movie, q.lower())
     except Exception as e:
         logger.warning(f"[IMDB] search_movie failed: {type(e).__name__}: {e}")
         return []
-
     if not result or not getattr(result, "titles", None):
         return []
-
     out: List[Dict[str, Any]] = []
     for m in result.titles:
         title = getattr(m, "title", None)
@@ -86,10 +76,6 @@ async def search_titles(query: str) -> List[Dict[str, Any]]:
 
 # ═══════════════════════ DETAILS (full) ═══════════════════════
 async def get_movie_details(imdb_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch full details for an IMDb id.
-    Shape mirrors the old bot's get_poster output.
-    """
     if not _HAS_IMDBKIT or not imdb_id:
         return None
     try:
@@ -112,10 +98,11 @@ async def get_movie_details(imdb_id: str) -> Optional[Dict[str, Any]]:
                 out.append(name)
         return out
 
-    plot = movie.plot if isinstance(getattr(movie, "plot", None), list) else [
-        getattr(movie, "plot", "")
-    ]
-    plot_text = plot[0] if plot else ""
+    plot = getattr(movie, "plot", None)
+    if isinstance(plot, list):
+        plot_text = plot[0] if plot else ""
+    else:
+        plot_text = plot or ""
     duration = getattr(movie, "duration", None)
     if isinstance(duration, list):
         duration = duration[0] if duration else None
@@ -144,66 +131,60 @@ async def get_movie_details(imdb_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ═══════════════════════ GET_POSTER (old-bot style) ═══════════════════════
-async def get_poster(query: str, bulk: bool = False,
+async def get_poster(query: str = "", bulk: bool = False,
                      id: Optional[str] = None,
                      file: Optional[str] = None) -> Any:
     """
-    Old-bot-compatible get_poster.
-      bulk=True  → return list of brief movies (for suggestion picker)
-      id set     → fetch full details by IMDb id
-      else       → search, take first result, fetch full details
+    bulk=True  → return list of brief movies
+    id set     → fetch full details by IMDb id
+    else       → search, take first, fetch details
     """
     if not _HAS_IMDBKIT:
-        return None if not bulk else []
+        return [] if bulk else None
 
     # ── By ID ──
     if id:
         return await get_movie_details(id)
 
     if not query:
-        return None if not bulk else []
+        return [] if bulk else None
 
-    # Extract year from query if present
+    # Extract year
     q = _clean_query(query)
     year_val = _extract_year(q)
     title = q
     if year_val:
-        title = re.sub(rf"\b{year_val}\b", "", q).strip()
+        title = re.sub(rf"\b{year_val}\b", "", q).strip() or q
 
-    briefs = await search_titles(title.lower())
-    if not briefs:
-        return None if not bulk else []
+    # Search
+    results = await search_titles(title.lower())
+    if not results:
+        return [] if bulk else None
 
-    # Filter by year if provided
+    # Filter by year
     if year_val:
-        by_year = [b for b in briefs if str(b.get("year") or "") == str(year_val)]
+        by_year = [b for b in results if str(b.get("year") or "") == str(year_val)]
         if by_year:
-            briefs = by_year
+            results = by_year
 
-    # Filter by kind (movie/tv)
+    # Filter by kind
     kind_filter = {"movie", "tv series", "tvseriess", "tvminiseries", "tvmovie"}
-    by_kind = [b for b in briefs if (b.get("kind") or "").lower() in kind_filter]
+    by_kind = [b for b in results if (b.get("kind") or "").lower() in kind_filter]
     if by_kind:
-        briefs = by_kind
+        results = by_kind
 
-    # Cap list
+    # Cap
     if MAX_LIST_ELM:
-        briefs = briefs[:MAX_LIST_ELM]
+        results = results[:MAX_LIST_ELM]
 
-    # Bulk mode → return the briefs
     if bulk:
-        return briefs
+        return results
 
-    # Non-bulk → fetch full details of first result
-    if not briefs:
+    # Non-bulk → first result details
+    if not results:
         return None
-    first = briefs[0]
+    first = results[0]
     imdb_id = first.get("imdb_id")
     if not imdb_id:
         return None
     return await get_movie_details(imdb_id)
-
-
-# ═══════════════════════ DIAGNOSTICS ═══════════════════════
-def is_available() -> bool:
-    return _HAS_IMDBKIT
