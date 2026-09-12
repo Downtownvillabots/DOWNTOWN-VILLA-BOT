@@ -13,7 +13,6 @@ async def start_private(client: Client, message: Message):
     user_id = message.from_user.id
     now = datetime.utcnow()
 
-    # Register/update user
     await user_repo.create_or_update_user(user_id, {
         "user_id": user_id,
         "first_name": message.from_user.first_name,
@@ -29,7 +28,6 @@ async def start_private(client: Client, message: Message):
 
 @Client.on_message(filters.new_chat_members)
 async def bot_added_to_group(client: Client, message: Message):
-    # Check if the bot itself was added
     for member in message.new_chat_members:
         if member.id == client.me.id:
             group_id = message.chat.id
