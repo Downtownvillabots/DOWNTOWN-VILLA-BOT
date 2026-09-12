@@ -514,7 +514,7 @@ async def duplicate_scan(cat: str, index: int, key: str = "file_id") -> Dict[str
                 total_dupes += g
         except Exception as e:
             errors.record(f"dup:{name}", str(e))
-    return {"ok": True, "total": total_dupes, "per_collection": per_col per_col if False else per_coll}
+        return {"ok": True, "total": total_dupes, "per_collection": per_coll}
 
 
 # ─────────────────────────── VIEW BUILDERS ───────────────────────────
