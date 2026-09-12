@@ -55,32 +55,43 @@ def _build_record(message, media: Dict[str, Any]) -> Dict[str, Any]:
 async def process_message(message, mode: str = "auto") -> Dict[str, Any]:
     """
     Process a single Pyrogram message.
-    Returns a result dict:
-      {status, reason, record, shard_index}
+    Returns {status, reason, record, shard_index}
     status: 'saved' | 'duplicate' | 'skipped' | 'error'
     """
+    msg_id = getattr(message, "id", "?")
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", "?") if chat else "?"
+
     media = _pick_media(message)
     if not media:
-        return {"status": "skipped", "reason": "no_media", "record": None, "shard_index": None}
+        logger.debug(f"[IDX] skip msg={msg_id} — no media")
+        return {"status": "skipped", "reason": "no_media",
+                "record": None, "shard_index": None}
 
     if not media.get("file_id"):
-        return {"status": "skipped", "reason": "no_file_id", "record": None, "shard_index": None}
+        logger.debug(f"[IDX] skip msg={msg_id} — no file_id")
+        return {"status": "skipped", "reason": "no_file_id",
+                "record": None, "shard_index": None}
 
     try:
         record = _build_record(message, media)
     except Exception as e:
-        logger.exception("Metadata extraction failed")
-        return {"status": "error", "reason": f"parse:{e}", "record": None, "shard_index": None}
+        logger.warning(f"[IDX] parse failed msg={msg_id}: {e}")
+        return {"status": "error", "reason": f"parse:{e}",
+                "record": None, "shard_index": None}
 
     if not record.get("title"):
-        return {"status": "skipped", "reason": "no_title", "record": record, "shard_index": None}
+        logger.info(f"[IDX] skip msg={msg_id} — no title from "
+                    f"file='{media.get('file_name')}'")
+        return {"status": "skipped", "reason": "no_title",
+                "record": record, "shard_index": None}
 
-    # Duplicate / save
     try:
         result = await media_files_repo.add_record(record)
     except Exception as e:
-        logger.exception("Save failed")
-        return {"status": "error", "reason": f"save:{e}", "record": record, "shard_index": None}
+        logger.exception(f"[IDX] save failed msg={msg_id}")
+        return {"status": "error", "reason": f"save:{e}",
+                "record": record, "shard_index": None}
 
     return {
         "status": result["status"],
