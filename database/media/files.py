@@ -1,34 +1,68 @@
-from typing import Optional, Dict, Any
-from database import db_registry
-from database.core.media_location import MediaLocationRepository
+"""
+Media file storage repository.
+Stores Telegram file references + searchable metadata.
+No file downloads. No local cache.
+"""
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from database.media.routing import media_router
+from database.media.duplicates import duplicate_checker
+
+logger = logging.getLogger(__name__)
+
 
 class MediaFileRepository:
-    def __init__(self):
-        self._location_repo = MediaLocationRepository()
+    async def add_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Save a fully-parsed media record.
+        Returns {status, shard_index, reason, record}.
+        Status: 'saved' | 'duplicate' | 'error'
+        """
+        # 1. Duplicate check (exact, then logical)
+        existing, shard = await duplicate_checker.check_all(record)
+        if existing:
+            return {
+                "status": "duplicate",
+                "shard_index": shard,
+                "reason": "exact" if existing.get("file_unique_id") == record.get("file_unique_id")
+                          else "logical",
+                "record": existing,
+            }
 
-    def _get_collection(self, shard_index: int):
-        db = db_registry.get_media_db(shard_index)
-        return db["media_files"]
+        # 2. Route to correct shard
+        try:
+            shard_index, db = await media_router.pick_shard()
+        except Exception as e:
+            logger.error(f"Routing failed: {e}")
+            return {"status": "error", "shard_index": None, "reason": str(e), "record": None}
 
-    async def add_file(self, file_id: str, data: Dict[str, Any]) -> int:
-        shard_count = db_registry.get_media_shard_count()
-        if shard_count == 0:
-            raise RuntimeError("No media database shards configured.")
-        db = db_registry.get_media_db()  # advances index
-        # Get the index that was used (registry internal)
-        shard_index = db_registry._media_shard_index  # okay for now
-        collection = self._get_collection(shard_index)
-        await collection.update_one(
-            {"file_id": file_id},
-            {"$set": data},
-            upsert=True
-        )
-        await self._location_repo.set_location(file_id, shard_index)
-        return shard_index
+        # 3. Enrich
+        record = dict(record)
+        record["logical_identity"] = duplicate_checker.logical_identity(record)
+        record["indexed_at"] = datetime.utcnow()
+        record["shard_index"] = shard_index
 
-    async def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
-        shard_index = await self._location_repo.get_location(file_id)
-        if shard_index is None:
-            return None
-        collection = self._get_collection(shard_index)
-        return await collection.find_one({"file_id": file_id})
+        # 4. Insert
+        try:
+            await db["media_files"].insert_one(record)
+        except Exception as e:
+            logger.exception("Insert failed")
+            return {"status": "error", "shard_index": shard_index,
+                    "reason": str(e), "record": None}
+
+        return {"status": "saved", "shard_index": shard_index,
+                "reason": None, "record": record}
+
+    async def count_all(self) -> int:
+        total = 0
+        for entry in __import__("database").db_registry.media_entries():
+            try:
+                total += await entry.db["media_files"].estimated_document_count()
+            except Exception:
+                pass
+        return total
+
+
+media_files_repo = MediaFileRepository()
