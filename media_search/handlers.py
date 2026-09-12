@@ -1,12 +1,8 @@
 """
 🏨 DOWNTOWN VILLA — Auto-filter handlers
-Full interactive flow with spell check:
-  Movie:  Title → Language → Quality → Release → Deliver
-  Series: Title → Language → Season → Episode → Quality → Release → Deliver
-  No results → AI spell check → auto-correct OR manual picker
-
-Callbacks are registered in plugins/auto_filter.py (Pyrogram requires
-top-level handlers), which delegates to the `_pick_*` functions here.
+Movie:  Title → Language → Quality → Release → Deliver
+Series: Title → Language → Season → Episode → Quality → Release → Deliver
+No DB hits → IMDb suggestions → user picks → exact search
 """
 import asyncio
 import logging
@@ -59,7 +55,6 @@ def _strip_trailing_digits(s: str) -> str:
 
 
 async def _edit(target, text: str, kb: Optional[InlineKeyboardMarkup] = None):
-    """Edit a Message or a CallbackQuery.message."""
     try:
         msg = getattr(target, "message", target)
         await msg.edit_text(
@@ -119,8 +114,8 @@ def _group_hits(hits: List[FileHit]) -> Dict[Tuple[str, Optional[int]], List[Fil
 
 # ═══════════════════════ MAIN ENTRY ═══════════════════════
 async def _handle_search(client: Client, message: Message, raw_query: str,
-                         is_group: bool = False):
-    logger.info(f"[SEARCH] START for {raw_query!r} is_group={is_group}")
+                         is_group: bool = False, _depth: int = 0):
+    logger.info(f"[SEARCH] START for {raw_query!r} depth={_depth}")
 
     try:
         status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
@@ -210,16 +205,14 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
     )
 
 
-# ═══════════════════════ NO-RESULTS + SPELL CHECK ═══════════════════════
+# ═══════════════════════ NO-RESULTS → IMDb SUGGESTIONS ═══════════════════════
 async def _handle_no_results(client: Client, message: Message, status,
                              raw_query: str, norm: str, is_series: bool):
-    """Spell-check flow when a search returns zero hits."""
-    from core.config import SPELL_CHECK_REPLY
-        try:
+    """Show IMDb/TMDB suggestions when DB returns 0 hits."""
+    try:
         from media_search.spell_check import get_suggestions, clean_query
     except Exception as e:
         logger.warning(f"[SEARCH] spell_check unavailable: {type(e).__name__}: {e}")
-        # Fallback: no suggestions, simple not-found
         try:
             await request_repo.add(message.from_user.id, norm, raw_query,
                                    "series" if is_series else "movie")
@@ -231,29 +224,8 @@ async def _handle_no_results(client: Client, message: Message, status,
             f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>",
         )
         return
-    # ── Stage 1: AI auto-correct ──
-    if SPELL_CHECK_REPLY:
-        await _edit(status, "🤖 ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ, ᴀɪ ɪꜱ ᴄʜᴇᴄᴋɪɴɢ ʏᴏᴜʀ ꜱᴘᴇʟʟɪɴɢ...")
-        corrected = None
-        try:
-            corrected = await ai_spell_check(raw_query, is_series=is_series)
-        except Exception as e:
-            logger.warning(f"[SEARCH] ai_spell_check failed: {e}")
 
-        if corrected and normalize(corrected) != norm:
-            await _edit(
-                status,
-                f"✅ ᴀɪ ꜱᴜɢɢᴇꜱᴛᴇᴅ: <code>{corrected}</code>\n"
-                f"🔍 ꜱᴇᴀʀᴄʜɪɴɢ ꜰᴏʀ ɪᴛ...",
-            )
-            await asyncio.sleep(0.6)
-            try:
-                await status.delete()
-            except Exception:
-                pass
-            return await _handle_search(client, message, corrected, is_group=False)
-
-    # ── Stage 2: manual picker ──
+    # Fetch suggestions
     cleaned = clean_query(raw_query)
     suggestions: List[Dict] = []
     try:
@@ -261,6 +233,13 @@ async def _handle_no_results(client: Client, message: Message, status,
     except Exception as e:
         logger.warning(f"[SEARCH] suggestion fetch failed: {e}")
 
+    if not suggestions and cleaned != raw_query:
+        try:
+            suggestions = await get_suggestions(raw_query, is_series=is_series)
+        except Exception:
+            pass
+
+    # No suggestions at all
     if not suggestions:
         try:
             await request_repo.add(message.from_user.id, norm, raw_query,
@@ -275,6 +254,7 @@ async def _handle_no_results(client: Client, message: Message, status,
         )
         return
 
+    # Save session with suggestions
     session = await sessions.create(
         user_id=message.from_user.id,
         chat_id=message.chat.id,
@@ -287,11 +267,12 @@ async def _handle_no_results(client: Client, message: Message, status,
         await _edit(status, "❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ. ᴛʀʏ ᴀɢᴀɪɴ.")
         return
 
+    # Build picker
     rows: List[List[InlineKeyboardButton]] = []
     for i, s in enumerate(suggestions[:10]):
         title = s.get("title") or "?"
-        year = s.get("year")
-        label = f"🎬 {title}" + (f" ({year})" if year else "")
+        yr = s.get("year")
+        label = f"🎬 {title}" + (f" ({yr})" if yr else "")
         rows.append([InlineKeyboardButton(
             label.upper(),
             callback_data=f"spol:{session.session_id}:{i}",
@@ -307,14 +288,14 @@ async def _handle_no_results(client: Client, message: Message, status,
         "🤔 <b>ᴅɪᴅ ʏᴏᴜ ᴍᴇᴀɴ?</b>",
         DIV, "",
         f"🔍 Yᴏᴜ ꜱᴇᴀʀᴄʜᴇᴅ: <code>{raw_query}</code>",
-        f"📝 <b>{len(suggestions)}</b> ᴘᴏꜱꜱɪʙʟᴇ ᴛɪᴛʟᴇꜱ:",
+        f"📝 <b>{len(suggestions)}</b> ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ:",
         "",
         "ᴘɪᴄᴋ ᴛʜᴇ ᴏɴᴇ ʏᴏᴜ ᴍᴇᴀɴᴛ:",
     ])
     await _edit(status, text, kb=InlineKeyboardMarkup(rows))
 
 
-# ═══════════════════════ TITLE PICKER ═══════════════════════
+# ═══════════════════════ TITLE PICKER (DB matches) ═══════════════════════
 async def _pick_title(client: Client, q: CallbackQuery, sid: str, idx: int):
     session = await sessions.get(sid)
     if not session or session.user_id != q.from_user.id:
@@ -329,6 +310,92 @@ async def _pick_title(client: Client, q: CallbackQuery, sid: str, idx: int):
     await _show_next_after_title(q.message, sid)
 
 
+# ═══════════════════════ SPOL (IMDb SUGGESTION PICK) ═══════════════════════
+async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int):
+    """User picked an IMDb suggestion → search DB for that exact title."""
+    session = await sessions.get(sid)
+    if not session or session.user_id != q.from_user.id:
+        await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        return
+    if idx >= len(session.candidates):
+        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        return
+
+    s = session.candidates[idx]
+    title = s.get("title") or ""
+    year = s.get("year")
+    await q.answer(f"🔎 ꜱᴇᴀʀᴄʜɪɴɢ: {title[:30]}")
+
+    # Exact DB search for the picked title
+    norm = normalize(title)
+    result = await engine.search_any(norm, year=year)
+    hits = _filter_by_title(result.hits, title, year)
+
+    # Try without year filter
+    if not hits and year:
+        result = await engine.search_any(norm, year=None)
+        hits = _filter_by_title(result.hits, title, None)
+
+    if not hits:
+        try:
+            await request_repo.add(
+                q.from_user.id, norm, title,
+                "series" if session.mode == "series" else "movie",
+            )
+        except Exception:
+            pass
+
+        admin_url = "https://t.me/"
+        try:
+            from core.config import OWNER_LNK, SUPPORT_CHAT
+            admin_url = OWNER_LNK or SUPPORT_CHAT or admin_url
+        except Exception:
+            pass
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔰 REQUEST TO ADMIN", url=admin_url)],
+            [InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")],
+        ])
+        try:
+            year_txt = f" ({year})" if year else ""
+            await q.message.edit_text(
+                "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+                f"😌 <b>{title}</b>{year_txt} ɪꜱ ɴᴏᴛ ᴀᴠᴀɪʟᴀʙʟᴇ ɪɴ ᴏᴜʀ ᴅᴀᴛᴀʙᴀꜱᴇ.\n\n"
+                "📝 ʀᴇǫᴜᴇꜱᴛ ʀᴇᴄᴏʀᴅᴇᴅ — ᴀᴅᴍɪɴ ᴡɪʟʟ ᴀᴅᴅ ɪᴛ ꜱᴏᴏɴ.",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # Found → update session and continue
+    await sessions.update(sid, selected_title=title, selected_year=year)
+
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    class _FakeMsg:
+        def __init__(self, msg, from_user, chat):
+            self._msg = msg
+            self.from_user = from_user
+            self.chat = chat
+            self.text = title
+            self.id = msg.id
+        async def reply_text(self, *a, **kw):
+            return await self._msg.reply_text(*a, **kw)
+
+    fake = _FakeMsg(q.message, q.from_user, q.message.chat)
+    try:
+        status = await fake.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
+    except Exception:
+        return
+    await _show_next_after_title(status, sid)
+
+
+# ═══════════════════════ TITLE → LANGUAGE ═══════════════════════
 async def _show_next_after_title(target, sid: str):
     session = await sessions.get(sid)
     if not session:
@@ -360,7 +427,8 @@ async def _show_languages(target, sid: str, langs: List[str]):
             lang.upper(), callback_data=f"sr:lang:{sid}:{i}",
         ))
         if len(pair) == 2:
-            rows.append(pair); pair = []
+            rows.append(pair)
+            pair = []
     if pair:
         rows.append(pair)
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:back:{sid}")])
@@ -413,7 +481,8 @@ async def _show_seasons(target, sid: str, seasons_list: List[int]):
             f"SEASON {s:02d}", callback_data=f"sr:seas:{sid}:{i}",
         ))
         if len(pair) == 2:
-            rows.append(pair); pair = []
+            rows.append(pair)
+            pair = []
     if pair:
         rows.append(pair)
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:lang_back:{sid}")])
@@ -457,8 +526,8 @@ async def _pick_season(client: Client, q: CallbackQuery, sid: str, idx: int):
 
 
 # ═══════════════════════ EPISODES ═══════════════════════
-async def _show_episodes(target, sid: str, season: int, eps: List[int], page: int = 0,
-                         per_page: int = 20):
+async def _show_episodes(target, sid: str, season: int, eps: List[int],
+                         page: int = 0, per_page: int = 20):
     session = await sessions.get(sid)
     if not session:
         return
@@ -473,7 +542,8 @@ async def _show_episodes(target, sid: str, season: int, eps: List[int], page: in
             f"EP {ep:02d}", callback_data=f"sr:ep:{sid}:{idx}",
         ))
         if len(trio) == 3:
-            rows.append(trio); trio = []
+            rows.append(trio)
+            trio = []
     if trio:
         rows.append(trio)
 
@@ -539,7 +609,8 @@ async def _show_qualities(target, sid: str):
             qv, callback_data=f"sr:q:{sid}:{i}",
         ))
         if len(pair) == 2:
-            rows.append(pair); pair = []
+            rows.append(pair)
+            pair = []
     if pair:
         rows.append(pair)
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{sid}")])
@@ -673,7 +744,7 @@ async def _back_to_titles(client: Client, q: CallbackQuery, sid: str):
         return
     rows: List[List[InlineKeyboardButton]] = []
     for i, c in enumerate(session.candidates[:10]):
-        label = _display_title(c["title"], c["year"])
+        label = _display_title(c["title"], c.get("year"))
         rows.append([InlineKeyboardButton(
             label.upper(), callback_data=f"sr:pick:{sid}:{i}",
         )])
@@ -738,39 +809,6 @@ async def _episode_page(client: Client, q: CallbackQuery, sid: str, page: int):
                   and (not lang or lang in (h.audio_languages or []))})
     await q.answer()
     await _show_episodes(q.message, sid, season, eps, page=page)
-
-
-# ═══════════════════════ SPOL SUGGESTION PICK ═══════════════════════
-async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int):
-    """Called from auto_filter.py's spol callback."""
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        return
-    if idx >= len(session.candidates):
-        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        return
-    s = session.candidates[idx]
-    title = s.get("title") or ""
-    await q.answer("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-
-    # Re-use the original user's message context
-    class _FakeMsg:
-        def __init__(self, msg, from_user, chat):
-            self._msg = msg
-            self.from_user = from_user
-            self.chat = chat
-            self.text = title
-            self.id = msg.id
-        async def reply_text(self, *a, **kw):
-            return await self._msg.reply_text(*a, **kw)
-
-    fake = _FakeMsg(q.message, q.from_user, q.message.chat)
-    await _handle_search(client, fake, title, is_group=False)
 
 
 # ═══════════════════════ INTERNAL SEARCH ═══════════════════════
