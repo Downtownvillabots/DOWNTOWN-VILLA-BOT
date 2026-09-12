@@ -7,7 +7,7 @@ class UserRepository:
 
     def _get_collection(self):
         if self._collection is None:
-            db = db_registry.get_core_db()
+            db = db_registry.get_user_db()
             self._collection = db["users"]
         return self._collection
 
@@ -30,3 +30,6 @@ class UserRepository:
         if expiry is not None:
             data["premium_expiry"] = expiry
         await self.create_or_update_user(user_id, data)
+
+    async def get_user_count(self) -> int:
+        return await self._get_collection().estimated_document_count()
