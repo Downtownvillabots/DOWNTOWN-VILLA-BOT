@@ -19,7 +19,16 @@ from core.config import (
 from media_search.engine import engine
 from media_search.metadata import metadata_provider
 from media_search.normalizer import normalize
-from services import imdb as imdb_service
+try:
+    from services import imdb as imdb_service
+    _HAS_IMDB_SERVICE = True
+except Exception as e:
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        f"[SPELL] services.imdb unavailable: {type(e).__name__}: {e}"
+    )
+    imdb_service = None
+    _HAS_IMDB_SERVICE = False
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +65,12 @@ def _best_match(query: str, candidates: List[str]) -> Optional[Tuple[str, int]]:
 # ═══════════════════════ SUGGESTION SOURCES ═══════════════════════
 async def _get_imdb_suggestions(query: str) -> List[Dict[str, Any]]:
     """Primary source — IMDb via IMDBKit."""
-    if not imdb_service.is_available():
+    if not _HAS_IMDB_SERVICE or imdb_service is None:
         return []
     try:
-        briefs = await imdb_service.get_poster(query, bulk=True)
-    except Exception as e:
-        logger.warning(f"[SPELL] IMDb suggestions failed: {e}")
+        if not imdb_service.is_available():
+            return []
+    except Exception:
         return []
     if not briefs:
         return []
