@@ -47,7 +47,11 @@ async def pm_text(client: Client, message: Message):
             return
 
         fn = _get_search_fn()
-        await fn(client, message, query)
+        try:
+            await fn(client, message, query, is_group=False)
+        except TypeError:
+            # Older signature without is_group — fall back
+            await fn(client, message, query)
 
     except Exception as e:
         logger.exception(f"[PM] handler failed: {type(e).__name__}: {e}")
