@@ -215,8 +215,22 @@ async def _handle_no_results(client: Client, message: Message, status,
                              raw_query: str, norm: str, is_series: bool):
     """Spell-check flow when a search returns zero hits."""
     from core.config import SPELL_CHECK_REPLY
-    from media_search.spell_check import ai_spell_check, get_suggestions, clean_query
-
+        try:
+        from media_search.spell_check import get_suggestions, clean_query
+    except Exception as e:
+        logger.warning(f"[SEARCH] spell_check unavailable: {type(e).__name__}: {e}")
+        # Fallback: no suggestions, simple not-found
+        try:
+            await request_repo.add(message.from_user.id, norm, raw_query,
+                                   "series" if is_series else "movie")
+        except Exception:
+            pass
+        await _edit(
+            status,
+            f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+            f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>",
+        )
+        return
     # ── Stage 1: AI auto-correct ──
     if SPELL_CHECK_REPLY:
         await _edit(status, "🤖 ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ, ᴀɪ ɪꜱ ᴄʜᴇᴄᴋɪɴɢ ʏᴏᴜʀ ꜱᴘᴇʟʟɪɴɢ...")
