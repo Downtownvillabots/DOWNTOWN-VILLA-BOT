@@ -7,7 +7,7 @@ class GroupRepository:
 
     def _get_collection(self):
         if self._collection is None:
-            db = db_registry.get_core_db()
+            db = db_registry.get_user_db()
             self._collection = db["groups"]
         return self._collection
 
@@ -20,3 +20,6 @@ class GroupRepository:
             {"$set": data},
             upsert=True
         )
+
+    async def get_group_count(self) -> int:
+        return await self._get_collection().estimated_document_count()
