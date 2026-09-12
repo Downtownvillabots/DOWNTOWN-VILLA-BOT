@@ -55,7 +55,7 @@ EMPTY = "▱"
 BAR_W = 18
 DIV = "━" * 26
 DIV_S = "┄" * 26
-PROGRESS_MIN_INTERVAL = 3.0   # seconds between progress edits
+PROGRESS_MIN_INTERVAL = 3.0
 
 # ═══════════════════════ ENV ═══════════════════════
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
@@ -96,6 +96,18 @@ def pbar(p: float, w: int = BAR_W) -> str:
     return TICK * filled + EMPTY * (w - filled)
 
 def pcolor(p: float) -> str:
+    """Capacity-oriented colours (used on shard/DB views)."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "🔴"
+    if p >= 95: return "🔴"
+    if p >= 85: return "🟠"
+    if p >= 70: return "🟡"
+    return "🟢"
+
+def pcolor_progress(p: float) -> str:
+    """Progress-oriented colours for indexing: red → orange → yellow → green."""
     try:
         p = float(p)
     except (TypeError, ValueError):
@@ -107,7 +119,7 @@ def pcolor(p: float) -> str:
     return "🔴"
 
 def progress_line(label: str, p: float, w: int = BAR_W) -> str:
-    return f"{pcolor(p)} <b>{sc(label)}</b> · <code>{p:.1f}%</code>\n<code>{pbar(p, w)}</code>"
+    return f"{pcolor_progress(p)} <b>{sc(label)}</b> · <code>{p:.1f}%</code>\n<code>{pbar(p, w)}</code>"
 
 def fmt_duration(seconds: float) -> str:
     try:
@@ -183,26 +195,18 @@ class _Jobs:
                 continue
             if st["status"] not in ("running", "paused"):
                 continue
-            # Check task liveness
             task = self.tasks.get(jid)
             if task is None or task.done():
-                # Dead job — clean up silently
                 logger.warning(f"Cleaning up dead job {jid} for channel {channel_id}")
                 self.force_clear(jid)
                 continue
             return jid
         return None
 
-
 jobs = _Jobs()
-
-# Pending forward state (awaiting media-mode selection)
-_pending_forwards: Dict[int, Dict[str, Any]] = {}
-
 
 # ═══════════════════════ MAIN KEYBOARD ═══════════════════════
 def kb_main() -> InlineKeyboardMarkup:
-    auto_status = "🟢 ACTIVE" if (DATABASE_CHANNEL_ID and AUTO_INDEXING_ENABLED) else "🔴 OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 START CHANNEL INDEX", callback_data="idx_start")],
         [InlineKeyboardButton("📡 AUTO INDEXING", callback_data="idx_auto")],
@@ -216,7 +220,6 @@ def kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔄 REFRESH", callback_data="idx_main")],
         [InlineKeyboardButton("❌ CLOSE", callback_data="idx_close")],
     ])
-
 
 async def _build_main() -> str:
     auto_status = "🟢 ᴀᴄᴛɪᴠᴇ" if (DATABASE_CHANNEL_ID and AUTO_INDEXING_ENABLED) else "🔴 ᴏꜰꜰ"
@@ -242,7 +245,6 @@ async def _build_main() -> str:
         f"ᴍᴇᴛᴀᴅᴀᴛᴀ ꜰɪʀꜱᴛ · ɴᴏ ꜰɪʟᴇ ᴅᴏᴡɴʟᴏᴀᴅ",
     ])
 
-
 # ═══════════════════════ COMMANDS ═══════════════════════
 @Client.on_message(filters.command(["index", "indexing"]) & filters.private)
 async def cmd_index(client: Client, message: Message):
@@ -258,7 +260,6 @@ async def cmd_index(client: Client, message: Message):
         logger.exception("cmd_index failed")
         await m.edit_text(f"🔴 ꜰᴀɪʟᴇᴅ: <code>{e}</code>", parse_mode=ParseMode.HTML)
 
-
 # ═══════════════════════ MAIN CALLBACKS ═══════════════════════
 @Client.on_callback_query(filters.regex(r"^idx_main$"))
 async def cb_main(client: Client, q: CallbackQuery):
@@ -272,17 +273,22 @@ async def cb_main(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
-
 @Client.on_callback_query(filters.regex(r"^idx_close$"))
 async def cb_close(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
         await q.answer("⛔", show_alert=True); return
+    chat_id = q.message.chat.id
+    for jid, st in list(jobs.state.items()):
+        if st.get("chat_id") == chat_id:
+            try:
+                await jobs.stop(jid)
+            except Exception:
+                jobs.force_clear(jid)
     try:
         await q.message.delete()
     except Exception:
         pass
     await q.answer("ᴄʟᴏꜱᴇᴅ")
-
 
 @Client.on_callback_query(filters.regex(r"^idx_start$"))
 async def cb_start(client: Client, q: CallbackQuery):
@@ -307,7 +313,6 @@ async def cb_start(client: Client, q: CallbackQuery):
     except Exception:
         pass
     await q.answer()
-
 
 @Client.on_callback_query(filters.regex(r"^idx_auto$"))
 async def cb_auto(client: Client, q: CallbackQuery):
@@ -337,7 +342,6 @@ async def cb_auto(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
-
 @Client.on_callback_query(filters.regex(r"^idx_movies$"))
 async def cb_movies(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
@@ -361,7 +365,6 @@ async def cb_movies(client: Client, q: CallbackQuery):
     except Exception:
         pass
     await q.answer()
-
 
 @Client.on_callback_query(filters.regex(r"^idx_series$"))
 async def cb_series(client: Client, q: CallbackQuery):
@@ -387,11 +390,11 @@ async def cb_series(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
-
 # ═══════════════════════ FORWARD DETECTION ═══════════════════════
-@Client.on_message(filters.private & ~filters.service & filters.user([int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]) if ADMINS else None)
+@Client.on_message(filters.private & ~filters.service)
 async def forward_detect(client: Client, message: Message):
-    """Detect forwarded messages from channels and offer indexing."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
     if not message.forward_from_chat:
         return
     chat = message.forward_from_chat
@@ -402,17 +405,8 @@ async def forward_detect(client: Client, message: Message):
     channel_title = chat.title or chat.username or str(channel_id)
     start_msg_id = message.forward_from_message_id or message.id
 
-    # Check for existing job on this channel
     existing = jobs.has_running_for_channel(channel_id)
-    token = uuid.uuid4().hex[:10]
-    _pending_forwards[message.from_user.id] = {
-        "token": token,
-        "channel_id": channel_id,
-        "channel_title": channel_title,
-        "start_message_id": start_msg_id,
-    }
-
-    text = "\n".join([
+    text_lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📥 <b>{fb('CHANNEL DETECTED')}</b>",
         DIV, "",
@@ -421,102 +415,138 @@ async def forward_detect(client: Client, message: Message):
         f"🆔 {sc('start message')} · <code>{start_msg_id}</code>",
         "",
         DIV_S,
-        "ᴡʜᴀᴛ ᴅᴏ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ɪɴᴅᴇx?",
-    ])
+    ]
     if existing:
-        text += f"\n\n⚠️ ᴀ ᴊᴏʙ ɪꜱ ᴀʟʀᴇᴀᴅʏ ʀᴜɴɴɪɴɢ ꜰᴏʀ ᴛʜɪꜱ ᴄʜᴀɴɴᴇʟ (<code>{existing}</code>)."
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 MOVIES ONLY", callback_data=f"idx_mode:{token}:movies")],
-        [InlineKeyboardButton("📺 SERIES ONLY", callback_data=f"idx_mode:{token}:series")],
-        [InlineKeyboardButton("🎬 + 📺 BOTH", callback_data=f"idx_mode:{token}:both")],
-        [InlineKeyboardButton("❌ CANCEL", callback_data=f"idx_cancel:{token}")],
-    ])
+        text_lines.append(f"⚠️ ᴊᴏʙ <code>{existing}</code> ɪꜱ ᴀʟʀᴇᴀᴅʏ ʀᴜɴɴɪɴɢ ꜰᴏʀ ᴛʜɪꜱ ᴄʜᴀɴɴᴇʟ.")
+        text_lines.append("ꜱᴛᴏᴘ ɪᴛ ꜰɪʀꜱᴛ ᴏʀ ᴜꜱᴇ ꜰᴏʀᴄᴇ ꜱᴛᴀʀᴛ.")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛑 STOP OLD JOB", callback_data=f"idx_stop_old:{existing}")],
+            [InlineKeyboardButton("⚠️ FORCE NEW JOB",
+                                  callback_data=f"idx_mode:{channel_id}:{start_msg_id}:both")],
+            [InlineKeyboardButton("❌ CANCEL", callback_data="idx_close_msg")],
+        ])
+    else:
+        text_lines.append("ᴡʜᴀᴛ ᴅᴏ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ɪɴᴅᴇx?")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎬 MOVIES ONLY",
+                                  callback_data=f"idx_mode:{channel_id}:{start_msg_id}:movies")],
+            [InlineKeyboardButton("📺 SERIES ONLY",
+                                  callback_data=f"idx_mode:{channel_id}:{start_msg_id}:series")],
+            [InlineKeyboardButton("🎬 + 📺 BOTH",
+                                  callback_data=f"idx_mode:{channel_id}:{start_msg_id}:both")],
+            [InlineKeyboardButton("❌ CANCEL", callback_data="idx_close_msg")],
+        ])
     try:
-        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+        await message.reply_text("\n".join(text_lines), reply_markup=kb,
+                                 parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
     except Exception:
         logger.exception("forward_detect reply failed")
 
-
-@Client.on_callback_query(filters.regex(r"^idx_cancel:(.+)$"))
-async def cb_cancel_pending(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^idx_close_msg$"))
+async def cb_close_msg(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
         await q.answer("⛔", show_alert=True); return
-    _pending_forwards.pop(q.from_user.id, None)
     try:
         await q.message.delete()
     except Exception:
         pass
-    await q.answer("ᴄᴀɴᴄᴇʟʟᴇᴅ")
+    await q.answer("ᴄʟᴏꜱᴇᴅ")
 
-
-@Client.on_callback_query(filters.regex(r"^idx_mode:(.+):(movies|series|both)$"))
+@Client.on_callback_query(filters.regex(r"^idx_mode:(-?\d+):(\d+):(movies|series|both)$"))
 async def cb_mode(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
         await q.answer("⛔", show_alert=True); return
-    token = q.matches[0].group(1)
-    mode = q.matches[0].group(2)
-    pending = _pending_forwards.get(q.from_user.id)
-    if not pending or pending.get("token") != token:
-        await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
 
-    channel_id = pending["channel_id"]
-    channel_title = pending["channel_title"]
-    start_msg_id = pending["start_message_id"]
-    _pending_forwards.pop(q.from_user.id, None)
+    channel_id = int(q.matches[0].group(1))
+    start_msg_id = int(q.matches[0].group(2))
+    mode = q.matches[0].group(3)
 
-    # Block concurrent jobs on the same channel
-    existing = jobs.has_running_for_channel(channel_id)
-    if existing:
-        await q.answer("⚠️ ᴀ ᴊᴏʙ ɪꜱ ᴀʟʀᴇᴀᴅʏ ʀᴜɴɴɪɴɢ ꜰᴏʀ ᴛʜɪꜱ ᴄʜᴀɴɴᴇʟ", show_alert=True)
-        return
-
-    job_id = f"INDEX-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
-    state = {
-        "job_id": job_id,
-        "admin_id": q.from_user.id,
-        "chat_id": q.message.chat.id,
-        "message_id": q.message.id,
-        "channel_id": channel_id,
-        "channel_title": channel_title,
-        "start_message_id": start_msg_id,
-        "current_message_id": start_msg_id,
-        "mode": mode,
-        "direction": "backward",
-        "status": "running",
-        "stats": {
-            "processed": 0, "indexed": 0, "duplicates": 0,
-            "skipped": 0, "failed": 0, "movies": 0, "series": 0,
-        },
-        "start_time": time.time(),
-        "last_edit": 0.0,
-    }
-    jobs.create(job_id, state)
-
-    # Persist initial job record
     try:
-        db_id = await indexing_jobs.create({
+        existing = jobs.has_running_for_channel(channel_id)
+        if existing:
+            jobs.force_clear(existing)
+
+        channel_title = str(channel_id)
+        try:
+            chat = await client.get_chat(channel_id)
+            channel_title = chat.title or channel_title
+        except Exception:
+            pass
+
+        job_id = f"INDEX-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+        state = {
             "job_id": job_id,
             "admin_id": q.from_user.id,
+            "chat_id": q.message.chat.id,
+            "message_id": q.message.id,
             "channel_id": channel_id,
             "channel_title": channel_title,
             "start_message_id": start_msg_id,
+            "current_message_id": start_msg_id,
             "mode": mode,
             "direction": "backward",
             "status": "running",
-            "stats": state["stats"],
-        })
-        state["db_id"] = db_id
+            "stats": {
+                "processed": 0, "indexed": 0, "duplicates": 0,
+                "skipped": 0, "failed": 0, "movies": 0, "series": 0,
+            },
+            "start_time": time.time(),
+            "last_edit": 0.0,
+        }
+        jobs.create(job_id, state)
+
+        try:
+            db_id = await indexing_jobs.create({
+                "job_id": job_id,
+                "admin_id": q.from_user.id,
+                "channel_id": channel_id,
+                "channel_title": channel_title,
+                "start_message_id": start_msg_id,
+                "mode": mode,
+                "direction": "backward",
+                "status": "running",
+                "stats": state["stats"],
+            })
+            state["db_id"] = db_id
+        except Exception:
+            state["db_id"] = None
+
+        await _render_progress(client, job_id, force=True)
+
+        task = asyncio.create_task(_run_job(client, job_id))
+        jobs.attach(job_id, task)
+
+        try:
+            await q.answer("▶️ ꜱᴛᴀʀᴛᴇᴅ")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception("cb_mode failed")
+        try:
+            await q.answer(f"❌ {type(e).__name__}: {e}"[:190], show_alert=True)
+        except Exception:
+            pass
+
+@Client.on_callback_query(filters.regex(r"^idx_stop_old:(.+)$"))
+async def cb_stop_old(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔", show_alert=True); return
+    jid = q.matches[0].group(1)
+    st = jobs.get(jid)
+    if st:
+        try:
+            await jobs.stop(jid)
+        except Exception:
+            jobs.force_clear(jid)
+    else:
+        jobs.force_clear(jid)
+    await q.answer("🛑 ᴏʟᴅ ᴊᴏʙ ꜱᴛᴏᴘᴘᴇᴅ — ꜰᴏʀᴡᴀʀᴅ ᴛʜᴇ ᴍᴇꜱꜱᴀɢᴇ ᴀɢᴀɪɴ", show_alert=True)
+    try:
+        await q.message.delete()
     except Exception:
-        state["db_id"] = None
-
-    # Render initial progress and start task
-    await _render_progress(client, job_id, force=True)
-    task = asyncio.create_task(_run_job(client, job_id))
-    jobs.attach(job_id, task)
-    await q.answer("▶️ ꜱᴛᴀʀᴛᴇᴅ")
-
+        pass
 
 # ═══════════════════════ PROGRESS RENDER ═══════════════════════
 async def _render_progress(client: Client, job_id: str, force: bool = False) -> None:
@@ -539,9 +569,8 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
     mode_label = {"movies": "🎬 MOVIES", "series": "📺 SERIES",
                   "both": "🎬 + 📺 BOTH"}.get(st["mode"], st["mode"].upper())
 
-    # ────────── COMPLETED SCREEN ──────────
+    # ────────── COMPLETED ──────────
     if st["status"] == "completed":
-        avg = speed
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"✅ <b>{fb('INDEXING COMPLETE')}</b>",
@@ -564,7 +593,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
             f"<code>{pbar(100.0)}</code>",
             "",
             f"⏱️ {sc('total time')} · <code>{fmt_duration(elapsed)}</code>",
-            f"⚡ {sc('avg speed')} · <code>{avg:.1f} ꜰɪʟᴇꜱ/ᴍɪɴ</code>",
+            f"⚡ {sc('avg speed')} · <code>{speed:.1f} ꜰɪʟᴇꜱ/ᴍɪɴ</code>",
         ])
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data="idx_close")]])
@@ -577,7 +606,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
             pass
         return
 
-    # ────────── STOPPED SCREEN ──────────
+    # ────────── STOPPED ──────────
     if st["status"] == "stopped":
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -601,7 +630,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
             pass
         return
 
-    # ────────── ERROR SCREEN ──────────
+    # ────────── ERROR ──────────
     if st["status"] == "error":
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -625,7 +654,7 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
             pass
         return
 
-    # ────────── RUNNING / PAUSED SCREEN ──────────
+    # ────────── RUNNING / PAUSED ──────────
     status_icon = {"running": "🟢 ʀᴜɴɴɪɴɢ", "paused": "🟡 ᴘᴀᴜꜱᴇᴅ"}.get(
         st["status"], st["status"].upper())
 
@@ -678,19 +707,21 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
             disable_web_page_preview=True)
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
-    except Exception:
-        pass
+    except Exception as e:
+        msg = str(e).lower()
+        if "not modified" in msg:
+            return
+        logger.warning(f"[IDX] progress edit failed for {job_id}: {type(e).__name__}: {e}")
 
 # ═══════════════════════ LIVE UPDATER ═══════════════════════
 async def _live_updater(client: Client, job_id: str) -> None:
-    """Update the progress message every 3 seconds while the job is active."""
+    """Refresh the progress message every 3 seconds."""
     try:
         while True:
             st = jobs.get(job_id)
             if not st:
                 return
             if st["status"] not in ("running", "paused"):
-                # final render is handled by _finish
                 return
             await _render_progress(client, job_id, force=True)
             await asyncio.sleep(3)
@@ -698,7 +729,6 @@ async def _live_updater(client: Client, job_id: str) -> None:
         return
     except Exception as e:
         logger.warning(f"live updater stopped: {e}")
-
 
 # ═══════════════════════ PARALLEL BATCH PROCESSOR ═══════════════════════
 async def _process_one(msg, st, stats, lock):
@@ -724,18 +754,20 @@ async def _process_one(msg, st, stats, lock):
                 elif rtype == "series":
                     stats["series"] += 1
                 shard = result.get("shard_index")
+                shard_label = f"DB{shard+1}" if isinstance(shard, int) else shard
                 logger.info(
                     f"[IDX] ✅ SAVED msg={msg_id} type={rtype} "
                     f"title='{title}' q={quality} c={codec} a={audio} "
-                    f"shard=DB{shard+1 if isinstance(shard, int) else shard}"
+                    f"shard={shard_label}"
                 )
             elif s == "duplicate":
                 stats["duplicates"] += 1
                 reason = result.get("reason") or "unknown"
                 shard = result.get("shard_index")
+                shard_label = f"DB{shard+1}" if isinstance(shard, int) else shard
                 logger.info(
                     f"[IDX] ♻️ DUPLICATE msg={msg_id} reason={reason} "
-                    f"title='{title}' shard=DB{shard+1 if isinstance(shard, int) else shard}"
+                    f"title='{title}' shard={shard_label}"
                 )
             elif s == "skipped":
                 stats["skipped"] += 1
@@ -768,7 +800,6 @@ async def _process_batch(msgs, st, stats, concurrency: int = 20):
 
     await asyncio.gather(*[_worker(m) for m in clean])
 
-
 # ═══════════════════════ JOB WORKER ═══════════════════════
 async def _run_job(client: Client, job_id: str) -> None:
     st = jobs.get(job_id)
@@ -778,9 +809,9 @@ async def _run_job(client: Client, job_id: str) -> None:
     stats = st["stats"]
     channel_id = st["channel_id"]
     start_id = st["start_message_id"]
-    BATCH = 100         # Telegram GetMessages hard cap
-    CONCURRENCY = 20    # parallel processors
-    PREFETCH = True     # fetch next batch while processing current
+    BATCH = 100
+    CONCURRENCY = 20
+    PREFETCH = True
 
     async def _finish(status: str):
         st["status"] = status
@@ -808,7 +839,6 @@ async def _run_job(client: Client, job_id: str) -> None:
             return []
 
     try:
-        # ── Verify bot can see the channel ──
         try:
             chat = await client.get_chat(channel_id)
             st["channel_title"] = chat.title or st.get("channel_title")
@@ -817,7 +847,6 @@ async def _run_job(client: Client, job_id: str) -> None:
             await _finish("error")
             return
 
-        # ── Start live updater (every 3s) ──
         live_task = asyncio.create_task(_live_updater(client, job_id))
 
         current = start_id
@@ -825,34 +854,29 @@ async def _run_job(client: Client, job_id: str) -> None:
 
         try:
             while current >= 1:
-                # Cooperative pause
                 while st["status"] == "paused":
                     await asyncio.sleep(0.5)
                 if st["status"] in ("stopped", "error"):
                     await _finish(st["status"])
                     return
 
-                # Compute the current batch
                 batch_ids = list(range(max(1, current - BATCH + 1), current + 1))
                 batch_ids.reverse()
 
-                # Fetch current batch (await prefetched, or start fresh)
                 if pending is not None:
                     msgs = await pending
                     pending = None
                 else:
                     msgs = await _fetch(channel_id, batch_ids)
 
-                # Kick off next batch fetch in background
                 next_current = current - BATCH
                 if PREFETCH and next_current >= 1:
                     next_ids = list(range(max(1, next_current - BATCH + 1), next_current + 1))
                     next_ids.reverse()
                     pending = asyncio.create_task(_fetch(channel_id, next_ids))
 
-                # Process current batch in parallel
                 await _process_batch(msgs, st, stats, concurrency=CONCURRENCY)
-                                # Periodic status log every batch
+
                 logger.info(
                     f"[IDX] batch done — current={current} "
                     f"processed={stats['processed']} saved={stats['indexed']} "
@@ -895,7 +919,6 @@ async def cb_pause(client: Client, q: CallbackQuery):
     else:
         await q.answer("ᴄᴀɴɴᴏᴛ ᴘᴀᴜꜱᴇ", show_alert=True)
 
-
 @Client.on_callback_query(filters.regex(r"^idx_resume:(.+)$"))
 async def cb_resume(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
@@ -907,7 +930,6 @@ async def cb_resume(client: Client, q: CallbackQuery):
     else:
         await q.answer("ᴄᴀɴɴᴏᴛ ʀᴇꜱᴜᴍᴇ", show_alert=True)
 
-
 @Client.on_callback_query(filters.regex(r"^idx_stop:(.+)$"))
 async def cb_stop(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
@@ -915,12 +937,8 @@ async def cb_stop(client: Client, q: CallbackQuery):
     jid = q.matches[0].group(1)
     if await jobs.stop(jid):
         await q.answer("❌ ꜱᴛᴏᴘᴘᴇᴅ")
-        st = jobs.get(jid)
-        if st:
-            await _render_progress(client, jid, force=True)
     else:
         await q.answer("ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
 
 # ═══════════════════════ STATS / HISTORY / DUPS / ROUTING ═══════════════════════
 @Client.on_callback_query(filters.regex(r"^idx_stats$"))
@@ -938,7 +956,6 @@ async def cb_stats(client: Client, q: CallbackQuery):
         DIV_S,
         f"🗄️ {sc('media shard distribution')}",
     ]
-    total_docs = max(1, total)
     for r in routing:
         if not r["ok"] and r["used_mb"] is None:
             lines.append(f"🔴 <b>{sc('shard')} {r['index']:02d}</b> · ᴜɴʀᴇᴀᴄʜᴀʙʟᴇ")
@@ -958,7 +975,6 @@ async def cb_stats(client: Client, q: CallbackQuery):
     except Exception:
         pass
     await q.answer()
-
 
 @Client.on_callback_query(filters.regex(r"^idx_history$"))
 async def cb_history(client: Client, q: CallbackQuery):
@@ -993,7 +1009,6 @@ async def cb_history(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
-
 @Client.on_callback_query(filters.regex(r"^idx_dups$"))
 async def cb_dups(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
@@ -1019,7 +1034,6 @@ async def cb_dups(client: Client, q: CallbackQuery):
     except Exception:
         pass
     await q.answer()
-
 
 @Client.on_callback_query(filters.regex(r"^idx_routing$"))
 async def cb_routing(client: Client, q: CallbackQuery):
@@ -1056,7 +1070,6 @@ async def cb_routing(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
-
 @Client.on_callback_query(filters.regex(r"^idx_live$"))
 async def cb_live(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
@@ -1087,6 +1100,24 @@ async def cb_live(client: Client, q: CallbackQuery):
         pass
     await q.answer()
 
+# ═══════════════════════ RESET COMMAND ═══════════════════════
+@Client.on_message(filters.command("index_reset") & filters.private)
+async def cmd_index_reset(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ."); return
+    n = 0
+    for jid in list(jobs.state.keys()):
+        st = jobs.get(jid)
+        if not st:
+            continue
+        try:
+            await jobs.stop(jid)
+            n += 1
+        except Exception:
+            jobs.force_clear(jid)
+            n += 1
+    await message.reply_text(f"🧹 ᴄʟᴇᴀʀᴇᴅ <b>{n}</b> ᴊᴏʙꜱ.",
+                             parse_mode=ParseMode.HTML)
 
 # ═══════════════════════ AUTO INDEXING ═══════════════════════
 if DATABASE_CHANNEL_ID:
@@ -1095,18 +1126,20 @@ if DATABASE_CHANNEL_ID:
         """Silent auto-indexing. No progress spam."""
         if not AUTO_INDEXING_ENABLED:
             return
-        # Ignore messages without media
         if not (message.video or message.document or message.audio):
             return
         try:
             result = await process_message(message, mode="auto")
             status = result["status"]
             if status == "saved":
-                logger.info(f"[AUTO-IDX] saved msg={message.id} "
-                            f"type={(result.get('record') or {}).get('type')}")
+                rec = result.get("record") or {}
+                logger.info(
+                    f"[AUTO-IDX] ✅ saved msg={message.id} "
+                    f"type={rec.get('type')} title='{rec.get('title') or rec.get('series_title')}'"
+                )
             elif status == "duplicate":
-                logger.debug(f"[AUTO-IDX] duplicate msg={message.id}")
+                logger.info(f"[AUTO-IDX] ♻️ duplicate msg={message.id}")
             elif status == "error":
-                logger.warning(f"[AUTO-IDX] error msg={message.id}: {result.get('reason')}")
+                logger.warning(f"[AUTO-IDX] ❌ error msg={message.id}: {result.get('reason')}")
         except Exception as e:
             logger.exception(f"[AUTO-IDX] handler failed: {e}")
