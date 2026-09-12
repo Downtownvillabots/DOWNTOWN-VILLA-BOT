@@ -602,8 +602,11 @@ async def _run_job(client: Client, job_id: str) -> None:
     st = jobs.get(job_id)
     if not st:
         return
+
     stats = st["stats"]
     channel_id = st["channel_id"]
+    start_id = st["start_message_id"]
+    BATCH = 100  # safe Telegram batch size
 
     async def _finish(status: str):
         st["status"] = status
@@ -618,28 +621,20 @@ async def _run_job(client: Client, job_id: str) -> None:
             })
 
     try:
-        # ── Verify bot can access the channel BEFORE iterating ──
+        # ── Verify bot can see the channel ──
         try:
             chat = await client.get_chat(channel_id)
             st["channel_title"] = chat.title or st.get("channel_title")
         except Exception as e:
             st["error"] = (
-                f"Cannot access channel {channel_id}: {type(e).__name__}: {e}\n"
-                f"👉 Add the bot as ADMIN in that channel."
+                f"Cannot access channel {channel_id}: {type(e).__name__}: {e}"
             )
             await _finish("error")
             return
 
-        # ── Iterate from start_message_id downward ──
-        offset = st["start_message_id"] + 1
-        try:
-            history = client.get_chat_history(channel_id, offset_id=offset)
-        except Exception as e:
-            st["error"] = f"get_chat_history failed: {type(e).__name__}: {e}"
-            await _finish("error")
-            return
-
-        async for msg in history:
+        # ── Iterate backward in batches of 100 using GetMessages (bot-allowed) ──
+        current = start_id
+        while current >= 1:
             while st["status"] == "paused":
                 await asyncio.sleep(1.0)
 
@@ -647,33 +642,62 @@ async def _run_job(client: Client, job_id: str) -> None:
                 await _finish(st["status"])
                 return
 
-            st["current_message_id"] = msg.id
-            stats["processed"] += 1
+            batch_ids = list(range(max(1, current - BATCH + 1), current + 1))
+            batch_ids.reverse()  # newest → oldest inside the batch
 
             try:
-                result = await process_message(msg, mode="manual")
-                s = result["status"]
-                rec = result.get("record") or {}
-                if s == "saved":
-                    stats["indexed"] += 1
-                    rtype = rec.get("type")
-                    if rtype == "movie":
-                        stats["movies"] += 1
-                    elif rtype == "series":
-                        stats["series"] += 1
-                elif s == "duplicate":
-                    stats["duplicates"] += 1
-                elif s == "skipped":
-                    stats["skipped"] += 1
-                else:
-                    stats["failed"] += 1
-            except asyncio.CancelledError:
-                raise
+                msgs = await client.get_messages(channel_id, message_ids=batch_ids)
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 2)
+                continue
             except Exception as e:
-                logger.warning(f"Message {msg.id} failed: {e}")
-                stats["failed"] += 1
+                logger.warning(f"Batch fetch failed at {current}: {e}")
+                st["error"] = f"get_messages failed at {current}: {type(e).__name__}: {e}"
+                await _finish("error")
+                return
+
+            # `msgs` is a list of Message or None (deleted / inaccessible)
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+
+            for msg in msgs:
+                if msg is None:
+                    continue
+                if getattr(msg, "empty", False):
+                    continue
+
+                st["current_message_id"] = msg.id
+                stats["processed"] += 1
+
+                try:
+                    result = await process_message(msg, mode="manual")
+                    s = result["status"]
+                    rec = result.get("record") or {}
+                    if s == "saved":
+                        stats["indexed"] += 1
+                        rtype = rec.get("type")
+                        if rtype == "movie":
+                            stats["movies"] += 1
+                        elif rtype == "series":
+                            stats["series"] += 1
+                    elif s == "duplicate":
+                        stats["duplicates"] += 1
+                    elif s == "skipped":
+                        stats["skipped"] += 1
+                    else:
+                        stats["failed"] += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Message {msg.id} failed: {e}")
+                    stats["failed"] += 1
 
             await _render_progress(client, job_id, force=False)
+
+            # Advance to the next (older) batch
+            if current - BATCH < 1:
+                break
+            current -= BATCH
 
         await _finish("completed")
 
