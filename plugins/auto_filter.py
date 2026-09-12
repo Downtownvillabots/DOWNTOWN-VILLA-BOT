@@ -28,6 +28,23 @@ from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════ DIAGNOSTIC — catch-all logger ═══════════════════════
+# Runs BEFORE every group-0 handler (negative group fires first).
+# Logs every private message. Remove once search is confirmed working.
+from pyrogram.types import Message as _DbgMsg
+
+@Client.on_message(filters.private, group=-100)
+async def _debug_private(client: Client, message: _DbgMsg):
+    try:
+        txt = (message.text or "").strip()
+        logger.info(
+            f"[AF-DEBUG] private msg id={message.id} "
+            f"from={message.from_user.id if message.from_user else '?'} "
+            f"text={txt[:60]!r}"
+        )
+    except Exception as e:
+        logger.warning(f"[AF-DEBUG] logger error: {e}")
+
 
 # ═══════════════════════ LOAD STATE ═══════════════════════
 class _LoadState:
