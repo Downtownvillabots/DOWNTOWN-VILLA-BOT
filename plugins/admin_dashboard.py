@@ -1,14 +1,7 @@
 # plugins/admin_dashboard.py
 """
 🏨 DOWNTOWN VILLA — ULTIMATE DATABASE CONTROL CENTER
-====================================================
-Complete live MongoDB control center inside Telegram.
-- Admin only
-- Real MongoDB statistics (dbStats, collStats, buildInfo, ping, listCollections)
-- Live auto-refresh with bounded background task
-- Multi-confirmation destructive actions
-- Secret redaction, audit logging, caching
-Single-file implementation.
+Fully hierarchical, dynamic, real-data MongoDB dashboard inside Telegram.
 """
 import asyncio
 import logging
@@ -32,28 +25,27 @@ from database import db_registry
 
 logger = logging.getLogger(__name__)
 
-# ============================ CONSTANTS ============================
+# ─────────────────────────── CONSTANTS ───────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 BAR_FULL = "█"
 BAR_EMPTY = "░"
 BAR_WIDTH = 20
+CACHE_TTL = 10
+LIVE_DEFAULT = 15
+LIVE_OPTIONS = [10, 15, 30, 60]
+RECENT_LIMITS = [5, 10, 20]
+COLL_PAGE_SIZE = 25
 MAX_LATENCY_HISTORY = 30
 
-CACHE_TTL = 10
-LIVE_REFRESH_DEFAULT = 10
-LIVE_REFRESH_OPTIONS = [5, 10, 15, 30, 60]
-RECENT_DOC_LIMITS = [5, 10, 20]
-COLLECTIONS_PAGE_SIZE = 25
-
-SENSITIVE_KEY_PATTERN = re.compile(
+SENSITIVE_KEY = re.compile(
     r"(token|password|secret|api[_-]?key|api[_-]?hash|session|uri|database_uri|dsn|auth)",
     re.IGNORECASE,
 )
-CONN_STRING_PATTERN = re.compile(r"mongodb(\+srv)?://[^\s'\"]+", re.IGNORECASE)
+MONGO_URI_PAT = re.compile(r"mongodb(\+srv)?://[^\s'\"]+", re.IGNORECASE)
 
 
-# ============================ HELPERS ============================
-def format_bytes(size: Optional[int]) -> str:
+# ─────────────────────────── HELPERS ───────────────────────────
+def fmt_bytes(size: Optional[int]) -> str:
     if not size:
         return "0 B"
     try:
@@ -68,33 +60,35 @@ def format_bytes(size: Optional[int]) -> str:
     return f"{s:.2f} {units[i]}"
 
 
-def format_int(n: Optional[int]) -> str:
+def fmt_int(n: Optional[int]) -> str:
     try:
         return f"{int(n):,}"
     except (TypeError, ValueError):
         return "0"
 
 
-def progress_bar(percent: float, width: int = BAR_WIDTH) -> str:
+def bar(percent: float, width: int = BAR_WIDTH) -> str:
     try:
-        pct = max(0.0, min(100.0, float(percent)))
+        p = max(0.0, min(100.0, float(percent)))
     except (TypeError, ValueError):
-        pct = 0.0
-    filled = int(round(width * pct / 100.0))
+        p = 0.0
+    filled = int(round(width * p / 100.0))
     filled = max(0, min(width, filled))
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
-def capacity_emoji(percent: float) -> str:
+def status_emoji(percent: float) -> str:
     try:
         p = float(percent)
     except (TypeError, ValueError):
-        return "🟢"
-    if p >= 95:
+        return "⚪"
+    if p >= 100:
         return "🔴"
-    if p >= 85:
+    if p >= 90:
+        return "🔴"
+    if p >= 75:
         return "🟠"
-    if p >= 70:
+    if p >= 60:
         return "🟡"
     return "🟢"
 
@@ -103,156 +97,130 @@ def now_ist() -> str:
     return datetime.now(IST).strftime("%I:%M:%S %p IST")
 
 
-def escape(s: Any) -> str:
+def esc(s: Any) -> str:
     if s is None:
         return ""
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def redact(value: Any) -> Any:
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if SENSITIVE_KEY_PATTERN.search(str(k)):
-                out[k] = "🔐 [REDACTED]"
-            else:
-                out[k] = redact(v)
-        return out
-    if isinstance(value, list):
-        return [redact(v) for v in value]
-    if isinstance(value, str):
-        return CONN_STRING_PATTERN.sub("mongodb://[REDACTED]", value)
-    return value
+def redact(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {k: ("🔐 [REDACTED]" if SENSITIVE_KEY.search(str(k)) else redact(val))
+                for k, val in v.items()}
+    if isinstance(v, list):
+        return [redact(x) for x in v]
+    if isinstance(v, str):
+        return MONGO_URI_PAT.sub("mongodb://[REDACTED]", v)
+    return v
 
 
-def summarize_doc(doc: Dict[str, Any], max_fields: int = 15, max_val_len: int = 120) -> str:
+def summarize_doc(doc: Dict[str, Any], max_fields: int = 12, max_len: int = 100) -> str:
     safe = redact(doc)
-    lines = []
+    out = []
     for i, (k, v) in enumerate(safe.items()):
         if i >= max_fields:
-            lines.append("… (more fields truncated)")
+            out.append("  <i>… truncated</i>")
             break
-        val = str(v)
-        if len(val) > max_val_len:
-            val = val[: max_val_len - 1] + "…"
-        lines.append(f"  <b>{escape(k)}</b>: <code>{escape(val)}</code>")
-    return "\n".join(lines)
+        sval = str(v)
+        if len(sval) > max_len:
+            sval = sval[: max_len - 1] + "…"
+        out.append(f"  <b>{esc(k)}</b>: <code>{esc(sval)}</code>")
+    return "\n".join(out)
 
 
-def is_admin(user_id: int) -> bool:
+def is_admin(uid: int) -> bool:
     try:
-        return int(user_id) in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]
+        return int(uid) in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]
     except Exception:
         return False
 
 
-# ============================ CACHE ============================
-class TTLCache:
+# ─────────────────────────── CACHE ───────────────────────────
+class _Cache:
     def __init__(self, ttl: int = CACHE_TTL):
-        self._ttl = ttl
-        self._data: Dict[str, Tuple[float, Any]] = {}
+        self.ttl = ttl
+        self._d: Dict[str, Tuple[float, Any]] = {}
 
-    def get(self, key: str) -> Optional[Any]:
-        entry = self._data.get(key)
-        if not entry:
+    def get(self, k: str):
+        e = self._d.get(k)
+        if not e:
             return None
-        ts, value = entry
-        if time.time() - ts > self._ttl:
-            self._data.pop(key, None)
+        if time.time() - e[0] > self.ttl:
+            self._d.pop(k, None)
             return None
-        return value
+        return e[1]
 
-    def set(self, key: str, value: Any) -> None:
-        self._data[key] = (time.time(), value)
+    def set(self, k: str, v: Any) -> None:
+        self._d[k] = (time.time(), v)
 
-    def invalidate(self, key: Optional[str] = None) -> None:
-        if key is None:
-            self._data.clear()
+    def invalidate(self, k: Optional[str] = None) -> None:
+        if k is None:
+            self._d.clear()
         else:
-            self._data.pop(key, None)
+            self._d.pop(k, None)
 
 
-cache = TTLCache()
+cache = _Cache()
 
 
-# ============================ AUDIT LOG ============================
-class DatabaseAuditLogger:
-    def __init__(self, max_entries: int = 200):
-        self._entries: deque = deque(maxlen=max_entries)
+# ─────────────────────────── ERROR MONITOR ───────────────────────────
+class _ErrorMonitor:
+    def __init__(self, maxlen: int = 50):
+        self._q: deque = deque(maxlen=maxlen)
 
-    async def log(self, admin_id: int, action: str, database: str = "-",
-                  collection: str = "-", result: str = "-", extra: str = "") -> None:
-        entry = {
-            "ts": now_ist(),
-            "admin": admin_id,
-            "action": action,
-            "database": database,
-            "collection": collection,
-            "result": result,
-            "extra": extra,
-        }
-        self._entries.append(entry)
-        logger.info(f"[AUDIT] admin={admin_id} action={action} db={database} "
-                    f"coll={collection} result={result} {extra}")
+    def record(self, src: str, err: str) -> None:
+        safe = MONGO_URI_PAT.sub("mongodb://[REDACTED]", str(err))
+        self._q.append({"ts": now_ist(), "src": src, "err": safe[:280]})
 
-    def recent(self, limit: int = 20) -> List[Dict[str, Any]]:
-        return list(self._entries)[-limit:][::-1]
+    def recent(self, n: int = 20) -> List[Dict[str, Any]]:
+        return list(self._q)[-n:][::-1]
 
 
-audit = DatabaseAuditLogger()
+errors = _ErrorMonitor()
 
 
-# ============================ LATENCY HISTORY ============================
-class LatencyHistory:
+# ─────────────────────────── LATENCY ───────────────────────────
+class _Latency:
     def __init__(self, maxlen: int = MAX_LATENCY_HISTORY):
-        self._data: Dict[str, deque] = {}
-        self._maxlen = maxlen
+        self._d: Dict[str, deque] = {}
+        self._m = maxlen
 
     def record(self, key: str, ms: Optional[float]) -> None:
         if ms is None:
             return
-        if key not in self._data:
-            self._data[key] = deque(maxlen=self._maxlen)
-        self._data[key].append(round(ms, 1))
+        self._d.setdefault(key, deque(maxlen=self._m)).append(round(ms, 1))
 
     def stats(self, key: str) -> Dict[str, Any]:
-        d = list(self._data.get(key, []))
+        d = list(self._d.get(key, []))
         if not d:
-            return {"current": None, "avg": None, "min": None, "max": None, "recent": []}
-        return {
-            "current": d[-1],
-            "avg": round(sum(d) / len(d), 1),
-            "min": min(d),
-            "max": max(d),
-            "recent": d[-10:],
-        }
+            return {"cur": None, "avg": None, "min": None, "max": None}
+        return {"cur": d[-1], "avg": round(sum(d) / len(d), 1), "min": min(d), "max": max(d)}
 
 
-latency_history = LatencyHistory()
+latency = _Latency()
 
 
-# ============================ ERROR MONITOR ============================
-class DatabaseErrorMonitor:
-    def __init__(self, maxlen: int = 50):
-        self._errors: deque = deque(maxlen=maxlen)
+# ─────────────────────────── AUDIT ───────────────────────────
+class _Audit:
+    def __init__(self, maxlen: int = 200):
+        self._q: deque = deque(maxlen=maxlen)
 
-    def record(self, source: str, error: str) -> None:
-        safe = CONN_STRING_PATTERN.sub("mongodb://[REDACTED]", str(error))
-        self._errors.append({
-            "ts": now_ist(),
-            "source": source,
-            "error": safe[:300],
+    def log(self, admin: int, action: str, target: str = "-", result: str = "-", extra: str = ""):
+        self._q.append({
+            "ts": now_ist(), "admin": admin, "action": action,
+            "target": target, "result": result, "extra": extra,
         })
+        logger.info(f"[AUDIT] admin={admin} action={action} target={target} result={result} {extra}")
 
-    def recent(self, limit: int = 20) -> List[Dict[str, Any]]:
-        return list(self._errors)[-limit:][::-1]
-
-
-error_monitor = DatabaseErrorMonitor()
+    def recent(self, n: int = 20) -> List[Dict[str, Any]]:
+        return list(self._q)[-n:][::-1]
 
 
-# ============================ MONGO DIAGNOSTICS ============================
-class MongoDiagnostics:
+audit = _Audit()
+
+
+# ─────────────────────────── MONGO DIAGNOSTICS ───────────────────────────
+class Diagnostics:
     @staticmethod
     async def ping(db) -> Optional[float]:
         try:
@@ -260,7 +228,7 @@ class MongoDiagnostics:
             await db.command("ping")
             return (time.time() - t0) * 1000.0
         except Exception as e:
-            error_monitor.record("ping", str(e))
+            errors.record("ping", str(e))
             return None
 
     @staticmethod
@@ -268,7 +236,15 @@ class MongoDiagnostics:
         try:
             return await db.command("dbStats")
         except Exception as e:
-            error_monitor.record("dbStats", str(e))
+            errors.record("dbStats", str(e))
+            return None
+
+    @staticmethod
+    async def coll_stats(db, name: str) -> Optional[Dict[str, Any]]:
+        try:
+            return await db.command("collStats", name)
+        except Exception as e:
+            errors.record(f"collStats:{name}", str(e))
             return None
 
     @staticmethod
@@ -276,1004 +252,986 @@ class MongoDiagnostics:
         try:
             return sorted(await db.list_collection_names())
         except Exception as e:
-            error_monitor.record("listCollections", str(e))
+            errors.record("listCollections", str(e))
             return []
 
     @staticmethod
-    async def build_info(db) -> Optional[str]:
+    async def build_version(db) -> Optional[str]:
         try:
-            info = await db.command("buildInfo")
-            return info.get("version")
+            return (await db.command("buildInfo")).get("version")
         except Exception:
-            return None
-
-    @staticmethod
-    async def coll_stats(db, coll: str) -> Optional[Dict[str, Any]]:
-        try:
-            return await db.command("collStats", coll)
-        except Exception as e:
-            error_monitor.record(f"collStats:{coll}", str(e))
             return None
 
     @staticmethod
     async def list_indexes(db, coll: str) -> List[Dict[str, Any]]:
         try:
-            cursor = db[coll].list_indexes()
-            items = []
-            async for idx in cursor:
-                items.append(idx)
-            return items
+            out = []
+            async for idx in db[coll].list_indexes():
+                out.append(idx)
+            return out
         except Exception as e:
-            error_monitor.record(f"listIndexes:{coll}", str(e))
+            errors.record(f"listIndexes:{coll}", str(e))
             return []
 
     @staticmethod
-    async def sample_documents(db, coll: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def sample(db, coll: str, limit: int = 5) -> List[Dict[str, Any]]:
         try:
-            cursor = db[coll].find({}).limit(limit)
-            return await cursor.to_list(length=limit)
+            return await db[coll].find({}).limit(limit).to_list(length=limit)
         except Exception as e:
-            error_monitor.record(f"sample:{coll}", str(e))
+            errors.record(f"sample:{coll}", str(e))
             return []
 
+    @staticmethod
+    async def estimate_count(db, coll: str) -> int:
+        try:
+            return await db[coll].estimated_document_count()
+        except Exception:
+            return 0
 
-# ============================ STATS MANAGER ============================
-class DatabaseStatsManager:
-    def get_all_dbs(self) -> List[Dict[str, Any]]:
-        dbs: List[Dict[str, Any]] = []
-        seen_ids = set()
 
-        system_db = db_registry.get_system_db()
-        if system_db is not None:
-            dbs.append({"label": "SYSTEM", "db": system_db, "name": "downtown_villa_system"})
-            seen_ids.add(id(system_db))
+# ─────────────────────────── STATS MANAGER ───────────────────────────
+class StatsManager:
+    def _entries(self, cat: str) -> List:
+        if cat == "system":
+            return db_registry.system_entries()
+        if cat == "user":
+            return db_registry.user_entries()
+        if cat == "media":
+            return db_registry.media_entries()
+        return []
 
-        user_db = db_registry.get_user_db()
-        if user_db is not None and id(user_db) not in seen_ids:
-            dbs.append({"label": "USER", "db": user_db, "name": "downtown_villa_user"})
-            seen_ids.add(id(user_db))
-
-        media_count = db_registry.get_media_shard_count()
-        for i in range(media_count):
-            mdb = db_registry.get_media_db(i)
-            if mdb is None or id(mdb) in seen_ids:
-                continue
-            dbs.append({"label": f"MEDIA_{i + 1}", "db": mdb, "name": "downtown_villa_media"})
-            seen_ids.add(id(mdb))
-
-        for i, d in enumerate(dbs, 1):
-            d["index"] = i
-        return dbs
-
-    def get_db_by_index(self, idx: int) -> Optional[Dict[str, Any]]:
-        for d in self.get_all_dbs():
-            if d["index"] == idx:
-                return d
+    async def db_info(self, cat: str, index: int) -> Optional[Dict[str, Any]]:
+        for e in self._entries(cat):
+            if e.index == index:
+                info = await self._gather(cat, e)
+                return info
         return None
 
-    async def get_full_stats(self, force: bool = False) -> Dict[str, Any]:
-        if not force:
-            cached = cache.get("full_stats")
-            if cached is not None:
-                return cached
-        dbs = self.get_all_dbs()
-        results = await asyncio.gather(
-            *[self._gather_db_stats(e) for e in dbs],
-            return_exceptions=False,
-        )
-        totals = self._compute_totals(results)
-        data = {
-            "databases": results,
-            "totals": totals,
-            "updated": now_ist(),
-            "db_count": len(results),
-        }
-        cache.set("full_stats", data)
+    async def category(self, cat: str) -> Dict[str, Any]:
+        key = f"cat:{cat}"
+        cached = cache.get(key)
+        if cached:
+            return cached
+        entries = self._entries(cat)
+        results = await asyncio.gather(*[self._gather(cat, e) for e in entries])
+        totals = self._totals(results)
+        data = {"items": results, "totals": totals, "updated": now_ist(),
+                "count": len(results), "category": cat}
+        cache.set(key, data)
         return data
 
-    async def _gather_db_stats(self, entry: Dict[str, Any]) -> Dict[str, Any]:
-        db = entry["db"]
-        out: Dict[str, Any] = {
-            "index": entry["index"],
-            "label": entry["label"],
-            "name": entry["name"],
-            "online": False,
-            "ping_ms": None,
-            "version": None,
-            "collections": 0,
-            "objects": 0,
-            "data_size": 0,
-            "storage_size": 0,
-            "index_size": 0,
-            "avg_obj_size": 0,
-            "collection_names": [],
+    async def overall(self) -> Dict[str, Any]:
+        cached = cache.get("overall")
+        if cached:
+            return cached
+        s = await self.category("system")
+        u = await self.category("user")
+        m = await self.category("media")
+        overall_totals = self._merge_totals([s["totals"], u["totals"], m["totals"]])
+        data = {
+            "system": s, "user": u, "media": m,
+            "totals": overall_totals,
+            "count": s["count"] + u["count"] + m["count"],
+            "updated": now_ist(),
         }
-        ping = await MongoDiagnostics.ping(db)
-        if ping is None:
+        cache.set("overall", data)
+        return data
+
+    async def _gather(self, cat: str, entry) -> Dict[str, Any]:
+        db = entry.db
+        out = {
+            "cat": cat, "index": entry.index, "label": entry.label,
+            "online": False, "ping_ms": None, "version": None,
+            "collections": 0, "objects": 0,
+            "data_size": 0, "storage_size": 0, "index_size": 0,
+            "avg_obj": 0, "collection_names": [],
+        }
+        p = await Diagnostics.ping(db)
+        if p is None:
             return out
         out["online"] = True
-        out["ping_ms"] = round(ping, 1)
-        latency_history.record(entry["label"], ping)
+        out["ping_ms"] = round(p, 1)
+        latency.record(f"{cat}:{entry.label}", p)
 
-        stats = await MongoDiagnostics.db_stats(db)
-        if stats:
-            out["collections"] = stats.get("collections", 0)
-            out["objects"] = stats.get("objects", 0)
-            out["data_size"] = stats.get("dataSize", 0)
-            out["storage_size"] = stats.get("storageSize", 0)
-            out["index_size"] = stats.get("indexSize", 0)
-            out["avg_obj_size"] = stats.get("avgObjSize", 0) or 0
-        out["collection_names"] = await MongoDiagnostics.list_collections(db)
-        out["version"] = await MongoDiagnostics.build_info(db)
+        st = await Diagnostics.db_stats(db)
+        if st:
+            out["collections"] = st.get("collections", 0)
+            out["objects"] = st.get("objects", 0)
+            out["data_size"] = st.get("dataSize", 0)
+            out["storage_size"] = st.get("storageSize", 0)
+            out["index_size"] = st.get("indexSize", 0)
+            out["avg_obj"] = st.get("avgObjSize", 0) or 0
+        out["collection_names"] = await Diagnostics.list_collections(db)
+        out["version"] = await Diagnostics.build_version(db)
         return out
 
-    def _compute_totals(self, dbs: List[Dict[str, Any]]) -> Dict[str, int]:
+    def _totals(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
         t = {"objects": 0, "data_size": 0, "storage_size": 0, "index_size": 0, "collections": 0}
-        for d in dbs:
-            if not d["online"]:
+        for i in items:
+            if not i["online"]:
                 continue
-            t["objects"] += d["objects"]
-            t["data_size"] += d["data_size"]
-            t["storage_size"] += d["storage_size"]
-            t["index_size"] += d["index_size"]
-            t["collections"] += d["collections"]
+            t["objects"] += i["objects"]
+            t["data_size"] += i["data_size"]
+            t["storage_size"] += i["storage_size"]
+            t["index_size"] += i["index_size"]
+            t["collections"] += i["collections"]
         return t
 
-    async def get_media_only(self) -> Dict[str, Any]:
-        cached = cache.get("media_only")
-        if cached is not None:
-            return cached
-        dbs = [d for d in self.get_all_dbs() if d["label"].startswith("MEDIA_")]
-        results = await asyncio.gather(*[self._gather_db_stats(e) for e in dbs]) if dbs else []
-        total_files = sum(r["objects"] for r in results)
-        total_storage = sum(r["storage_size"] for r in results)
-        total_data = sum(r["data_size"] for r in results)
-        data = {
-            "shards": results,
-            "total_files": total_files,
-            "total_storage": total_storage,
-            "total_data": total_data,
-        }
-        cache.set("media_only", data)
-        return data
-
-    async def get_user_db_stats(self) -> Dict[str, Any]:
-        cached = cache.get("user_db")
-        if cached is not None:
-            return cached
-        user_db = db_registry.get_user_db()
-        if user_db is None:
-            return {"available": False}
-        dbs = await MongoDiagnostics.db_stats(user_db)
-        names = await MongoDiagnostics.list_collections(user_db)
-        counts: Dict[str, int] = {}
-        for name in names:
-            try:
-                counts[name] = await user_db[name].estimated_document_count()
-            except Exception:
-                counts[name] = 0
-        data = {
-            "available": True,
-            "name": "downtown_villa_user",
-            "objects": (dbs or {}).get("objects", 0),
-            "data_size": (dbs or {}).get("dataSize", 0),
-            "storage_size": (dbs or {}).get("storageSize", 0),
-            "index_size": (dbs or {}).get("indexSize", 0),
-            "collections": names,
-            "counts": counts,
-        }
-        cache.set("user_db", data)
-        return data
+    def _merge_totals(self, totals: List[Dict[str, int]]) -> Dict[str, int]:
+        m = {"objects": 0, "data_size": 0, "storage_size": 0, "index_size": 0, "collections": 0}
+        for t in totals:
+            for k in m:
+                m[k] += t.get(k, 0)
+        return m
 
 
-stats_manager = DatabaseStatsManager()
+stats = StatsManager()
 
 
-# ============================ DUPLICATE MANAGER ============================
-class DuplicateManager:
-    async def scan(self, db, collection_name: str, key: str = "file_id") -> Dict[str, Any]:
-        if db is None:
-            return {"ok": False, "reason": "No database"}
-        coll = db[collection_name]
-        try:
-            pipeline = [
-                {"$match": {key: {"$exists": True, "$ne": None}}},
-                {"$group": {"_id": f"${key}", "count": {"$sum": 1}}},
-                {"$match": {"count": {"$gt": 1}}},
-                {"$count": "duplicate_groups"},
-            ]
-            result = await coll.aggregate(pipeline).to_list(length=1)
-            dup_groups = result[0]["duplicate_groups"] if result else 0
-            return {"ok": True, "duplicate_groups": dup_groups, "key": key}
-        except Exception as e:
-            error_monitor.record("duplicate_scan", str(e))
-            return {"ok": False, "reason": str(e)}
-
-
-duplicate_manager = DuplicateManager()
-
-
-# ============================ CONFIRMATION MANAGER ============================
-class ConfirmationManager:
-    def __init__(self, ttl: int = 120):
-        self._pending: Dict[str, Dict[str, Any]] = {}
-        self._ttl = ttl
-
-    def _key(self, admin_id: int, token: str) -> str:
-        return f"{admin_id}:{token}"
-
-    def start(self, admin_id: int, token: str, payload: Dict[str, Any]) -> None:
-        self._pending[self._key(admin_id, token)] = {
-            "step": 1,
-            "payload": payload,
-            "expires": time.time() + self._ttl,
-        }
-
-    def advance(self, admin_id: int, token: str) -> Optional[Dict[str, Any]]:
-        k = self._key(admin_id, token)
-        entry = self._pending.get(k)
-        if not entry:
-            return None
-        if time.time() > entry["expires"]:
-            self._pending.pop(k, None)
-            return None
-        entry["step"] += 1
-        entry["expires"] = time.time() + self._ttl
-        return entry
-
-    def get(self, admin_id: int, token: str) -> Optional[Dict[str, Any]]:
-        k = self._key(admin_id, token)
-        entry = self._pending.get(k)
-        if not entry:
-            return None
-        if time.time() > entry["expires"]:
-            self._pending.pop(k, None)
-            return None
-        return entry
-
-    def cancel(self, admin_id: int, token: str) -> None:
-        self._pending.pop(self._key(admin_id, token), None)
-
-    def cleanup(self) -> None:
-        now = time.time()
-        for k in list(self._pending.keys()):
-            if self._pending[k]["expires"] < now:
-                self._pending.pop(k, None)
-
-
-confirmations = ConfirmationManager()
-
-
-# ============================ LIVE REFRESH MANAGER ============================
-class LiveRefreshManager:
+# ─────────────────────────── LIVE MONITOR ───────────────────────────
+class LiveMonitor:
     def __init__(self):
         self._tasks: Dict[int, asyncio.Task] = {}
         self._state: Dict[int, Dict[str, Any]] = {}
 
     def is_live(self, chat_id: int) -> bool:
-        return chat_id in self._tasks and not self._tasks[chat_id].done()
+        t = self._tasks.get(chat_id)
+        return t is not None and not t.done()
 
     def interval(self, chat_id: int) -> int:
-        return self._state.get(chat_id, {}).get("interval", LIVE_REFRESH_DEFAULT)
+        return self._state.get(chat_id, {}).get("interval", LIVE_DEFAULT)
 
-    async def start(self, client: Client, chat_id: int, message_id: int, view: str,
-                    extra: Optional[Dict[str, Any]] = None) -> None:
+    async def start(self, client: Client, chat_id: int, msg_id: int, view: str, extra: Dict):
         await self.stop(chat_id)
-        self._state[chat_id] = {"interval": self.interval(chat_id), "view": view,
-                                "extra": extra or {}, "message_id": message_id}
-        self._tasks[chat_id] = asyncio.create_task(
-            self._loop(client, chat_id, message_id, view, extra or {})
-        )
+        self._state[chat_id] = {"interval": self.interval(chat_id), "view": view, "extra": extra or {}}
+        self._tasks[chat_id] = asyncio.create_task(self._loop(client, chat_id, msg_id, view, extra or {}))
 
-    async def stop(self, chat_id: int) -> None:
-        task = self._tasks.pop(chat_id, None)
+    async def stop(self, chat_id: int):
+        t = self._tasks.pop(chat_id, None)
         self._state.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
+        if t and not t.done():
+            t.cancel()
             try:
-                await task
+                await t
             except Exception:
                 pass
 
-    def set_interval(self, chat_id: int, interval: int) -> None:
-        if chat_id in self._state:
-            self._state[chat_id]["interval"] = interval
-        else:
-            self._state[chat_id] = {"interval": interval}
-
-    async def _loop(self, client: Client, chat_id: int, message_id: int, view: str,
-                    extra: Dict[str, Any]) -> None:
+    async def _loop(self, client: Client, chat_id: int, msg_id: int, view: str, extra: Dict):
         try:
             while True:
-                interval = self.interval(chat_id)
-                await asyncio.sleep(interval)
+                await asyncio.sleep(self.interval(chat_id))
+                cache.invalidate()
                 try:
-                    data = await stats_manager.get_full_stats(force=True)
-                    text, kb = render_view(view, data, extra)
-                    try:
-                        await client.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            text=text,
-                            reply_markup=kb,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        pass
+                    text, kb = await build_view(view, extra)
+                    await client.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id,
+                        text=text, reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
-                    error_monitor.record("live_refresh", str(e))
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             return
+
+
+live = LiveMonitor()
+
+
+# ─────────────────────────── CONFIRMATION ───────────────────────────
+class Confirmations:
+    def __init__(self, ttl: int = 180):
+        self._p: Dict[str, Dict[str, Any]] = {}
+        self._ttl = ttl
+
+    def _k(self, uid: int, tok: str) -> str:
+        return f"{uid}:{tok}"
+
+    def start(self, uid: int, tok: str, payload: Dict):
+        self._p[self._k(uid, tok)] = {"step": 1, "payload": payload, "exp": time.time() + self._ttl}
+
+    def get(self, uid: int, tok: str) -> Optional[Dict]:
+        e = self._p.get(self._k(uid, tok))
+        if not e:
+            return None
+        if time.time() > e["exp"]:
+            self._p.pop(self._k(uid, tok), None)
+            return None
+        return e
+
+    def advance(self, uid: int, tok: str) -> Optional[Dict]:
+        e = self.get(uid, tok)
+        if not e:
+            return None
+        e["step"] += 1
+        e["exp"] = time.time() + self._ttl
+        return e
+
+    def cancel(self, uid: int, tok: str):
+        self._p.pop(self._k(uid, tok), None)
+
+    def cleanup(self):
+        now = time.time()
+        for k in list(self._p.keys()):
+            if self._p[k]["exp"] < now:
+                self._p.pop(k, None)
+
+
+confirms = Confirmations()
+
+
+# ─────────────────────────── DUPLICATE SCAN ───────────────────────────
+async def duplicate_scan(cat: str, index: int, key: str = "file_id") -> Dict[str, Any]:
+    info = await stats.db_info(cat, index)
+    if not info or not info["online"]:
+        return {"ok": False, "reason": "DB offline"}
+    entry = None
+    for e in (db_registry.system_entries() if cat == "system"
+              else db_registry.user_entries() if cat == "user"
+              else db_registry.media_entries()):
+        if e.index == index:
+            entry = e
+            break
+    if not entry:
+        return {"ok": False, "reason": "Entry missing"}
+    db = entry.db
+    total_dupes = 0
+    per_coll = []
+    for name in info["collection_names"]:
+        try:
+            pipeline = [
+                {"$match": {key: {"$exists": True, "$ne": None}}},
+                {"$group": {"_id": f"${key}", "n": {"$sum": 1}}},
+                {"$match": {"n": {"$gt": 1}}},
+                {"$count": "g"},
+            ]
+            r = await db[name].aggregate(pipeline).to_list(length=1)
+            g = r[0]["g"] if r else 0
+            if g:
+                per_coll.append({"name": name, "dupes": g})
+                total_dupes += g
         except Exception as e:
-            logger.warning(f"Live refresh loop error: {e}")
+            errors.record(f"dup:{name}", str(e))
+    return {"ok": True, "total": total_dupes, "per_collection": per_col per_col if False else per_coll}
 
 
-live_refresh = LiveRefreshManager()
+# ─────────────────────────── VIEW BUILDERS ───────────────────────────
+def _status(cat: str, items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "⚪ NO DATABASES"
+    up = sum(1 for i in items if i["online"])
+    if up == len(items):
+        return "🟢 HEALTHY"
+    if up == 0:
+        return "🔴 OFFLINE"
+    return f"🟡 {up}/{len(items)} ONLINE"
 
 
-# ============================ VIEW RENDERERS ============================
-def render_main(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+def _db_block(cat: str, d: Dict[str, Any]) -> str:
+    status = "🟢" if d["online"] else "🔴"
+    ping = f"{d['ping_ms']}ms" if d["ping_ms"] is not None else "—"
+    title = f"{cat.upper()} DATABASE {d['index']:02d}"
+    return "\n".join([
+        f"{status} <b>{title}</b>",
+        f"🏷️ CLUSTER: <code>{esc(d['label'])}</code>",
+        f"⏱️ PING: <code>{ping}</code>",
+        f"📦 DOCUMENTS: <code>{fmt_int(d['objects'])}</code>",
+        f"💾 STORAGE: <code>{fmt_bytes(d['storage_size'])}</code>",
+        f"📄 DATA: <code>{fmt_bytes(d['data_size'])}</code>",
+        f"🧩 INDEXES: <code>{fmt_bytes(d['index_size'])}</code>",
+        f"🗂️ COLLECTIONS: <code>{fmt_int(d['collections'])}</code>",
+    ])
+
+
+def _totals_block(t: Dict[str, int]) -> str:
+    return "\n".join([
+        "📊 <b>ALL DATABASES TOTAL</b>",
+        f"📦 DOCUMENTS: <code>{fmt_int(t['objects'])}</code>",
+        f"💾 STORAGE: <code>{fmt_bytes(t['storage_size'])}</code>",
+        f"📄 DATA: <code>{fmt_bytes(t['data_size'])}</code>",
+        f"🧩 INDEXES: <code>{fmt_bytes(t['index_size'])}</code>",
+        f"🗂️ COLLECTIONS: <code>{fmt_int(t['collections'])}</code>",
+    ])
+
+
+def _progress_block(percent: float, label: str) -> str:
+    return "\n".join([
+        f"📊 <b>{label}</b>",
+        f"{status_emoji(percent)} {percent:.1f}% USED",
+        f"<code>{bar(percent)}</code>",
+    ])
+
+
+# ─────────────────────────── MAIN SCREEN ───────────────────────────
+def kb_main(data: Dict[str, Any]) -> InlineKeyboardMarkup:
+    s = data["system"]; u = data["user"]; m = data["media"]
+    rows = [
+        [InlineKeyboardButton("🖥️ SYSTEM DATABASES", callback_data="db_cat:system")],
+        [InlineKeyboardButton("👥 USER DATABASES", callback_data="db_cat:user")],
+        [InlineKeyboardButton("🎬 MEDIA DATABASES", callback_data="db_cat:media")],
+        [InlineKeyboardButton("📊 OVERALL", callback_data="db_cat:overall")],
+        [
+            InlineKeyboardButton("❤️ HEALTH", callback_data="db_health:overall"),
+            InlineKeyboardButton("⚡ PERFORMANCE", callback_data="db_perf:overall"),
+        ],
+        [
+            InlineKeyboardButton("🧹 DUPLICATES", callback_data="db_dups:media:1"),
+            InlineKeyboardButton("🧩 INDEXES", callback_data="db_colls:media:1:1"),
+        ],
+        [
+            InlineKeyboardButton("📋 ACTIVITY LOG", callback_data="db_audit"),
+            InlineKeyboardButton("🚨 ERRORS", callback_data="db_errors"),
+        ],
+        [
+            InlineKeyboardButton("📡 LIVE MONITOR", callback_data="db_live"),
+            InlineKeyboardButton("🔄 REFRESH", callback_data="db_refresh"),
+        ],
+        [InlineKeyboardButton("❌ CLOSE", callback_data="db_close")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def view_main() -> Tuple[str, InlineKeyboardMarkup]:
+    data = await stats.overall()
+    s, u, m = data["system"], data["user"], data["media"]
     lines = [
         "🏨 <b>DOWNTOWN VILLA</b>",
         "💾 <b>DATABASE CONTROL CENTER</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔄 UPDATED: <code>{data['updated']}</code>",
         "",
-        f"🗄️ Databases: <b>{data['db_count']}</b>",
-        f"🔄 Updated: <code>{data['updated']}</code>",
+        f"🖥️ SYSTEM DATABASES: <b>{s['count']}</b>",
+        f"👥 USER DATABASES: <b>{u['count']}</b>",
+        f"🎬 MEDIA DATABASES: <b>{m['count']}</b>",
+        f"🗄️ TOTAL: <b>{data['count']}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        _totals_block(data["totals"]),
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🖥️ SYSTEM STATUS: {_status('system', s['items'])}",
+        f"👥 USER STATUS: {_status('user', u['items'])}",
+        f"🎬 MEDIA STATUS: {_status('media', m['items'])}",
         "",
+        "📡 LIVE MONITORING: 🟢 READY",
+        f"🕐 LAST UPDATE: {data['updated']}",
     ]
-    for db in data["databases"]:
-        lines.append(render_db_block(db))
+    return "\n".join(lines), kb_main(data)
+
+
+# ─────────────────────────── CATEGORY SCREEN ───────────────────────────
+def kb_category(cat: str, data: Dict[str, Any]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    pair: List[InlineKeyboardButton] = []
+    for item in data["items"]:
+        emoji = "🟢" if item["online"] else "🔴"
+        label = f"{emoji} {cat.upper()} DB {item['index']:02d}"
+        pair.append(InlineKeyboardButton(label, callback_data=f"db_db:{cat}:{item['index']}"))
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton(f"📊 ALL {cat.upper()} DATABASES",
+                                      callback_data=f"db_catall:{cat}")])
+    if cat != "overall":
+        rows.append([
+            InlineKeyboardButton("❤️ HEALTH", callback_data=f"db_health:{cat}"),
+            InlineKeyboardButton("⚡ PERFORMANCE", callback_data=f"db_perf:{cat}"),
+        ])
+    rows.append([
+        InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_cat:{cat}"),
+        InlineKeyboardButton("◀️ BACK", callback_data="db_main"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def view_category(cat: str) -> Tuple[str, InlineKeyboardMarkup]:
+    if cat == "overall":
+        return await view_main()
+    data = await stats.category(cat)
+    title = {
+        "system": "🖥️ SYSTEM DATABASE CONTROL",
+        "user": "👥 USER DATABASE CONTROL",
+        "media": "🎬 MEDIA DATABASE CONTROL",
+    }.get(cat, "DATABASE CONTROL")
+    lines = [
+        f"🏨 <b>DOWNTOWN VILLA</b>",
+        f"<b>{title}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>{data['count']} CONFIGURED</b>",
+        f"🔄 UPDATED: <code>{data['updated']}</code>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not data["items"]:
+        lines.append("⚪ NO DATABASES IN THIS CATEGORY.")
+    for item in data["items"]:
+        lines.append(_db_block(cat, item))
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(_totals_block(data["totals"]))
+    return "\n".join(lines), kb_category(cat, data)
 
-    t = data["totals"]
-    lines.extend([
-        "📊 <b>ALL DATABASES TOTAL</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📦 Files: <code>{format_int(t['objects'])}</code>",
-        f"💾 Storage: <code>{format_bytes(t['storage_size'])}</code>",
-        f"📄 Data: <code>{format_bytes(t['data_size'])}</code>",
-        f"🧩 Indexes: <code>{format_bytes(t['index_size'])}</code>",
-        f"🗂️ Collections: <code>{format_int(t['collections'])}</code>",
-        "",
-        "🟢 SYSTEM HEALTHY" if all(d["online"] for d in data["databases"]) and data["databases"]
-        else "🔴 SOME DATABASES OFFLINE",
+
+# ─────────────────────────── INDIVIDUAL DB SCREEN ───────────────────────────
+def kb_db(cat: str, index: int, db: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧱 COLLECTIONS", callback_data=f"db_colls:{cat}:{index}:1"),
+            InlineKeyboardButton("📊 STATISTICS", callback_data=f"db_stats:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton("🔍 SEARCH", callback_data=f"db_search:{cat}:{index}"),
+            InlineKeyboardButton("🧹 DUPLICATES", callback_data=f"db_dups:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton("🧩 INDEXES", callback_data=f"db_colls:{cat}:{index}:1"),
+            InlineKeyboardButton("🗑️ CLEAR DATA", callback_data=f"db_clear:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton("❤️ HEALTH", callback_data=f"db_health:{cat}"),
+            InlineKeyboardButton("⚡ PERFORMANCE", callback_data=f"db_perf:{cat}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_db:{cat}:{index}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}"),
+        ],
     ])
-    return "\n".join(lines), main_keyboard(data)
 
 
-def render_db_block(db: Dict[str, Any]) -> str:
-    status = "🟢" if db["online"] else "🔴"
-    ping = f"{db['ping_ms']}ms" if db["ping_ms"] is not None else "—"
-    return (
-        f"{status} <b>DATABASE {db['index']:02d} — {db['label']}</b>\n"
-        f"🏷️ Name: <code>{escape(db['name'])}</code>\n"
-        f"⏱️ Ping: <code>{ping}</code>\n"
-        f"📦 Documents: <code>{format_int(db['objects'])}</code>\n"
-        f"💾 Storage: <code>{format_bytes(db['storage_size'])}</code>\n"
-        f"📄 Data: <code>{format_bytes(db['data_size'])}</code>\n"
-        f"🧩 Indexes: <code>{format_bytes(db['index_size'])}</code>\n"
-        f"🗂️ Collections: <code>{format_int(db['collections'])}</code>"
-    )
-
-
-def render_db_detail(db: Dict[str, Any], db_extra: Optional[Dict[str, Any]] = None) -> Tuple[str, InlineKeyboardMarkup]:
-    status = "🟢 ONLINE" if db["online"] else "🔴 OFFLINE"
-    ping = f"{db['ping_ms']}ms" if db["ping_ms"] is not None else "—"
-    version = db["version"] or "—"
+async def view_db(cat: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
+    info = await stats.db_info(cat, index)
+    if not info:
+        return "❌ DATABASE NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")
+        ]])
+    status = "🟢 ONLINE" if info["online"] else "🔴 OFFLINE"
+    ping = f"{info['ping_ms']}ms" if info["ping_ms"] is not None else "—"
+    ver = info["version"] or "—"
     lines = [
-        f"🗄️ <b>DATABASE {db['index']:02d} — {db['label']}</b>",
+        f"🏨 <b>DOWNTOWN VILLA</b>",
+        f"🗄️ <b>{cat.upper()} DATABASE {info['index']:02d}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🏷️ Name: <code>{escape(db['name'])}</code>",
-        f"📡 Status: {status}",
-        f"⏱️ Ping: <code>{ping}</code>",
-        f"🍃 MongoDB: <code>{escape(version)}</code>",
+        f"🏷️ CLUSTER: <code>{esc(info['label'])}</code>",
+        f"📡 STATUS: {status}",
+        f"⏱️ PING: <code>{ping}</code>",
+        f"🍃 MONGODB: <code>{esc(ver)}</code>",
         "",
-        f"📦 Documents: <code>{format_int(db['objects'])}</code>",
-        f"🗂️ Collections: <code>{format_int(db['collections'])}</code>",
-        f"📄 Data: <code>{format_bytes(db['data_size'])}</code>",
-        f"💾 Storage: <code>{format_bytes(db['storage_size'])}</code>",
-        f"🧩 Indexes: <code>{format_bytes(db['index_size'])}</code>",
-        f"📐 Avg Object: <code>{format_bytes(int(db['avg_obj_size'] or 0))}</code>",
-        "",
+        f"📦 DOCUMENTS: <code>{fmt_int(info['objects'])}</code>",
+        f"🗂️ COLLECTIONS: <code>{fmt_int(info['collections'])}</code>",
+        f"📄 DATA: <code>{fmt_bytes(info['data_size'])}</code>",
+        f"💾 STORAGE: <code>{fmt_bytes(info['storage_size'])}</code>",
+        f"🧩 INDEXES: <code>{fmt_bytes(info['index_size'])}</code>",
+        f"📐 AVG OBJECT: <code>{fmt_bytes(int(info['avg_obj'] or 0))}</code>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "COLLECTIONS",
+        "📚 <b>COLLECTIONS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    names = db["collection_names"]
+    names = info["collection_names"]
     if not names:
-        lines.append("⚪ No collections.")
+        lines.append("⚪ NO COLLECTIONS.")
     else:
-        for n in names[:30]:
-            lines.append(f"• <code>{escape(n)}</code>")
-        if len(names) > 30:
-            lines.append(f"… and {len(names) - 30} more")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🧱 Collections", callback_data=f"db_colls:{db['index']}:1"),
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"db_detail:{db['index']}"),
-        ],
-        [
-            InlineKeyboardButton("◀️ Back", callback_data="db_main"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
-    return "\n".join(lines), kb
+        for i, n in enumerate(names[:25], 1):
+            lines.append(f"{i}. <code>{esc(n)}</code>")
+        if len(names) > 25:
+            lines.append(f"… +{len(names) - 25} MORE")
+    return "\n".join(lines), kb_db(cat, index, info)
 
 
-def render_collections(idx: int, db: Dict[str, Any], page: int) -> Tuple[str, InlineKeyboardMarkup]:
-    names = db["collection_names"]
-    total = len(names)
-    total_pages = max(1, (total + COLLECTIONS_PAGE_SIZE - 1) // COLLECTIONS_PAGE_SIZE)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * COLLECTIONS_PAGE_SIZE
-    end = start + COLLECTIONS_PAGE_SIZE
-    slice_ = names[start:end]
-    lines = [
-        f"🧱 <b>COLLECTIONS — DB {idx:02d} ({escape(db['label'])})</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Total: <code>{total}</code>  Page: <code>{page}/{total_pages}</code>",
-        "",
-    ]
-    if not slice_:
-        lines.append("⚪ No collections.")
-    for i, n in enumerate(slice_, start=start + 1):
-        lines.append(f"{i}. <code>{escape(n)}</code>")
-    rows = []
-    for n in slice_:
-        rows.append([InlineKeyboardButton(f"📄 {n[:40]}", callback_data=f"db_coll:{idx}:{n}")])
+# ─────────────────────────── COLLECTIONS EXPLORER ───────────────────────────
+def kb_colls(cat: str, index: int, page: int, total_pages: int, names: List[str]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for n in names[:COLL_PAGE_SIZE]:
+        rows.append([InlineKeyboardButton(f"📁 {n[:45]}",
+                                           callback_data=f"db_coll:{cat}:{index}:{n}")])
     nav = []
     if page > 1:
-        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"db_colls:{idx}:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton("◀️ PREVIOUS",
+                                         callback_data=f"db_colls:{cat}:{index}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="db_noop"))
     if page < total_pages:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"db_colls:{idx}:{page + 1}"))
+        nav.append(InlineKeyboardButton("NEXT ▶️",
+                                         callback_data=f"db_colls:{cat}:{index}:{page+1}"))
     if nav:
         rows.append(nav)
     rows.append([
-        InlineKeyboardButton("◀️ Back", callback_data=f"db_detail:{idx}"),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
+        InlineKeyboardButton("◀️ BACK", callback_data=f"db_db:{cat}:{index}"),
+        InlineKeyboardButton("🏠 HOME", callback_data="db_main"),
     ])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(rows)
 
 
-async def render_collection_detail(idx: int, coll_name: str) -> Tuple[str, InlineKeyboardMarkup]:
-    entry = stats_manager.get_db_by_index(idx)
-    if not entry:
-        return "❌ Database not found.", back_keyboard()
-    db = entry["db"]
-    stats = await MongoDiagnostics.coll_stats(db, coll_name)
+async def view_colls(cat: str, index: int, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    info = await stats.db_info(cat, index)
+    if not info:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")]])
+    names = info["collection_names"]
+    total = len(names)
+    tp = max(1, (total + COLL_PAGE_SIZE - 1) // COLL_PAGE_SIZE)
+    page = max(1, min(page, tp))
+    start = (page - 1) * COLL_PAGE_SIZE
+    slice_ = names[start:start + COLL_PAGE_SIZE]
     lines = [
-        "🧱 <b>COLLECTION</b>",
+        f"🏨 <b>DOWNTOWN VILLA</b>",
+        f"🧱 <b>COLLECTIONS — {cat.upper()} DB {index:02d}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📚 Name: <code>{escape(coll_name)}</code>",
+        f"TOTAL: <code>{total}</code>  PAGE: <code>{page}/{tp}</code>",
+        "",
     ]
-    if stats:
-        lines.extend([
-            f"📦 Documents: <code>{format_int(stats.get('count', 0))}</code>",
-            f"📄 Data: <code>{format_bytes(stats.get('size', 0))}</code>",
-            f"💾 Storage: <code>{format_bytes(stats.get('storageSize', 0))}</code>",
-            f"🧩 Indexes: <code>{format_bytes(stats.get('totalIndexSize', 0))}</code>",
-            f"📐 Avg Object: <code>{format_bytes(int(stats.get('avgObjSize', 0) or 0))}</code>",
-            f"🗂️ Indexes: <code>{len(stats.get('indexSizes', {}) or {})}</code>",
-        ])
-    else:
-        lines.append("⚪ Statistics unavailable.")
-    kb = InlineKeyboardMarkup([
+    for i, n in enumerate(slice_, start=start + 1):
+        lines.append(f"{i}. <code>{esc(n)}</code>")
+    return "\n".join(lines), kb_colls(cat, index, page, tp, slice_)
+
+
+# ─────────────────────────── COLLECTION DETAIL ───────────────────────────
+def kb_coll(cat: str, index: int, name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📄 Recent Docs", callback_data=f"db_recent:{idx}:{coll_name}"),
-            InlineKeyboardButton("🔑 Indexes", callback_data=f"db_idx:{idx}:{coll_name}"),
+            InlineKeyboardButton("📄 RECENT DOCS",
+                                  callback_data=f"db_recent:{cat}:{index}:{name}:5"),
+            InlineKeyboardButton("🔑 INDEXES", callback_data=f"db_idx:{cat}:{index}:{name}"),
         ],
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"db_coll:{idx}:{coll_name}"),
-            InlineKeyboardButton("◀️ Back", callback_data=f"db_colls:{idx}:1"),
+            InlineKeyboardButton("🧹 FIND DUPLICATES",
+                                  callback_data=f"db_dup_coll:{cat}:{index}:{name}"),
+            InlineKeyboardButton("🗑️ CLEAR COLLECTION",
+                                  callback_data=f"db_clear_coll:{cat}:{index}:{name}"),
         ],
         [
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
+            InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_coll:{cat}:{index}:{name}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_colls:{cat}:{index}:1"),
         ],
     ])
-    return "\n".join(lines), kb
 
 
-async def render_recent(idx: int, coll_name: str, limit: int = 5) -> Tuple[str, InlineKeyboardMarkup]:
-    entry = stats_manager.get_db_by_index(idx)
+async def view_coll(cat: str, index: int, name: str) -> Tuple[str, InlineKeyboardMarkup]:
+    info = await stats.db_info(cat, index)
+    if not info:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")]])
+    entry = None
+    for e in (db_registry.system_entries() if cat == "system"
+              else db_registry.user_entries() if cat == "user"
+              else db_registry.media_entries()):
+        if e.index == index:
+            entry = e; break
     if not entry:
-        return "❌ Database not found.", back_keyboard()
-    db = entry["db"]
-    docs = await MongoDiagnostics.sample_documents(db, coll_name, limit=limit)
+        return "❌ DB ENTRY MISSING.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")]])
+    st = await Diagnostics.coll_stats(entry.db, name)
     lines = [
-        f"📄 <b>RECENT DOCUMENTS — {escape(coll_name)}</b>",
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        f"🧱 <b>COLLECTION</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Limit: <code>{limit}</code>  Returned: <code>{len(docs)}</code>",
+        f"📚 NAME: <code>{esc(name)}</code>",
+        f"🗄️ DATABASE: {cat.upper()} {index:02d} ({esc(entry.label)})",
+    ]
+    if st:
+        lines += [
+            f"📦 DOCUMENTS: <code>{fmt_int(st.get('count', 0))}</code>",
+            f"📄 DATA: <code>{fmt_bytes(st.get('size', 0))}</code>",
+            f"💾 STORAGE: <code>{fmt_bytes(st.get('storageSize', 0))}</code>",
+            f"🧩 INDEX SIZE: <code>{fmt_bytes(st.get('totalIndexSize', 0))}</code>",
+            f"📐 AVG OBJECT: <code>{fmt_bytes(int(st.get('avgObjSize', 0) or 0))}</code>",
+            f"🔑 INDEXES: <code>{len(st.get('indexSizes', {}) or {})}</code>",
+        ]
+    else:
+        lines.append("⚪ STATISTICS UNAVAILABLE.")
+    return "\n".join(lines), kb_coll(cat, index, name)
+
+
+# ─────────────────────────── RECENT DOCS ───────────────────────────
+async def view_recent(cat: str, index: int, name: str, limit: int) -> Tuple[str, InlineKeyboardMarkup]:
+    entry = None
+    for e in (db_registry.system_entries() if cat == "system"
+              else db_registry.user_entries() if cat == "user"
+              else db_registry.media_entries()):
+        if e.index == index:
+            entry = e; break
+    if not entry:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")]])
+    docs = await Diagnostics.sample(entry.db, name, limit)
+    lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        f"📄 <b>RECENT DOCUMENTS — {esc(name)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"LIMIT: <code>{limit}</code>  RETURNED: <code>{len(docs)}</code>",
         "",
     ]
     if not docs:
-        lines.append("⚪ No documents.")
-    for i, doc in enumerate(docs, 1):
-        lines.append(f"<b>Document {i}</b>")
-        lines.append(summarize_doc(doc))
+        lines.append("⚪ NO DOCUMENTS.")
+    for i, d in enumerate(docs, 1):
+        lines.append(f"<b>DOCUMENT {i}</b>")
+        lines.append(summarize_doc(d))
         lines.append("")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Limit {n}", callback_data=f"db_recent:{idx}:{coll_name}:{n}")
-         for n in RECENT_DOC_LIMITS],
+        [InlineKeyboardButton(f"LIMIT {n}",
+                               callback_data=f"db_recent:{cat}:{index}:{name}:{n}")
+         for n in RECENT_LIMITS],
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"db_recent:{idx}:{coll_name}:{limit}"),
-            InlineKeyboardButton("◀️ Back", callback_data=f"db_coll:{idx}:{coll_name}"),
+            InlineKeyboardButton("🔄 REFRESH",
+                                  callback_data=f"db_recent:{cat}:{index}:{name}:{limit}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_coll:{cat}:{index}:{name}"),
         ],
     ])
     return "\n".join(lines), kb
 
 
-async def render_indexes(idx: int, coll_name: str) -> Tuple[str, InlineKeyboardMarkup]:
-    entry = stats_manager.get_db_by_index(idx)
+# ─────────────────────────── INDEXES ───────────────────────────
+async def view_indexes(cat: str, index: int, name: str) -> Tuple[str, InlineKeyboardMarkup]:
+    entry = None
+    for e in (db_registry.system_entries() if cat == "system"
+              else db_registry.user_entries() if cat == "user"
+              else db_registry.media_entries()):
+        if e.index == index:
+            entry = e; break
     if not entry:
-        return "❌ Database not found.", back_keyboard()
-    db = entry["db"]
-    indexes = await MongoDiagnostics.list_indexes(db, coll_name)
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}")]])
+    idxs = await Diagnostics.list_indexes(entry.db, name)
     lines = [
-        f"🔑 <b>INDEXES — {escape(coll_name)}</b>",
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        f"🔑 <b>INDEXES — {esc(name)}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    if not indexes:
-        lines.append("⚪ No indexes found.")
-    for i, idx_doc in enumerate(indexes, 1):
-        safe = redact(idx_doc)
-        lines.append(f"<b>{i}. {escape(safe.get('name', '?'))}</b>")
-        lines.append(f"  Keys: <code>{escape(safe.get('key', {}))}</code>")
+    if not idxs:
+        lines.append("⚪ NO INDEXES.")
+    for i, ix in enumerate(idxs, 1):
+        safe = redact(ix)
+        lines.append(f"<b>{i}. {esc(safe.get('name', '?'))}</b>")
+        lines.append(f"  KEYS: <code>{esc(safe.get('key', {}))}</code>")
         if safe.get("unique"):
-            lines.append("  Unique: ✅")
+            lines.append("  UNIQUE: ✅")
         if safe.get("sparse"):
-            lines.append("  Sparse: ✅")
+            lines.append("  SPARSE: ✅")
         if "expireAfterSeconds" in safe:
             lines.append(f"  TTL: <code>{safe['expireAfterSeconds']}s</code>")
         lines.append("")
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"db_idx:{idx}:{coll_name}"),
-            InlineKeyboardButton("◀️ Back", callback_data=f"db_coll:{idx}:{coll_name}"),
+            InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_idx:{cat}:{index}:{name}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_coll:{cat}:{index}:{name}"),
         ],
     ])
     return "\n".join(lines), kb
 
 
-async def render_health(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+# ─────────────────────────── HEALTH ───────────────────────────
+async def view_health(cat: str) -> Tuple[str, InlineKeyboardMarkup]:
+    if cat == "overall":
+        data = await stats.overall()
+        categories = [("system", data["system"]), ("user", data["user"]), ("media", data["media"])]
+    else:
+        c = await stats.category(cat)
+        categories = [(cat, c)]
     lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
         "❤️ <b>DATABASE HEALTH</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    healthy = 0
-    total = len(data["databases"])
-    for db in data["databases"]:
-        if db["online"]:
-            healthy += 1
-            lines.append(f"🟢 <b>{db['label']}</b> ({db['index']:02d}) — <code>{db['ping_ms']}ms</code>")
-        else:
-            lines.append(f"🔴 <b>{db['label']}</b> ({db['index']:02d}) — OFFLINE")
+    all_ok = True
+    for name, cat_data in categories:
+        up = sum(1 for i in cat_data["items"] if i["online"])
+        total = len(cat_data["items"])
+        if up != total or total == 0:
+            all_ok = False
+        lines.append(f"<b>{name.upper()}</b>: {_status(name, cat_data['items'])}")
+        for i in cat_data["items"]:
+            if i["online"]:
+                lines.append(f"  🟢 {i['label']} — <code>{i['ping_ms']}ms</code>")
+            else:
+                lines.append(f"  🔴 {i['label']} — OFFLINE")
     lines.append("")
-    if total == 0:
-        lines.append("⚪ No databases configured.")
-    elif healthy == total:
-        lines.append("🟢 <b>ALL DATABASES HEALTHY</b>")
-    elif healthy == 0:
-        lines.append("🔴 <b>ALL DATABASES DOWN</b>")
+    lines.append("🟢 <b>ALL HEALTHY</b>" if all_ok else "🟡 <b>WARNINGS PRESENT</b>")
+    back = "db_main" if cat == "overall" else f"db_cat:{cat}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_health:{cat}"),
+        InlineKeyboardButton("◀️ BACK", callback_data=back),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ─────────────────────────── PERFORMANCE ───────────────────────────
+async def view_perf(cat: str) -> Tuple[str, InlineKeyboardMarkup]:
+    if cat == "overall":
+        data = await stats.overall()
+        cats = [("system", data["system"]), ("user", data["user"]), ("media", data["media"])]
     else:
-        lines.append(f"🟡 <b>PARTIAL — {healthy}/{total} HEALTHY</b>")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_health"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
-    return "\n".join(lines), kb
-
-
-async def render_performance(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+        c = await stats.category(cat)
+        cats = [(cat, c)]
     lines = [
-        "📈 <b>DATABASE PERFORMANCE</b>",
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "⚡ <b>DATABASE PERFORMANCE</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    for db in data["databases"]:
-        key = db["label"]
-        st = latency_history.stats(key)
-        cur = st["current"] if st["current"] is not None else "—"
-        avg = st["avg"] if st["avg"] is not None else "—"
-        mn = st["min"] if st["min"] is not None else "—"
-        mx = st["max"] if st["max"] is not None else "—"
-        lines.append(f"<b>{key}</b>")
-        lines.append(f"  Current: <code>{cur}ms</code>  Avg: <code>{avg}ms</code>")
-        lines.append(f"  Min: <code>{mn}ms</code>  Max: <code>{mx}ms</code>")
-        if st["recent"]:
-            lines.append(f"  Recent: <code>{' '.join(str(x) for x in st['recent'])}</code>")
-        lines.append("")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_perf"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
+    for name, cd in cats:
+        for i in cd["items"]:
+            key = f"{name}:{i['label']}"
+            st = latency.stats(key)
+            cur = st["cur"] if st["cur"] is not None else "—"
+            avg = st["avg"] if st["avg"] is not None else "—"
+            mn = st["min"] if st["min"] is not None else "—"
+            mx = st["max"] if st["max"] is not None else "—"
+            lines.append(f"<b>{name.upper()} {i['label']}</b>")
+            lines.append(f"  CUR: <code>{cur}ms</code>  AVG: <code>{avg}ms</code>")
+            lines.append(f"  MIN: <code>{mn}ms</code>  MAX: <code>{mx}ms</code>")
+            lines.append("")
+    back = "db_main" if cat == "overall" else f"db_cat:{cat}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_perf:{cat}"),
+        InlineKeyboardButton("◀️ BACK", callback_data=back),
+    ]])
     return "\n".join(lines), kb
 
 
-async def render_distribution(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = [
-        "📊 <b>DATABASE DISTRIBUTION</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    media = [d for d in data["databases"] if d["label"].startswith("MEDIA_")]
-    total_files = sum(d["objects"] for d in media) or 1
-    for d in media:
-        pct = (d["objects"] / total_files) * 100
-        bar = progress_bar(pct, 18)
-        lines.append(f"{d['label']} {bar} {d['objects']:,} files ({pct:.1f}%)")
-    if not media:
-        lines.append("⚪ No media shards configured.")
-    kb = InlineKeyboardMarkup([
+# ─────────────────────────── DUPLICATES ───────────────────────────
+def kb_dups(cat: str, index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 START SCAN", callback_data=f"db_dup_scan:{cat}:{index}")],
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_dist"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
+            InlineKeyboardButton("📊 VIEW LAST SCAN", callback_data=f"db_dup_last:{cat}:{index}"),
+            InlineKeyboardButton("🗑️ REMOVE DUPLICATES", callback_data=f"db_dup_remove:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_dups:{cat}:{index}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_db:{cat}:{index}"),
         ],
     ])
-    return "\n".join(lines), kb
 
 
-async def render_media(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    md = await stats_manager.get_media_only()
+async def view_dups(cat: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
+    info = await stats.db_info(cat, index)
+    if not info:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data="db_main")]])
     lines = [
-        "📁 <b>MEDIA DATABASE</b>",
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "🧹 <b>DUPLICATE CONTROL CENTER</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    if not md["shards"]:
-        lines.append("⚪ No media shards configured.")
-    for shard in md["shards"]:
-        status = "🟢" if shard["online"] else "🔴"
-        lines.append(f"{status} <b>{shard['label']}</b>")
-        lines.append(f"  📦 Files: <code>{format_int(shard['objects'])}</code>")
-        lines.append(f"  💾 Storage: <code>{format_bytes(shard['storage_size'])}</code>")
-        lines.append("")
-    lines.extend([
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📊 <b>TOTAL MEDIA</b>",
-        f"📦 Files: <code>{format_int(md['total_files'])}</code>",
-        f"💾 Storage: <code>{format_bytes(md['total_storage'])}</code>",
-    ])
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_media"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
-    return "\n".join(lines), kb
-
-
-async def render_user_db() -> Tuple[str, InlineKeyboardMarkup]:
-    ud = await stats_manager.get_user_db_stats()
-    if not ud.get("available"):
-        return "⚪ User database not available.", back_keyboard()
-    lines = [
-        "👥 <b>USER DATABASE</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🏷️ Name: <code>{escape(ud['name'])}</code>",
-        f"📦 Documents: <code>{format_int(ud['objects'])}</code>",
-        f"💾 Storage: <code>{format_bytes(ud['storage_size'])}</code>",
-        f"📄 Data: <code>{format_bytes(ud['data_size'])}</code>",
-        f"🧩 Indexes: <code>{format_bytes(ud['index_size'])}</code>",
+        f"🗄️ TARGET: {cat.upper()} DB {index:02d} ({esc(info['label'])})",
+        f"📦 TOTAL RECORDS: <code>{fmt_int(info['objects'])}</code>",
+        "🔍 SCAN STATUS: <b>READY</b>",
         "",
+        "PRESS <b>START SCAN</b> TO SCAN FOR DUPLICATES ON KEY <code>file_id</code>.",
+        "",
+        "⚠️ SCAN IS READ-ONLY. REMOVAL REQUIRES 3-STAGE CONFIRMATION.",
+    ]
+    return "\n".join(lines), kb_dups(cat, index)
+
+
+async def view_dup_scan(cat: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
+    result = await duplicate_scan(cat, index, "file_id")
+    info = await stats.db_info(cat, index)
+    lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "🧹 <b>DUPLICATE SCAN RESULT</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "COLLECTION COUNTS",
+        f"🗄️ TARGET: {cat.upper()} DB {index:02d}",
+    ]
+    if not result.get("ok"):
+        lines.append(f"🔴 SCAN FAILED: {esc(result.get('reason'))}")
+        return "\n".join(lines), kb_dups(cat, index)
+    lines.append(f"📦 DOCUMENTS SCANNED: <code>{fmt_int(info['objects'])}</code>")
+    lines.append(f"🧹 DUPLICATE GROUPS: <code>{fmt_int(result['total'])}</code>")
+    lines.append("")
+    if result["per_collection"]:
+        lines.append("<b>PER COLLECTION:</b>")
+        for pc in result["per_collection"][:20]:
+            lines.append(f"• <code>{esc(pc['name'])}</code>: {fmt_int(pc['dupes'])}")
+    else:
+        lines.append("🟢 NO DUPLICATES FOUND.")
+    return "\n".join(lines), kb_dups(cat, index)
+
+
+# ─────────────────────────── ACTIVITY ───────────────────────────
+async def view_audit() -> Tuple[str, InlineKeyboardMarkup]:
+    entries = audit.recent(30)
+    lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "📋 <b>ACTIVITY LOG</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    for name in ud["collections"]:
-        lines.append(f"• <code>{escape(name)}</code>: {format_int(ud['counts'].get(name, 0))}")
-    if not ud["collections"]:
-        lines.append("⚪ No collections.")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_user"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
+    if not entries:
+        lines.append("⚪ NO ACTIVITY.")
+    for e in entries:
+        lines.append(f"⏱️ <code>{e['ts']}</code>")
+        lines.append(f"👤 <code>{e['admin']}</code> → <b>{esc(e['action'])}</b>")
+        lines.append(f"🎯 TARGET: <code>{esc(e['target'])}</code>")
+        lines.append(f"✅ RESULT: <code>{esc(e['result'])}</code>")
+        lines.append("")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 REFRESH", callback_data="db_audit"),
+        InlineKeyboardButton("◀️ BACK", callback_data="db_main"),
+    ]])
     return "\n".join(lines), kb
 
 
-async def render_errors() -> Tuple[str, InlineKeyboardMarkup]:
-    errs = error_monitor.recent(20)
+async def view_errors() -> Tuple[str, InlineKeyboardMarkup]:
+    errs = errors.recent(20)
     lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
         "🚨 <b>DATABASE ERRORS</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     if not errs:
-        lines.append("🟢 No recent errors.")
+        lines.append("🟢 NO RECENT ERRORS.")
     for e in errs:
         lines.append(f"⏱️ <code>{e['ts']}</code>")
-        lines.append(f"📍 <b>{escape(e['source'])}</b>")
-        lines.append(f"<code>{escape(e['error'])}</code>")
+        lines.append(f"📍 <b>{esc(e['src'])}</b>")
+        lines.append(f"<code>{esc(e['err'])}</code>")
         lines.append("")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_errors"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 REFRESH", callback_data="db_errors"),
+        InlineKeyboardButton("◀️ BACK", callback_data="db_main"),
+    ]])
     return "\n".join(lines), kb
 
 
-async def render_audit() -> Tuple[str, InlineKeyboardMarkup]:
-    entries = audit.recent(20)
+# ─────────────────────────── CATEGORY TOTAL VIEW ───────────────────────────
+async def view_cat_all(cat: str) -> Tuple[str, InlineKeyboardMarkup]:
+    data = await stats.category(cat)
     lines = [
-        "🛡 <b>AUDIT LOG</b>",
+        f"🏨 <b>DOWNTOWN VILLA</b>",
+        f"📊 <b>ALL {cat.upper()} DATABASES</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    if not entries:
-        lines.append("⚪ No audit entries.")
-    for e in entries:
-        lines.append(f"⏱️ <code>{e['ts']}</code>")
-        lines.append(
-            f"👤 <code>{e['admin']}</code> • <b>{escape(e['action'])}</b>"
-        )
-        lines.append(
-            f"🗄️ <code>{escape(e['database'])}</code> / <code>{escape(e['collection'])}</code>"
-        )
-        lines.append(f"✅ Result: <code>{escape(e['result'])}</code>")
-        if e["extra"]:
-            lines.append(f"ℹ️ {escape(e['extra'])}")
-        lines.append("")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_audit"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
-    return "\n".join(lines), kb
-
-
-async def render_config(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = [
-        "🧪 <b>DATABASE CONFIGURATION</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    for d in data["databases"]:
-        lines.append(f"{'🟢' if d['online'] else '🔴'} {d['label']}: "
-                     f"{'CONFIGURED' if d['online'] else 'OFFLINE'}")
-    lines.append("")
-    lines.append(f"🔄 Live refresh: <code>{LIVE_REFRESH_DEFAULT}s</code> default")
-    lines.append(f"💾 Cache TTL: <code>{CACHE_TTL}s</code>")
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="db_config"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
-    return "\n".join(lines), kb
-
-
-async def render_duplicates() -> Tuple[str, InlineKeyboardMarkup]:
-    data = await stats_manager.get_full_stats()
-    media = [d for d in data["databases"] if d["label"].startswith("MEDIA_")]
-    lines = [
-        "♻️ <b>DUPLICATE SCAN</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "Scanning <code>file_id</code> duplicates per shard…",
+        _totals_block(data["totals"]),
         "",
     ]
-    total_dupes = 0
-    for d in media:
-        entry = stats_manager.get_db_by_index(d["index"])
-        coll_name = None
-        for name in d["collection_names"]:
-            if "file" in name.lower() or "media" in name.lower():
-                coll_name = name
-                break
-        if not coll_name and d["collection_names"]:
-            coll_name = d["collection_names"][0]
-        if not coll_name:
-            lines.append(f"⚪ {d['label']}: no collection")
-            continue
-        result = await duplicate_manager.scan(entry["db"], coll_name, "file_id")
-        if result.get("ok"):
-            dupes = result.get("duplicate_groups", 0)
-            total_dupes += dupes
-            lines.append(f"🔍 {d['label']} / <code>{escape(coll_name)}</code>")
-            lines.append(f"   Duplicate groups: <code>{format_int(dupes)}</code>")
-        else:
-            lines.append(f"🔴 {d['label']}: {escape(result.get('reason'))}")
-    lines.append("")
-    lines.append(f"📊 <b>Total duplicate groups: {format_int(total_dupes)}</b>")
-    lines.append("")
-    lines.append("⚠️ Read-only. Removal requires multi-step confirmation.")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚠️ Duplicate Removal", callback_data="db_duprem")],
-        [
-            InlineKeyboardButton("🔄 Rescan", callback_data="db_dups"),
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
-    ])
+    for item in data["items"]:
+        lines.append(_db_block(cat, item))
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 REFRESH", callback_data=f"db_catall:{cat}"),
+        InlineKeyboardButton("◀️ BACK", callback_data=f"db_cat:{cat}"),
+    ]])
     return "\n".join(lines), kb
 
 
-# ============================ KEYBOARDS ============================
-def main_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    dbs = data["databases"]
-    pair: List[InlineKeyboardButton] = []
-    for db in dbs:
-        emoji = "🟢" if db["online"] else "🔴"
-        label = f"{emoji} DB{db['index']:02d} {db['label']}"
-        pair.append(InlineKeyboardButton(label, callback_data=f"db_detail:{db['index']}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-
-    rows.append([
-        InlineKeyboardButton("📊 DISTRIBUTION", callback_data="db_dist"),
-        InlineKeyboardButton("❤️ HEALTH", callback_data="db_health"),
-    ])
-    rows.append([
-        InlineKeyboardButton("📈 PERF", callback_data="db_perf"),
-        InlineKeyboardButton("📁 MEDIA", callback_data="db_media"),
-    ])
-    rows.append([
-        InlineKeyboardButton("👥 USER DB", callback_data="db_user"),
-        InlineKeyboardButton("♻️ DUPLICATES", callback_data="db_dups"),
-    ])
-    rows.append([
-        InlineKeyboardButton("🚨 ERRORS", callback_data="db_errors"),
-        InlineKeyboardButton("🛡 AUDIT", callback_data="db_audit"),
-    ])
-    rows.append([
-        InlineKeyboardButton("🧪 CONFIG", callback_data="db_config"),
-        InlineKeyboardButton("🧹 MAINTENANCE", callback_data="db_maint"),
-    ])
-    rows.append([
-        InlineKeyboardButton("🔄 REFRESH", callback_data="db_refresh"),
-        InlineKeyboardButton("🟢 LIVE", callback_data="db_live"),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def back_keyboard(target: str = "db_main") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️ Back", callback_data=target),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-    ]])
-
-
-def confirm_keyboard(token: str, step: int) -> InlineKeyboardMarkup:
+# ─────────────────────────── CLEAR DATA (DANGER ZONE) ───────────────────────────
+def kb_clear(cat: str, index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ CLEAR THIS DATABASE",
+                               callback_data=f"db_clear_db:{cat}:{index}")],
         [
-            InlineKeyboardButton("⚠️ CONTINUE", callback_data=f"db_confirm:{token}"),
-            InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{token}"),
+            InlineKeyboardButton("◀️ BACK", callback_data=f"db_db:{cat}:{index}"),
+            InlineKeyboardButton("❌ CANCEL", callback_data="db_main"),
         ],
     ])
 
 
-def final_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("☢️ YES, PERMANENTLY DELETE", callback_data=f"db_confirm:{token}")],
-        [InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{token}")],
-    ])
+async def view_clear(cat: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
+    info = await stats.db_info(cat, index)
+    if not info:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data="db_main")]])
+    lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "☢️ <b>DANGER ZONE — CLEAR DATA</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🎯 TARGET: {cat.upper()} DB {index:02d}",
+        f"📚 CLUSTER: <code>{esc(info['label'])}</code>",
+        f"📦 DOCUMENTS: <code>{fmt_int(info['objects'])}</code>",
+        f"💾 STORAGE: <code>{fmt_bytes(info['storage_size'])}</code>",
+        "",
+        "⚠️ <b>THIS WILL REMOVE ALL DOCUMENTS IN ALL COLLECTIONS.</b>",
+        "⚠️ <b>THIS CANNOT BE UNDONE.</b>",
+        "",
+        "MULTI-STAGE CONFIRMATION REQUIRED.",
+    ]
+    return "\n".join(lines), kb_clear(cat, index)
 
 
-# ============================ VIEW ROUTER ============================
-def render_view(view: str, data: Dict[str, Any], extra: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+async def do_clear_db(cat: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
+    entry = None
+    for e in (db_registry.system_entries() if cat == "system"
+              else db_registry.user_entries() if cat == "user"
+              else db_registry.media_entries()):
+        if e.index == index:
+            entry = e; break
+    if not entry:
+        return "❌ DB NOT FOUND.", InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data="db_main")]])
+    deleted = 0
+    for name in await Diagnostics.list_collections(entry.db):
+        try:
+            r = await entry.db[name].delete_many({})
+            deleted += r.deleted_count
+        except Exception as e:
+            errors.record(f"clear:{name}", str(e))
+    cache.invalidate()
+    audit.log(0, "clear_database", target=f"{cat}:{index}", result=f"deleted={deleted}")
+    lines = [
+        "🏨 <b>DOWNTOWN VILLA</b>",
+        "🟢 <b>OPERATION COMPLETE</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🎯 TARGET: {cat.upper()} DB {index:02d}",
+        f"🗑️ DOCUMENTS REMOVED: <code>{fmt_int(deleted)}</code>",
+        f"⏱️ TIME: <code>{now_ist()}</code>",
+        "📊 STATISTICS REFRESHED: 🟢 YES",
+    ]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 VIEW DATABASE",
+                               callback_data=f"db_db:{cat}:{index}"),
+        InlineKeyboardButton("◀️ BACK", callback_data="db_main"),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ─────────────────────────── VIEW ROUTER ───────────────────────────
+async def build_view(view: str, extra: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     try:
         if view == "main":
-            return render_main(data)
+            return await view_main()
+        if view == "category":
+            return await view_category(extra["cat"])
+        if view == "db":
+            return await view_db(extra["cat"], extra["index"])
+        if view == "colls":
+            return await view_colls(extra["cat"], extra["index"], extra.get("page", 1))
+        if view == "coll":
+            return await view_coll(extra["cat"], extra["index"], extra["name"])
+        if view == "recent":
+            return await view_recent(extra["cat"], extra["index"], extra["name"], extra.get("limit", 5))
+        if view == "indexes":
+            return await view_indexes(extra["cat"], extra["index"], extra["name"])
         if view == "health":
-            return render_health_sync(data)
+            return await view_health(extra["cat"])
         if view == "perf":
-            return render_perf_sync(data)
-        if view == "dist":
-            return render_dist_sync(data)
-        if view == "config":
-            return render_config_sync(data)
-        return render_main(data)
+            return await view_perf(extra["cat"])
+        if view == "audit":
+            return await view_audit()
+        if view == "errors":
+            return await view_errors()
+        if view == "catall":
+            return await view_cat_all(extra["cat"])
+        return await view_main()
     except Exception as e:
-        logger.warning(f"render_view fallback: {e}")
-        return render_main(data)
+        logger.exception(f"build_view({view}) failed")
+        return f"🔴 RENDER FAILED: <code>{esc(e)}</code>", InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 HOME", callback_data="db_main")]])
 
 
-def render_health_sync(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = ["❤️ <b>DATABASE HEALTH</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-    healthy = 0
-    total = len(data["databases"])
-    for db in data["databases"]:
-        if db["online"]:
-            healthy += 1
-            lines.append(f"🟢 <b>{db['label']}</b> ({db['index']:02d}) — <code>{db['ping_ms']}ms</code>")
-        else:
-            lines.append(f"🔴 <b>{db['label']}</b> ({db['index']:02d}) — OFFLINE")
-    lines.append("")
-    if total and healthy == total:
-        lines.append("🟢 <b>ALL DATABASES HEALTHY</b>")
-    elif total and healthy == 0:
-        lines.append("🔴 <b>ALL DATABASES DOWN</b>")
-    else:
-        lines.append(f"🟡 <b>{healthy}/{total} HEALTHY</b>")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data="db_health"),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-    ]])
-    return "\n".join(lines), kb
-
-
-def render_perf_sync(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = ["📈 <b>DATABASE PERFORMANCE</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-    for db in data["databases"]:
-        key = db["label"]
-        st = latency_history.stats(key)
-        cur = st["current"] if st["current"] is not None else "—"
-        avg = st["avg"] if st["avg"] is not None else "—"
-        mn = st["min"] if st["min"] is not None else "—"
-        mx = st["max"] if st["max"] is not None else "—"
-        lines.append(f"<b>{key}</b>")
-        lines.append(f"  Cur: <code>{cur}ms</code>  Avg: <code>{avg}ms</code>  Min: <code>{mn}ms</code>  Max: <code>{mx}ms</code>")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data="db_perf"),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-    ]])
-    return "\n".join(lines), kb
-
-
-def render_dist_sync(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = ["📊 <b>DATABASE DISTRIBUTION</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-    media = [d for d in data["databases"] if d["label"].startswith("MEDIA_")]
-    total_files = sum(d["objects"] for d in media) or 1
-    for d in media:
-        pct = (d["objects"] / total_files) * 100
-        bar = progress_bar(pct, 18)
-        lines.append(f"{d['label']} {bar} {d['objects']:,} ({pct:.1f}%)")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data="db_dist"),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-    ]])
-    return "\n".join(lines), kb
-
-
-def render_config_sync(data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = ["🧪 <b>DATABASE CONFIGURATION</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-    for d in data["databases"]:
-        lines.append(f"{'🟢' if d['online'] else '🔴'} {d['label']}")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh", callback_data="db_config"),
-        InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-    ]])
-    return "\n".join(lines), kb
-
-
-# ============================ HANDLERS ============================
+# ─────────────────────────── HANDLERS ───────────────────────────
 @Client.on_message(filters.command("database") & filters.private)
-async def cmd_database(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        await message.reply_text("⛔ Unauthorized.")
+async def cmd_database(client: Client, msg: Message):
+    if not is_admin(msg.from_user.id):
+        await msg.reply_text("⛔ UNAUTHORIZED.")
         return
-    msg = await message.reply_text("🔄 Loading database control center...")
+    m = await msg.reply_text("🔄 LOADING DATABASE CONTROL CENTER...")
+    text, kb = await build_view("main", {})
     try:
-        data = await stats_manager.get_full_stats(force=True)
+        await m.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                          disable_web_page_preview=True)
     except Exception as e:
-        logger.exception("cmd_database failed")
-        await msg.edit_text(f"🔴 Failed: <code>{escape(e)}</code>",
-                            parse_mode=ParseMode.HTML)
-        return
-    text, kb = render_main(data)
-    try:
-        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning(f"edit_text failed: {e}")
+        logger.warning(f"edit failed: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^db_main$"))
 async def cb_main(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    await live_refresh.stop(q.message.chat.id)
-    data = await stats_manager.get_full_stats(force=True)
-    text, kb = render_main(data)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    await live.stop(q.message.chat.id)
+    text, kb = await build_view("main", {})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1285,28 +1243,23 @@ async def cb_main(client: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^db_refresh$"))
 async def cb_refresh(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
     cache.invalidate()
-    data = await stats_manager.get_full_stats(force=True)
-    text, kb = render_main(data)
+    text, kb = await build_view("main", {})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
-    await q.answer("🔄 Refreshed")
+    await q.answer("🔄 REFRESHED")
 
 
-@Client.on_callback_query(filters.regex(r"^db_detail:(\d+)$"))
-async def cb_detail(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^db_cat:(system|user|media|overall)$"))
+async def cb_cat(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    idx = int(q.matches[0].group(1))
-    data = await stats_manager.get_full_stats()
-    db = next((d for d in data["databases"] if d["index"] == idx), None)
-    if not db:
-        await q.answer("Not found", show_alert=True); return
-    text, kb = render_db_detail(db)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1)
+    text, kb = await build_view("category", {"cat": cat})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1315,17 +1268,40 @@ async def cb_detail(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_colls:(\d+):(\d+)$"))
+@Client.on_callback_query(filters.regex(r"^db_catall:(system|user|media)$"))
+async def cb_catall(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1)
+    text, kb = await build_view("catall", {"cat": cat})
+    try:
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^db_db:(system|user|media):(\d+)$"))
+async def cb_db(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    text, kb = await build_view("db", {"cat": cat, "index": idx})
+    try:
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^db_colls:(system|user|media):(\d+):(\d+)$"))
 async def cb_colls(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    idx = int(q.matches[0].group(1))
-    page = int(q.matches[0].group(2))
-    data = await stats_manager.get_full_stats()
-    db = next((d for d in data["databases"] if d["index"] == idx), None)
-    if not db:
-        await q.answer("Not found", show_alert=True); return
-    text, kb = render_collections(idx, db, page)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2)); page = int(q.matches[0].group(3))
+    text, kb = await build_view("colls", {"cat": cat, "index": idx, "page": page})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1334,13 +1310,12 @@ async def cb_colls(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_coll:(\d+):(.+)$"))
+@Client.on_callback_query(filters.regex(r"^db_coll:(system|user|media):(\d+):(.+)$"))
 async def cb_coll(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    idx = int(q.matches[0].group(1))
-    coll = q.matches[0].group(2)
-    text, kb = await render_collection_detail(idx, coll)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2)); name = q.matches[0].group(3)
+    text, kb = await build_view("coll", {"cat": cat, "index": idx, "name": name})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1349,15 +1324,13 @@ async def cb_coll(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_recent:(\d+):([^:]+)(?::(\d+))?$"))
+@Client.on_callback_query(filters.regex(r"^db_recent:(system|user|media):(\d+):([^:]+):(\d+)$"))
 async def cb_recent(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    idx = int(q.matches[0].group(1))
-    coll = q.matches[0].group(2)
-    limit_str = q.matches[0].group(3)
-    limit = int(limit_str) if limit_str else 5
-    text, kb = await render_recent(idx, coll, limit)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    name = q.matches[0].group(3); lim = int(q.matches[0].group(4))
+    text, kb = await build_view("recent", {"cat": cat, "index": idx, "name": name, "limit": lim})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1366,13 +1339,12 @@ async def cb_recent(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_idx:(\d+):(.+)$"))
+@Client.on_callback_query(filters.regex(r"^db_idx:(system|user|media):(\d+):(.+)$"))
 async def cb_idx(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    idx = int(q.matches[0].group(1))
-    coll = q.matches[0].group(2)
-    text, kb = await render_indexes(idx, coll)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2)); name = q.matches[0].group(3)
+    text, kb = await build_view("indexes", {"cat": cat, "index": idx, "name": name})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1381,12 +1353,12 @@ async def cb_idx(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_health$"))
+@Client.on_callback_query(filters.regex(r"^db_health:(system|user|media|overall)$"))
 async def cb_health(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    data = await stats_manager.get_full_stats(force=True)
-    text, kb = await render_health(data)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1)
+    text, kb = await build_view("health", {"cat": cat})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1395,66 +1367,12 @@ async def cb_health(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_perf$"))
+@Client.on_callback_query(filters.regex(r"^db_perf:(system|user|media|overall)$"))
 async def cb_perf(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    data = await stats_manager.get_full_stats()
-    text, kb = await render_performance(data)
-    try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True)
-    except Exception:
-        pass
-    await q.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^db_dist$"))
-async def cb_dist(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    data = await stats_manager.get_full_stats()
-    text, kb = await render_distribution(data)
-    try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True)
-    except Exception:
-        pass
-    await q.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^db_media$"))
-async def cb_media(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    data = await stats_manager.get_full_stats()
-    text, kb = await render_media(data)
-    try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True)
-    except Exception:
-        pass
-    await q.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^db_user$"))
-async def cb_user(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    text, kb = await render_user_db()
-    try:
-        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True)
-    except Exception:
-        pass
-    await q.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^db_errors$"))
-async def cb_errors(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    text, kb = await render_errors()
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1)
+    text, kb = await build_view("perf", {"cat": cat})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1466,8 +1384,8 @@ async def cb_errors(client: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^db_audit$"))
 async def cb_audit(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    text, kb = await render_audit()
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    text, kb = await build_view("audit", {})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1476,12 +1394,11 @@ async def cb_audit(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_config$"))
-async def cb_config(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^db_errors$"))
+async def cb_errors(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    data = await stats_manager.get_full_stats()
-    text, kb = await render_config(data)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    text, kb = await build_view("errors", {})
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1490,12 +1407,27 @@ async def cb_config(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_dups$"))
+@Client.on_callback_query(filters.regex(r"^db_dups:(system|user|media):(\d+)$"))
 async def cb_dups(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    await q.answer("Scanning...")
-    text, kb = await render_duplicates()
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    text, kb = await view_dups(cat, idx)
+    try:
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^db_dup_scan:(system|user|media):(\d+)$"))
+async def cb_dup_scan(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    await q.answer("🔍 SCANNING...")
+    text, kb = await view_dup_scan(cat, idx)
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
@@ -1503,117 +1435,30 @@ async def cb_dups(client: Client, q: CallbackQuery):
         pass
 
 
-@Client.on_callback_query(filters.regex(r"^db_duprem$"))
-async def cb_duprem(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^db_dup_last:(system|user|media):(\d+)$"))
+async def cb_dup_last(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    token = f"duprem:{int(time.time())}"
-    confirmations.start(q.from_user.id, token, {"action": "duplicate_removal"})
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    await q.answer("USE START SCAN TO RUN A FRESH SCAN.", show_alert=True)
+
+
+@Client.on_callback_query(filters.regex(r"^db_dup_remove:(system|user|media):(\d+)$"))
+async def cb_dup_remove(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    tok = f"dup:{cat}:{idx}:{int(time.time())}"
+    confirms.start(q.from_user.id, tok, {"action": "dup_remove", "cat": cat, "index": idx})
     text = (
-        "⚠️ <b>DUPLICATE REMOVAL</b>\n"
+        "⚠️ <b>DUPLICATE REMOVAL — STEP 1/3</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "This action may delete database records.\n\n"
-        "Continue?"
-    )
-    try:
-        await q.message.edit_text(text, reply_markup=confirm_keyboard(token, 1),
-                                  parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-    await q.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^db_confirm:(.+)$"))
-async def cb_confirm(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    token = q.matches[0].group(1)
-    entry = confirmations.get(q.from_user.id, token)
-    if not entry:
-        await q.answer("⏱️ Expired or invalid.", show_alert=True); return
-    step = entry["step"]
-    if step < 3:
-        confirmations.advance(q.from_user.id, token)
-        if step == 1:
-            text = (
-                "🚨 <b>FINAL WARNING</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "This can permanently delete database records.\n"
-                "This cannot be safely undone.\n\n"
-                "Continue?"
-            )
-            kb = confirm_keyboard(token, 2)
-        else:
-            text = (
-                "☢️ <b>PERMANENT DELETION</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Click the confirmation button below to execute.\n"
-                "This is irreversible."
-            )
-            kb = final_confirm_keyboard(token)
-        try:
-            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        await q.answer()
-        return
-
-    confirmations.cancel(q.from_user.id, token)
-    payload = entry["payload"]
-    action = payload.get("action")
-    if action == "duplicate_removal":
-        await audit.log(q.from_user.id, "duplicate_removal", result="REQUESTED",
-                        extra="Not executed — safe mode")
-        text = (
-            "⚠️ <b>DUPLICATE REMOVAL — SAFE MODE</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Removal is disabled in this build to prevent data loss.\n"
-            "Scan results are read-only.\n\n"
-            "Contact the developer to enable dangerous operations."
-        )
-        try:
-            await q.message.edit_text(text, reply_markup=back_keyboard("db_dups"),
-                                      parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        await q.answer()
-        return
-
-
-@Client.on_callback_query(filters.regex(r"^db_cancel:(.+)$"))
-async def cb_cancel(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    token = q.matches[0].group(1)
-    confirmations.cancel(q.from_user.id, token)
-    try:
-        await q.message.edit_text("❌ Cancelled.", reply_markup=back_keyboard("db_main"))
-    except Exception:
-        pass
-    await q.answer("Cancelled")
-
-
-@Client.on_callback_query(filters.regex(r"^db_maint$"))
-async def cb_maint(client: Client, q: CallbackQuery):
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    text = (
-        "🧹 <b>DATABASE MAINTENANCE</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Safe tools only. Destructive operations are not exposed here."
+        f"🎯 TARGET: {cat.upper()} DB {idx:02d}\n\n"
+        "THIS MAY DELETE DATABASE RECORDS.\n\n"
+        "CONTINUE?"
     )
     kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh Stats", callback_data="db_refresh"),
-            InlineKeyboardButton("🧹 Clear Cache", callback_data="db_clearcache"),
-        ],
-        [
-            InlineKeyboardButton("♻️ Duplicate Scan", callback_data="db_dups"),
-            InlineKeyboardButton("❤️ Health", callback_data="db_health"),
-        ],
-        [
-            InlineKeyboardButton("🏠 Home", callback_data="db_main"),
-        ],
+        [InlineKeyboardButton("⚠️ CONTINUE", callback_data=f"db_confirm:{tok}")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{tok}")],
     ])
     try:
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -1622,31 +1467,150 @@ async def cb_maint(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^db_clearcache$"))
-async def cb_clearcache(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^db_clear:(system|user|media):(\d+)$"))
+async def cb_clear(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
-    cache.invalidate()
-    await q.answer("🧹 Cache cleared", show_alert=True)
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    text, kb = await view_clear(cat, idx)
+    try:
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^db_clear_db:(system|user|media):(\d+)$"))
+async def cb_clear_db(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    cat = q.matches[0].group(1); idx = int(q.matches[0].group(2))
+    tok = f"clear:{cat}:{idx}:{int(time.time())}"
+    confirms.start(q.from_user.id, tok, {"action": "clear_db", "cat": cat, "index": idx})
+    text = (
+        "⚠️ <b>STEP 1/3 — CLEAR DATABASE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 {cat.upper()} DB {idx:02d}\n\n"
+        "ALL DOCUMENTS WILL BE REMOVED.\n\n"
+        "CONTINUE?"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ CONTINUE", callback_data=f"db_confirm:{tok}")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{tok}")],
+    ])
+    try:
+        await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^db_confirm:(.+)$"))
+async def cb_confirm(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    tok = q.matches[0].group(1)
+    entry = confirms.get(q.from_user.id, tok)
+    if not entry:
+        await q.answer("⏱️ EXPIRED OR INVALID.", show_alert=True); return
+    step = entry["step"]
+    if step < 3:
+        confirms.advance(q.from_user.id, tok)
+        if step == 1:
+            text = (
+                "🚨 <b>STEP 2/3 — FINAL WARNING</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "THIS CANNOT BE UNDONE.\n\n"
+                "CONTINUE?"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚨 CONTINUE", callback_data=f"db_confirm:{tok}")],
+                [InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{tok}")],
+            ])
+        else:
+            text = (
+                "☢️ <b>STEP 3/3 — PERMANENT DELETION</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "CLICK BELOW TO EXECUTE."
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("☢️ YES, PERMANENTLY DELETE", callback_data=f"db_confirm:{tok}")],
+                [InlineKeyboardButton("❌ CANCEL", callback_data=f"db_cancel:{tok}")],
+            ])
+        try:
+            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await q.answer()
+        return
+
+    # Step 3 → execute
+    confirms.cancel(q.from_user.id, tok)
+    payload = entry["payload"]
+    action = payload.get("action")
+    if action == "clear_db":
+        cat = payload["cat"]; idx = payload["index"]
+        text, kb = await do_clear_db(cat, idx)
+        try:
+            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+        except Exception:
+            pass
+        await q.answer("✅ DONE")
+    elif action == "dup_remove":
+        audit.log(q.from_user.id, "duplicate_removal_safe_mode",
+                  target=f"{payload['cat']}:{payload['index']}",
+                  result="DISABLED_SAFE_MODE")
+        text = (
+            "⚠️ <b>DUPLICATE REMOVAL — SAFE MODE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "REMOVAL IS DISABLED TO PREVENT DATA LOSS.\n"
+            "SCAN RESULTS REMAIN READ-ONLY."
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data="db_main")]])
+        try:
+            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await q.answer("SAFE MODE")
+
+
+@Client.on_callback_query(filters.regex(r"^db_cancel:(.+)$"))
+async def cb_cancel(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    tok = q.matches[0].group(1)
+    confirms.cancel(q.from_user.id, tok)
+    try:
+        await q.message.edit_text(
+            "❌ CANCELLED.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 HOME", callback_data="db_main")]]),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    await q.answer("CANCELLED")
 
 
 @Client.on_callback_query(filters.regex(r"^db_live$"))
 async def cb_live(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
     chat_id = q.message.chat.id
-    if live_refresh.is_live(chat_id):
-        await live_refresh.stop(chat_id)
-        await q.answer("🔴 Live monitoring OFF", show_alert=True)
+    if live.is_live(chat_id):
+        await live.stop(chat_id)
+        await q.answer("🔴 LIVE MONITOR OFF", show_alert=True)
         return
     rows = [
-        [InlineKeyboardButton(f"{n}s", callback_data=f"db_livego:{n}")
-         for n in LIVE_REFRESH_OPTIONS],
-        [InlineKeyboardButton("❌ Cancel", callback_data="db_main")],
+        [InlineKeyboardButton(f"{n}s", callback_data=f"db_livego:{n}") for n in LIVE_OPTIONS],
+        [InlineKeyboardButton("❌ CANCEL", callback_data="db_main")],
     ]
     try:
         await q.message.edit_text(
-            "🟢 <b>LIVE MONITORING</b>\nChoose refresh interval:",
+            "🟢 <b>LIVE MONITOR</b>\nCHOOSE REFRESH INTERVAL:",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
@@ -1658,39 +1622,50 @@ async def cb_live(client: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^db_livego:(\d+)$"))
 async def cb_livego(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
-        await q.answer("⛔ Unauthorized", show_alert=True); return
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
     interval = int(q.matches[0].group(1))
     chat_id = q.message.chat.id
-    live_refresh.set_interval(chat_id, interval)
-    await live_refresh.start(client, chat_id, q.message.id, "main", {})
-    await q.answer(f"🟢 Live ON — every {interval}s", show_alert=True)
+    await live.start(client, chat_id, q.message.id, "main", {})
+    live._state[chat_id]["interval"] = interval
+    await q.answer(f"🟢 LIVE ON — EVERY {interval}s", show_alert=True)
     try:
-        data = await stats_manager.get_full_stats(force=True)
-        text, kb = render_main(data)
+        text, kb = await build_view("main", {})
         await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception:
         pass
 
 
-@Client.on_callback_query(filters.regex(r"^noop$"))
+@Client.on_callback_query(filters.regex(r"^db_close$"))
+async def cb_close(client: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ UNAUTHORIZED", show_alert=True); return
+    await live.stop(q.message.chat.id)
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.answer("CLOSED")
+
+
+@Client.on_callback_query(filters.regex(r"^db_noop$"))
 async def cb_noop(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-# ============================ CLEANUP TASK ============================
-async def _cleanup_loop():
+# ─────────────────────────── CLEANUP LOOP ───────────────────────────
+async def _confirm_cleanup():
     while True:
         try:
-            confirmations.cleanup()
+            confirms.cleanup()
         except Exception:
             pass
         await asyncio.sleep(60)
 
 
 @Client.on_message(filters.command("database_cleanup") & filters.private)
-async def cmd_cleanup(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        await message.reply_text("⛔ Unauthorized."); return
-    await live_refresh.stop(message.chat.id)
-    await message.reply_text("🧹 Live monitor stopped for this chat.")
+async def cmd_cleanup(client: Client, msg: Message):
+    if not is_admin(msg.from_user.id):
+        await msg.reply_text("⛔ UNAUTHORIZED."); return
+    await live.stop(msg.chat.id)
+    await msg.reply_text("🧹 LIVE MONITOR STOPPED FOR THIS CHAT.")
