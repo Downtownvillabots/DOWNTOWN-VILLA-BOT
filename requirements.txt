@@ -3,3 +3,4 @@ tgcrypto-pyrofork
 motor==3.7.1
 pymongo==4.13.2
 aiohttp>=3.9.0
+rapidfuzz>=3.5.0
