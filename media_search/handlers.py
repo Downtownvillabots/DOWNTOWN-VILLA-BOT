@@ -2,7 +2,7 @@
 🏨 DOWNTOWN VILLA — Auto-filter handlers
 Movie:  Title → Language → Quality → Release → Deliver
 Series: Title → Language → Season → Episode → Quality → Release → Deliver
-No DB hits → IMDb suggestions → user picks → exact search
+No DB hits → IMDb suggestions → user picks → request channel flow
 """
 import asyncio
 import logging
@@ -312,7 +312,10 @@ async def _pick_title(client: Client, q: CallbackQuery, sid: str, idx: int):
 
 # ═══════════════════════ SPOL (IMDb SUGGESTION PICK) ═══════════════════════
 async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int):
-    """User picked an IMDb suggestion → search DB for that exact title."""
+    """
+    User picked an IMDb suggestion → search DB for that exact title.
+    If found → continue. If not found → post to request channel.
+    """
     session = await sessions.get(sid)
     if not session or session.user_id != q.from_user.id:
         await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
@@ -324,6 +327,7 @@ async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int)
     s = session.candidates[idx]
     title = s.get("title") or ""
     year = s.get("year")
+    imdb_id = s.get("metadata_id")
     await q.answer(f"🔎 ꜱᴇᴀʀᴄʜɪɴɢ: {title[:30]}")
 
     # Exact DB search for the picked title
@@ -336,7 +340,40 @@ async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int)
         result = await engine.search_any(norm, year=None)
         hits = _filter_by_title(result.hits, title, None)
 
+    # ── NOT FOUND → post to request channel ──
     if not hits:
+        # Log to request channel + BIN channel
+        try:
+            from services.request_service import post_request
+            await post_request(
+                client=client,
+                user_id=q.from_user.id,
+                username=getattr(q.from_user, "username", "") or "",
+                full_name=getattr(q.from_user, "first_name", "") or "",
+                movie_name=title,
+                imdb_id=imdb_id,
+                user_query=session.query or title,
+            )
+        except Exception as e:
+            logger.warning(f"[SEARCH] request channel post failed: {e}")
+
+        # Log to BIN channel too
+        try:
+            from core.config import BIN_CHANNEL, NO_RESULTS_MSG
+            if BIN_CHANNEL and NO_RESULTS_MSG:
+                await client.send_message(
+                    chat_id=BIN_CHANNEL,
+                    text=(
+                        "#NoResults\n\n"
+                        f"👤 ᴜꜱᴇʀ : {q.from_user.mention}\n"
+                        f"🆔 ɪᴅ : <code>{q.from_user.id}</code>\n\n"
+                        f"🔍 ꜱᴇᴀʀᴄʜ : <b>{title}</b>"
+                    ),
+                )
+        except Exception:
+            pass
+
+        # Log to DB
         try:
             await request_repo.add(
                 q.from_user.id, norm, title,
@@ -361,7 +398,7 @@ async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int)
             await q.message.edit_text(
                 "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
                 f"😌 <b>{title}</b>{year_txt} ɪꜱ ɴᴏᴛ ᴀᴠᴀɪʟᴀʙʟᴇ ɪɴ ᴏᴜʀ ᴅᴀᴛᴀʙᴀꜱᴇ.\n\n"
-                "📝 ʀᴇǫᴜᴇꜱᴛ ʀᴇᴄᴏʀᴅᴇᴅ — ᴀᴅᴍɪɴ ᴡɪʟʟ ᴀᴅᴅ ɪᴛ ꜱᴏᴏɴ.",
+                "📝 ʀᴇǫᴜᴇꜱᴛ ꜱᴇɴᴛ — ᴀᴅᴍɪɴ ᴡɪʟʟ ɴᴏᴛɪꜰʏ ʏᴏᴜ ꜱᴏᴏɴ.",
                 reply_markup=kb,
                 parse_mode=ParseMode.HTML,
             )
@@ -369,7 +406,7 @@ async def _pick_suggestion(client: Client, q: CallbackQuery, sid: str, idx: int)
             pass
         return
 
-    # Found → update session and continue
+    # ── FOUND → update session and continue ──
     await sessions.update(sid, selected_title=title, selected_year=year)
 
     try:
