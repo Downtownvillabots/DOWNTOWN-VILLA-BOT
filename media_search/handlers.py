@@ -1,23 +1,23 @@
 """
-Auto-filter handlers — pure text search.
-No commands. User types movie/series name → bot searches → sends file.
-PM: always search.
-Group: search only on title-like messages (prevents chatter spam).
+🏨 DOWNTOWN VILLA — Auto-filter handlers
+Full interactive flow:
+  Movie: Title → Language → Quality → Release → Deliver
+  Series: Title → Language → Season → Episode → Quality → Release → Deliver
 """
 import asyncio
 import logging
-import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode, ChatType
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.enums import ParseMode
+from pyrogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
 
-from media_search.config import SEARCH_PAGE_SIZE
 from media_search.delivery import delivery
 from media_search.engine import engine
 from media_search.models import FileHit
-from media_search.normalizer import parse_query
+from media_search.normalizer import parse_query, normalize
 from media_search.ranker import ranker
 from media_search.requests import requests as request_repo
 from media_search.sessions import sessions
@@ -27,20 +27,8 @@ logger = logging.getLogger(__name__)
 
 DIV = "━" * 26
 
-# ───────── Noise / stop phrases for group messages ─────────
-_GROUP_STOP_WORDS = {
-    "hi", "hello", "hey", "yo", "sup", "ok", "okay", "k", "yes", "no",
-    "yep", "nope", "thanks", "thank you", "thx", "ty", "bye", "goodbye",
-    "good morning", "good night", "gm", "gn", "lol", "lmao", "haha",
-    "nice", "cool", "great", "wow", "omg", "wtf", "what", "why", "how",
-    "who", "when", "where", "help", "sure", "please", "pls", "np",
-    "sorry", "done", "stop", "go", "come", "wait", "hmm", "umm",
-}
 
-# Only letters, digits, spaces, and common title punctuation
-_TITLE_CHARS = re.compile(r"^[A-Za-z0-9\s\.\-_:,'!&]+$")
-
-
+# ═══════════════════════ HELPERS ═══════════════════════
 def _human_size(size: Optional[int]) -> str:
     if not size:
         return "0 B"
@@ -56,109 +44,28 @@ def _human_size(size: Optional[int]) -> str:
     return f"{s:.2f} {units[i]}"
 
 
-def _looks_like_title(text: str) -> bool:
-    """Decide if a group message is likely a movie/series search."""
-    if not text:
-        return False
-    t = text.strip()
-    if len(t) < 2 or len(t) > 60:
-        return False
-    # Reject URLs
-    if "http://" in t.lower() or "https://" in t.lower() or "t.me/" in t.lower():
-        return False
-    # Reject @mentions (except if it's just the bot mention — handled separately)
-    if "@" in t:
-        return False
-    # Reject common chatter
-    if t.lower() in _GROUP_STOP_WORDS:
-        return False
-    # Reject messages with too many words
-    words = t.split()
-    if len(words) > 6:
-        return False
-    # Reject messages with emojis or weird chars
-    if not _TITLE_CHARS.match(t):
-        return False
-    # Reject single character
-    if len(t) == 1:
-        return False
-    # Reject if it's just punctuation
-    if not any(c.isalnum() for c in t):
-        return False
-    return True
+def _display_title(t: str, year: Optional[int]) -> str:
+    """Pretty title for buttons."""
+    base = (t or "?").strip().title()
+    return f"{base} ({year})" if year else base
 
 
-# # ═══════════════════════ PRIVATE TEXT → SEARCH ═══════════════════════
-@Client.on_message(filters.private & filters.text & ~filters.service)
-async def handle_private_text(client: Client, message: Message):
-    """Any text in PM triggers a search. Command names are skipped inside."""
-    if not message.text:
-        return
+# ═══════════════════════ MAIN ENTRY (called from plugins/auto_filter.py) ═══════════════════════
+async def _handle_search(client: Client, message: Message, raw_query: str, is_group: bool = False):
+    logger.info(f"[SEARCH] START for {raw_query!r} is_group={is_group}")
 
-    query = message.text.strip()
-    logger.info(f"[SEARCH] PM hit from={message.from_user.id} text={query[:60]!r}")
-
-    # Skip commands (unified check inside the handler — more reliable than filter)
-    if query.startswith("/"):
-        logger.info(f"[SEARCH] skipping command: {query.split()[0]}")
-        return
-
-    if len(query) < 2 or len(query) > 120:
-        logger.info(f"[SEARCH] length out of range: {len(query)}")
-        return
-
-    await _handle_search(client, message, query)
-
-
-# ═══════════════════════ GROUP / CHANNEL — SMART TRIGGER ═══════════════════════
-@Client.on_message(filters.text & (filters.group | filters.channel) & ~filters.service)
-async def handle_group_text(client: Client, message: Message):
-    """Group: only search when message looks like a title OR bot is mentioned/replied."""
-    if not message.text:
-        return
-
-    text = message.text.strip()
-    me = (getattr(client, "username", "") or "").lower()
-
-    # ── Trigger 1: reply to bot's message ──
-    if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.is_self and _looks_like_title(text):
-            await _handle_search(client, message, text, is_group=True)
-            return
-
-    # ── Trigger 2: @mention of bot ──
-    if me and f"@{me}" in text.lower():
-        cleaned = re.sub(rf"@{re.escape(me)}", "", text, flags=re.IGNORECASE).strip()
-        if len(cleaned) >= 2:
-            await _handle_search(client, message, cleaned, is_group=True)
-            return
-
-    # ── Trigger 3: message itself looks like a title ──
-    if _looks_like_title(text):
-        await _handle_search(client, message, text, is_group=True)
-        return
-
-
-# ═══════════════════════ CORE SEARCH ═══════════════════════
-async def _handle_search(client: Client, message: Message, raw_query: str, is_group: bool):
-    """Search and send the best file, or picker if multiple titles."""
-    logger.info(f"[SEARCH] starting search for {raw_query!r}")
     try:
         status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
-        logger.info(f"[SEARCH] status message sent id={status.id}")
     except Exception as e:
-        logger.exception(f"[SEARCH] failed to send status: {e}")
+        logger.exception(f"[SEARCH] reply failed: {e}")
         return
 
     norm, year, is_series = parse_query(raw_query)
     if not norm:
-        try:
-            await status.edit_text("❌ ᴘʟᴇᴀꜱᴇ ᴇɴᴛᴇʀ ᴀ ᴠᴀʟɪᴅ ꜱᴇᴀʀᴄʜ.")
-        except Exception:
-            pass
+        await _edit(status, "❌ ᴘʟᴇᴀꜱᴇ ᴇɴᴛᴇʀ ᴀ ᴠᴀʟɪᴅ ꜱᴇᴀʀᴄʜ.")
         return
 
-    # Search all shards
+    # ── Search all shards ──
     if is_series:
         result = await engine.search_series(norm, year=year)
     else:
@@ -167,246 +74,311 @@ async def _handle_search(client: Client, message: Message, raw_query: str, is_gr
             engine.search_series(norm, year=year),
         )
         result = r_movie if r_movie.hits else r_series
+        if not is_series and not result.hits:
+            result = await engine.search_any(norm, year=year)
 
     hits = result.hits
+    logger.info(f"[SEARCH] got {len(hits)} hits complete={result.complete}")
 
     # ── No results ──
     if not hits:
         if not result.complete:
-            try:
-                await status.edit_text(
-                    "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-                    "⚠️ ᴏɴᴇ ᴏʀ ᴍᴏʀᴇ ᴅᴀᴛᴀʙᴀꜱᴇꜱ ᴜɴʀᴇᴀᴄʜᴀʙʟᴇ.\n"
-                    "ᴘʟᴇᴀꜱᴇ ᴛʀʏ ᴀɢᴀɪɴ ɪɴ ᴀ ᴍᴏᴍᴇɴᴛ.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+            await _edit(
+                status,
+                "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+                "⚠️ ᴏɴᴇ ᴏʀ ᴍᴏʀᴇ ᴅᴀᴛᴀʙᴀꜱᴇꜱ ᴜɴʀᴇᴀᴄʜᴀʙʟᴇ. ᴛʀʏ ᴀɢᴀɪɴ.",
+            )
             return
-
-        # Log request
         try:
-            await request_repo.add(
-                message.from_user.id, norm, raw_query,
-                "series" if is_series else "movie",
-            )
+            await request_repo.add(message.from_user.id, norm, raw_query,
+                                   "series" if is_series else "movie")
         except Exception:
             pass
-
-        try:
-            await status.edit_text(
-                f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-                f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>\n\n"
-                f"📝 ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ʜᴀꜱ ʙᴇᴇɴ ʀᴇᴄᴏʀᴅᴇᴅ.",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
-
-    # ── Group titles ──
-    titles: Dict[str, List[FileHit]] = {}
-    for h in hits:
-        key = (h.series_title or h.title or "?").strip()
-        titles.setdefault(key, []).append(h)
-
-    # ── ONE TITLE → send best file directly ──
-    if len(titles) == 1:
-        title_hits = list(titles.values())[0]
-        best = (
-            ranker.best_for_episode(title_hits) if is_series
-            else ranker.rank(title_hits)[0]
+        await _edit(
+            status,
+            f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
+            f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>\n\n"
+            f"📝 ʀᴇǫᴜᴇꜱᴛ ʀᴇᴄᴏʀᴅᴇᴅ.",
         )
-
-        # Force-sub (private only)
-        if not is_group:
-            ok, missing = await subscription.is_subscribed(client, message.from_user.id)
-            if not ok:
-                try:
-                    await status.edit_text(
-                        "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-                        "⚠️ ᴊᴏɪɴ ᴛʜᴇ ᴄʜᴀɴɴᴇʟꜱ ʙᴇʟᴏᴡ ᴛᴏ ɢᴇᴛ ʏᴏᴜʀ ꜰɪʟᴇ.",
-                        reply_markup=_sub_keyboard(missing),
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-                return
-
-        # Delete the "searching..." message
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-        # Send to whoever triggered (PM → user; group → the group so everyone sees)
-        target_chat = message.chat.id if is_group else message.from_user.id
-        group_id = message.chat.id if is_group else None
-
-        ok, err = await delivery.send_file(client, target_chat, best, group_id=group_id)
-        if not ok and err:
-            try:
-                await message.reply_text(err)
-            except Exception:
-                pass
         return
 
-    # ── MULTIPLE TITLES → picker ──
+    # ── Group by (title, year) ──
+    groups = _group_hits(hits)
+    logger.info(f"[SEARCH] grouped into {len(groups)} title(s)")
+
+    # ── Save session ──
+    candidates = []
+    for (t, y), th in groups.items():
+        candidates.append({
+            "title": t,
+            "year": y,
+            "type": th[0].type,
+            "count": len(th),
+        })
+
     session = await sessions.create(
         user_id=message.from_user.id,
         chat_id=message.chat.id,
         query=raw_query,
         normalized_query=norm,
         mode="series" if is_series else "movie",
-        candidates=[
-            {
-                "title": t,
-                "year": v[0].year,
-                "type": v[0].type,
-                "count": len(v),
-            }
-            for t, v in titles.items()
-        ][:10],
+        candidates=candidates,
     )
     if not session:
-        try:
-            await status.edit_text("❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ. ᴛʀʏ ᴀɢᴀɪɴ.")
-        except Exception:
-            pass
+        await _edit(status, "❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ. ᴛʀʏ ᴀɢᴀɪɴ.")
+        return
+
+    # ── ONE title → jump straight to language ──
+    if len(candidates) == 1:
+        c = candidates[0]
+        await sessions.update(
+            session.session_id,
+            selected_title=c["title"],
+            selected_year=c["year"],
+        )
+        await _show_languages(status, session.session_id)
+        return
+
+    # ── MULTIPLE → title picker ──
+    rows: List[List[InlineKeyboardButton]] = []
+    for i, c in enumerate(candidates[:10]):
+        label = _display_title(c["title"], c["year"])
+        rows.append([InlineKeyboardButton(
+            label.upper(),
+            callback_data=f"sr:pick:{session.session_id}:{i}",
+        )])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
+
+    await _edit(
+        status,
+        "\n".join([
+            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+            f"🔎 <b>{len(candidates)} ᴛɪᴛʟᴇꜱ ꜰᴏᴜɴᴅ</b>",
+            DIV, "",
+            f"🔍 Qᴜᴇʀʏ: <code>{raw_query}</code>",
+            "",
+            "ꜱᴇʟᴇᴄᴛ ᴀ ᴛɪᴛʟᴇ:",
+        ]),
+        kb=InlineKeyboardMarkup(rows),
+    )
+
+
+# ═══════════════════════ GROUPING ═══════════════════════
+def _group_hits(hits: List[FileHit]) -> Dict[tuple, List[FileHit]]:
+    """
+    Group files by (display_title, year).
+    Merges "KGF Chapter" + "KGF Chapter" with same year into one group.
+    Splits by year so Chapter 1 (2018) and Chapter 2 (2022) stay separate.
+    """
+    groups: Dict[tuple, List[FileHit]] = {}
+    for h in hits:
+        base = (h.series_title or h.title or "?").strip()
+        # Remove trailing numbers from base (e.g. "KGF Chapter 1" → "KGF Chapter")
+        import re
+        base_clean = re.sub(r"\s+\d+\s*$", "", base).strip()
+        key = (base_clean or base, h.year)
+        groups.setdefault(key, []).append(h)
+    return groups
+
+
+# ═══════════════════════ LANGUAGE SCREEN ═══════════════════════
+async def _show_languages(message_or_msg, session_id: str):
+    session = await sessions.get(session_id)
+    if not session:
+        return
+    title = session.selected_title
+    year = session.selected_year
+
+    # Re-search this exact title
+    norm = normalize(title)
+    result = await engine.search_any(norm, year=year)
+    hits = _filter_by_title(result.hits, title, year)
+    if not hits:
+        await _edit(message_or_msg, "❌ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ᴛɪᴛʟᴇ.")
+        return
+
+    langs = sorted({l for h in hits for l in (h.audio_languages or [])})
+    if not langs:
+        # No language info → skip straight to quality
+        await sessions.update(session_id, selected_language="")
+        await _show_qualities(message_or_msg, session_id)
         return
 
     rows: List[List[InlineKeyboardButton]] = []
-    for i, (title, th) in enumerate(list(titles.items())[:10]):
-        year = th[0].year
-        label = f"🎬 {title}" + (f" ({year})" if year else "")
-        rows.append([
-            InlineKeyboardButton(
-                label.upper(),
-                callback_data=f"sr:pick:{session.session_id}:{i}",
-            )
-        ])
+    pair: List[InlineKeyboardButton] = []
+    for i, lang in enumerate(langs[:12]):
+        pair.append(InlineKeyboardButton(
+            lang.upper(), callback_data=f"sr:lang:{session_id}:{i}",
+        ))
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:back:{session_id}")])
     rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
 
-    text = "\n".join([
-        "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-        f"🔎 <b>{len(titles)} ᴍᴀᴛᴄʜᴇꜱ ꜰᴏᴜɴᴅ</b>",
-        DIV, "",
-        f"🔍 Qᴜᴇʀʏ: <code>{raw_query}</code>",
-        "",
-        "ꜱᴇʟᴇᴄᴛ ᴏɴᴇ:",
-    ])
+    await _edit(
+        message_or_msg,
+        "\n".join([
+            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+            f"🎬 <b>{_display_title(title, year)}</b>",
+            f"📦 ꜰɪʟᴇꜱ: <code>{len(hits)}</code>",
+            DIV, "",
+            "🌐 ꜱᴇʟᴇᴄᴛ ʟᴀɴɢᴜᴀɢᴇ:",
+        ]),
+        kb=InlineKeyboardMarkup(rows),
+    )
+
+
+# ═══════════════════════ QUALITY SCREEN (movies) ═══════════════════════
+async def _show_qualities(message_or_msg, session_id: str):
+    session = await sessions.get(session_id)
+    if not session:
+        return
+    title = session.selected_title
+    year = session.selected_year
+    lang = session.selected_language
+
+    norm = normalize(title)
+    result = await engine.search_any(norm, year=year)
+    hits = _filter_by_title(result.hits, title, year)
+    if lang:
+        hits = [h for h in hits if lang in (h.audio_languages or [])]
+
+    quals = sorted({(h.quality or "").upper() for h in hits if h.quality})
+    if not quals:
+        await _edit(message_or_msg, "❌ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇʟᴇᴄᴛɪᴏɴ.")
+        return
+
+    rows: List[List[InlineKeyboardButton]] = []
+    pair: List[InlineKeyboardButton] = []
+    for i, q in enumerate(quals[:10]):
+        pair.append(InlineKeyboardButton(
+            q, callback_data=f"sr:q:{session_id}:{i}",
+        ))
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:lang_back:{session_id}")])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
+
+    await _edit(
+        message_or_msg,
+        "\n".join([
+            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+            f"🎬 <b>{_display_title(title, year)}</b>",
+            f"🌐 ʟᴀɴɢᴜᴀɢᴇ: <code>{lang or '—'}</code>",
+            f"📦 ꜰɪʟᴇꜱ: <code>{len(hits)}</code>",
+            DIV, "",
+            "🎞️ ꜱᴇʟᴇᴄᴛ ǫᴜᴀʟɪᴛʏ:",
+        ]),
+        kb=InlineKeyboardMarkup(rows),
+    )
+
+
+# ═══════════════════════ FILE LIST ═══════════════════════
+async def _show_files(message_or_msg, session_id: str):
+    session = await sessions.get(session_id)
+    if not session:
+        return
+    title = session.selected_title
+    year = session.selected_year
+    lang = session.selected_language
+    qual = session.selected_quality
+
+    norm = normalize(title)
+    result = await engine.search_any(norm, year=year)
+    hits = _filter_by_title(result.hits, title, year)
+    if lang:
+        hits = [h for h in hits if lang in (h.audio_languages or [])]
+    if qual:
+        hits = [h for h in hits if (h.quality or "").upper() == qual.upper()]
+
+    hits = ranker.rank(hits)
+    # Dedupe by file_unique_id (fallback file_id)
+    seen = set()
+    uniq = []
+    for h in hits:
+        k = h.file_unique_id or h.file_id
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(h)
+
+    if not uniq:
+        await _edit(message_or_msg, "❌ ɴᴏ ʀᴇʟᴇᴀꜱᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇʟᴇᴄᴛɪᴏɴ.")
+        return
+
+    # Store the exact hit list in the session for later retrieval
+    await sessions.update(
+        session_id,
+        candidates=session.candidates,  # keep original
+    )
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for i, h in enumerate(uniq[:10]):
+        label = f"📦 {_human_size(h.file_size)} • {(h.codec or '?').upper()}"
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"sr:file:{session_id}:{i}",
+        )])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{session_id}")])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
+
+    await _edit(
+        message_or_msg,
+        "\n".join([
+            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+            f"🎬 <b>{_display_title(title, year)}</b>",
+            f"🌐 ʟᴀɴɢᴜᴀɢᴇ: <code>{lang or '—'}</code>",
+            f"🎞️ Qᴜᴀʟɪᴛʏ: <code>{qual or '—'}</code>",
+            f"📦 ʀᴇʟᴇᴀꜱᴇꜱ: <code>{len(uniq)}</code>",
+            DIV, "",
+            "ᴘɪᴄᴋ ᴀ ʀᴇʟᴇᴀꜱᴇ:",
+        ]),
+        kb=InlineKeyboardMarkup(rows),
+    )
+
+
+# ═══════════════════════ FILTER HELPER ═══════════════════════
+def _filter_by_title(hits: List[FileHit], title: str, year: Optional[int]) -> List[FileHit]:
+    norm = normalize(title)
+    import re
+    out = []
+    for h in hits:
+        base = (h.series_title or h.title or "").strip()
+        base_clean = re.sub(r"\s+\d+\s*$", "", base).strip()
+        if normalize(base_clean) != norm:
+            continue
+        if year and h.year != year:
+            continue
+        out.append(h)
+    if not out:
+        # Fallback: looser match
+        for h in hits:
+            if year and h.year != year:
+                continue
+            bn = normalize(h.series_title or h.title or "")
+            if bn.startswith(norm) or norm.startswith(bn):
+                out.append(h)
+    return out
+
+
+# ═══════════════════════ EDIT HELPER ═══════════════════════
+async def _edit(target, text: str, kb: Optional[InlineKeyboardMarkup] = None):
+    """Edit a Message or CallbackQuery.message."""
     try:
-        await status.edit_text(
+        msg = getattr(target, "message", target)
+        await msg.edit_text(
             text,
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.warning(f"[SEARCH] picker render failed: {e}")
+        logger.warning(f"[SEARCH] edit failed: {type(e).__name__}: {e}")
 
 
-# ═══════════════════════ SUBSCRIPTION KEYBOARD ═══════════════════════
-def _sub_keyboard(missing_channels: List[int]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for ch in missing_channels[:5]:
-        try:
-            cid = str(ch).replace("-100", "").replace("-", "")
-            url = f"https://t.me/c/{cid}/1"
-        except Exception:
-            url = "https://t.me/"
-        rows.append([InlineKeyboardButton("📢 JOIN CHANNEL", url=url)])
-    rows.append([InlineKeyboardButton("🔄 CHECK AGAIN", callback_data="sr:check_sub")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-    return InlineKeyboardMarkup(rows)
-
-
-# ═══════════════════════ CALLBACKS ═══════════════════════
-@Client.on_callback_query(filters.regex(r"^sr:close$"))
-async def cb_close(client: Client, q: CallbackQuery):
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-    await q.answer("ᴄʟᴏꜱᴇᴅ")
-
-
-@Client.on_callback_query(filters.regex(r"^sr:check_sub$"))
-async def cb_check_sub(client: Client, q: CallbackQuery):
-    ok, missing = await subscription.is_subscribed(client, q.from_user.id)
-    if ok:
-        await q.answer("✅ ᴠᴇʀɪꜰɪᴇᴅ! ꜱᴇɴᴅ ʏᴏᴜʀ ꜱᴇᴀʀᴄʜ ᴀɢᴀɪɴ.", show_alert=True)
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-    else:
-        await q.answer("❌ ꜱᴛɪʟʟ ᴍɪꜱꜱɪɴɢ ᴄʜᴀɴɴᴇʟꜱ", show_alert=True)
-
-
-@Client.on_callback_query(filters.regex(r"^sr:pick:([a-f0-9]+):(\d+)$"))
-async def cb_pick(client: Client, q: CallbackQuery):
-    """User picked one title from the picker."""
-    session_id = q.matches[0].group(1)
-    idx = int(q.matches[0].group(2))
-    session = await sessions.get(session_id)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        return
-    if idx >= len(session.candidates):
-        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        return
-
-    candidate = session.candidates[idx]
-    title = candidate["title"]
-
-    await q.answer("📤 ꜱᴇɴᴅɪɴɢ...")
-
-    norm, _, is_series = parse_query(title)
-    if candidate.get("type") == "series":
-        result = await engine.search_series(norm, year=candidate.get("year"))
-    else:
-        result = await engine.search_movie(norm, year=candidate.get("year"))
-
-    if not result.hits:
-        try:
-            await q.message.edit_text("❌ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ.")
-        except Exception:
-            pass
-        return
-
-    # Force-sub check (private only)
-    is_group = q.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-    if not is_group:
-        ok, missing = await subscription.is_subscribed(client, q.from_user.id)
-        if not ok:
-            try:
-                await q.message.edit_text(
-                    "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-                    "⚠️ ᴊᴏɪɴ ᴛʜᴇ ᴄʜᴀɴɴᴇʟꜱ ʙᴇʟᴏᴡ ᴛᴏ ɢᴇᴛ ʏᴏᴜʀ ꜰɪʟᴇ.",
-                    reply_markup=_sub_keyboard(missing),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            return
-
-    best = (
-        ranker.best_for_episode(result.hits) if is_series
-        else ranker.rank(result.hits)[0]
-    )
-
-    target_chat = q.message.chat.id if is_group else q.from_user.id
-    group_id = q.message.chat.id if is_group else None
-
-    ok, err = await delivery.send_file(client, target_chat, best, group_id=group_id)
-    if ok:
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-    elif err:
-        try:
-            await q.message.edit_text(err)
-        except Exception:
-            pass
+# ═══════════════════════ CALLBACKS (handled in plugins/auto_filter.py) ═══════════════════════
+# Callbacks are registered in plugins/auto_filter.py so Pyrogram finds them at top level.
+# We expose helper functions here for those handlers to call.
