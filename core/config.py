@@ -167,3 +167,10 @@ AUTO_DELETE_WARNING = environ.get(
     "⚠️ ᴛʜɪꜱ ꜰɪʟᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ <b>{minutes} ᴍɪɴᴜᴛᴇꜱ</b>.\n"
     "ᴘʟᴇᴀꜱᴇ ꜱᴀᴠᴇ ᴏʀ ꜱʜᴀʀᴇ ɪᴛ ɴᴏᴡ."
 )
+
+# ═══════════════════════ SPELL CHECK / SUGGESTIONS ═══════════════════════
+SPELL_CHECK_REPLY = is_enabled(environ.get("SPELL_CHECK_REPLY", "True"), True)
+SPELL_CHECK_THRESHOLD = int(environ.get("SPELL_CHECK_THRESHOLD", "80"))   # 0-100
+SPELL_CHECK_CANDIDATES = int(environ.get("SPELL_CHECK_CANDIDATES", "5"))  # max retries
+MAX_LIST_ELM = int(environ.get("MAX_LIST_ELM", "10"))
+SUGGESTION_TTL = int(environ.get("SUGGESTION_TTL", "60"))                 # auto-delete seconds
