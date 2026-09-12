@@ -88,16 +88,26 @@ def _looks_like_title(text: str) -> bool:
     return True
 
 
-# ═══════════════════════ PRIVATE CHAT — ANY TEXT ═══════════════════════
-@Client.on_message(filters.text & filters.private & ~filters.command(["start", "index", "database"]))
+# # ═══════════════════════ PRIVATE TEXT → SEARCH ═══════════════════════
+@Client.on_message(filters.private & filters.text & ~filters.service)
 async def handle_private_text(client: Client, message: Message):
-    """PM: any text triggers a search."""
+    """Any text in PM triggers a search. Command names are skipped inside."""
     if not message.text:
         return
+
     query = message.text.strip()
-    if len(query) < 2 or len(query) > 120:
+    logger.info(f"[SEARCH] PM hit from={message.from_user.id} text={query[:60]!r}")
+
+    # Skip commands (unified check inside the handler — more reliable than filter)
+    if query.startswith("/"):
+        logger.info(f"[SEARCH] skipping command: {query.split()[0]}")
         return
-    await _handle_search(client, message, query, is_group=False)
+
+    if len(query) < 2 or len(query) > 120:
+        logger.info(f"[SEARCH] length out of range: {len(query)}")
+        return
+
+    await _handle_search(client, message, query)
 
 
 # ═══════════════════════ GROUP / CHANNEL — SMART TRIGGER ═══════════════════════
@@ -132,9 +142,12 @@ async def handle_group_text(client: Client, message: Message):
 # ═══════════════════════ CORE SEARCH ═══════════════════════
 async def _handle_search(client: Client, message: Message, raw_query: str, is_group: bool):
     """Search and send the best file, or picker if multiple titles."""
+    logger.info(f"[SEARCH] starting search for {raw_query!r}")
     try:
         status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
-    except Exception:
+        logger.info(f"[SEARCH] status message sent id={status.id}")
+    except Exception as e:
+        logger.exception(f"[SEARCH] failed to send status: {e}")
         return
 
     norm, year, is_series = parse_query(raw_query)
