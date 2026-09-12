@@ -9,8 +9,11 @@ class DatabaseRegistry:
         self._manager = manager
         self._media_shard_index = 0
 
-    def get_core_db(self):
-        return self._manager.get_core_db()
+    def get_system_db(self):
+        return self._manager.get_system_db()
+
+    def get_user_db(self):
+        return self._manager.get_user_db()
 
     def get_catalog_db(self):
         return self._manager.get_catalog_db()
@@ -20,7 +23,7 @@ class DatabaseRegistry:
             return self._manager.get_media_db(shard_index)
         count = self._manager.get_media_db_count()
         if count == 0:
-            return self._manager.get_core_db()
+            return self._manager.get_user_db()
         db = self._manager.get_media_db(self._media_shard_index)
         self._media_shard_index = (self._media_shard_index + 1) % count
         return db
