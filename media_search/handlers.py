@@ -150,7 +150,7 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
     hits = result.hits
     logger.info(f"[SEARCH] {len(hits)} hits complete={result.complete}")
 
-    if not hits:
+       if not hits:
         if not result.complete:
             await _edit(
                 status,
@@ -158,17 +158,9 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
                 "⚠️ ᴏɴᴇ ᴏʀ ᴍᴏʀᴇ ᴅᴀᴛᴀʙᴀꜱᴇꜱ ᴜɴʀᴇᴀᴄʜᴀʙʟᴇ. ᴛʀʏ ᴀɢᴀɪɴ.",
             )
             return
-        try:
-            await request_repo.add(message.from_user.id, norm, raw_query,
-                                   "series" if is_series else "movie")
-        except Exception:
-            pass
-        await _edit(
-            status,
-            f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-            f"❌ ɴᴏ ᴍᴀᴛᴄʜɪɴɢ ꜰɪʟᴇ ꜰᴏʀ <code>{raw_query}</code>\n\n"
-            f"📝 ʀᴇǫᴜᴇꜱᴛ ʀᴇᴄᴏʀᴅᴇᴅ.",
-        )
+
+        # ── SPELL CHECK ──
+        await _handle_no_results(client, message, status, raw_query, norm, is_series)
         return
 
     # ── Group by (title, year) ──
