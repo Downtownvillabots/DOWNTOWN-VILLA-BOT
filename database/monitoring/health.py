@@ -3,13 +3,20 @@ from database import db_registry
 class HealthRepository:
     async def get_database_health(self) -> dict:
         health = {}
-        core_db = db_registry.get_core_db()
-        if core_db:
+        system_db = db_registry.get_system_db()
+        if system_db:
             try:
-                await core_db.command("ping")
-                health["core"] = "ok"
+                await system_db.command("ping")
+                health["system"] = "ok"
             except Exception:
-                health["core"] = "error"
+                health["system"] = "error"
+        user_db = db_registry.get_user_db()
+        if user_db:
+            try:
+                await user_db.command("ping")
+                health["user"] = "ok"
+            except Exception:
+                health["user"] = "error"
         catalog_db = db_registry.get_catalog_db()
         if catalog_db:
             try:
@@ -25,3 +32,4 @@ class HealthRepository:
             except Exception:
                 health[f"media_{i}"] = "error"
         return health
+        
