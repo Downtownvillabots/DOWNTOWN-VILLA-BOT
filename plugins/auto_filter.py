@@ -209,3 +209,57 @@ async def cb_pick(client: Client, q):
 
 # ═══════════════════════ STARTUP LOG ═══════════════════════
 logger.info("[AUTO-FILTER] PM search handlers registered")
+
+
+
+# ═══════════════════════ DIAGNOSTIC — count indexed files ═══════════════════════
+@Client.on_message(filters.private & filters.command("dbstats"))
+async def cmd_dbstats(client: Client, message: Message):
+    try:
+        from core.config import ADMINS
+        uid = message.from_user.id
+        if int(uid) not in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]:
+            await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
+            return
+    except Exception:
+        await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
+        return
+
+    try:
+        from database import db_registry
+        entries = db_registry.media_entries()
+        lines = [f"🗄️ ᴍᴇᴅɪᴀ ꜱʜᴀʀᴅꜱ: {len(entries)}", ""]
+        total = 0
+        for e in entries:
+            try:
+                count = await e.db["media_files"].estimated_document_count()
+                total += count
+                lines.append(f"  DB{e.index:02d} ({e.label}): <code>{count}</code>")
+            except Exception as ex:
+                lines.append(f"  DB{e.index:02d}: ⚠️ {type(ex).__name__}")
+        lines.append("")
+        lines.append(f"📦 ᴛᴏᴛᴀʟ: <code>{total}</code>")
+
+        # Show a few sample titles
+        if total > 0:
+            lines.append("")
+            lines.append("📋 ꜱᴀᴍᴘʟᴇ ᴛɪᴛʟᴇꜱ:")
+            shown = 0
+            for e in entries:
+                if shown >= 10:
+                    break
+                try:
+                    cursor = e.db["media_files"].find({}, {"title": 1, "type": 1}).limit(10)
+                    async for doc in cursor:
+                        if shown >= 10:
+                            break
+                        title = doc.get("title") or "?"
+                        t = doc.get("type") or "?"
+                        lines.append(f"  • <code>{title}</code> [{t}]")
+                        shown += 1
+                except Exception:
+                    pass
+
+        await message.reply_text("\n".join(lines), parse_mode="html")
+    except Exception as e:
+        await message.reply_text(f"❌ {type(e).__name__}: {e}")
