@@ -87,6 +87,69 @@ class RequestRepository:
             return await c.count_documents({"created_at": {"$gte": since}})
         except Exception:
             return 0
+    # ═══════════════════════ REQUEST TOKENS ═══════════════════════
+    async def create_token(self, user_id: int, username: str, full_name: str,
+                           movie_name: str, imdb_id: Optional[str] = None,
+                           user_query: str = "") -> Optional[str]:
+        """Create a request token. Returns token_id."""
+        c = self._coll()
+        if c is None:
+            return None
+        import uuid
+        import time as _t
+        token_id = uuid.uuid4().hex[:12]
+        now = _t.time()
+        try:
+            await c.insert_one({
+                "token_id": token_id,
+                "user_id": user_id,
+                "username": username or "",
+                "full_name": full_name or "",
+                "movie_name": movie_name,
+                "imdb_id": imdb_id,
+                "user_query": user_query or movie_name,
+                "status": "pending",
+                "created_at": now,
+                "expires_at": now + (7 * 24 * 3600),
+            })
+            return token_id
+        except Exception as e:
+            logger.warning(f"[REQUESTS] create_token failed: {e}")
+            return None
 
+    async def get_token(self, token_id: str) -> Optional[Dict]:
+        c = self._coll()
+        if c is None:
+            return None
+        try:
+            return await c.find_one({"token_id": token_id})
+        except Exception:
+            return None
+
+    async def update_token(self, token_id: str, status: str) -> bool:
+        c = self._coll()
+        if c is None:
+            return False
+        try:
+            r = await c.update_one(
+                {"token_id": token_id},
+                {"$set": {"status": status, "updated_at": __import__("time").time()}},
+            )
+            return r.matched_count > 0
+        except Exception as e:
+            logger.warning(f"[REQUESTS] update_token failed: {e}")
+            return False
+
+    async def delete_token(self, token_id: str) -> bool:
+        c = self._coll()
+        if c is None:
+            return False
+        try:
+            r = await c.delete_one({"token_id": token_id})
+            logger.info(f"[REQUESTS] token {token_id} cleared from cache")
+            return r.deleted_count > 0
+        except Exception as e:
+            logger.warning(f"[REQUESTS] delete_token failed: {e}")
+            return False
 
 requests = RequestRepository()
