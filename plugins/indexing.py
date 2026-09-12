@@ -597,6 +597,72 @@ async def _render_progress(client: Client, job_id: str, force: bool = False) -> 
     except Exception:
         pass
 
+# ═══════════════════════ LIVE UPDATER ═══════════════════════
+async def _live_updater(client: Client, job_id: str) -> None:
+    """Update the progress message every 3 seconds while the job is active."""
+    try:
+        while True:
+            st = jobs.get(job_id)
+            if not st:
+                return
+            if st["status"] not in ("running", "paused"):
+                # final render is handled by _finish
+                return
+            await _render_progress(client, job_id, force=True)
+            await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.warning(f"live updater stopped: {e}")
+
+
+# ═══════════════════════ PARALLEL BATCH PROCESSOR ═══════════════════════
+async def _process_one(msg, st, stats, lock):
+    """Process a single message and update stats safely."""
+    try:
+        result = await process_message(msg, mode="manual")
+        s = result["status"]
+        rec = result.get("record") or {}
+        async with lock:
+            stats["processed"] += 1
+            if s == "saved":
+                stats["indexed"] += 1
+                rtype = rec.get("type")
+                if rtype == "movie":
+                    stats["movies"] += 1
+                elif rtype == "series":
+                    stats["series"] += 1
+            elif s == "duplicate":
+                stats["duplicates"] += 1
+            elif s == "skipped":
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
+            st["current_message_id"] = msg.id
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"Message {getattr(msg, 'id', '?')} failed: {e}")
+        async with lock:
+            stats["processed"] += 1
+            stats["failed"] += 1
+
+
+async def _process_batch(msgs, st, stats, concurrency: int = 20):
+    """Process a batch of messages with bounded concurrency."""
+    clean = [m for m in msgs if m is not None and not getattr(m, "empty", False)]
+    if not clean:
+        return
+    sem = asyncio.Semaphore(concurrency)
+    lock = asyncio.Lock()
+
+    async def _worker(msg):
+        async with sem:
+            await _process_one(msg, st, stats, lock)
+
+    await asyncio.gather(*[_worker(m) for m in clean])
+
+
 # ═══════════════════════ JOB WORKER ═══════════════════════
 async def _run_job(client: Client, job_id: str) -> None:
     st = jobs.get(job_id)
@@ -606,7 +672,9 @@ async def _run_job(client: Client, job_id: str) -> None:
     stats = st["stats"]
     channel_id = st["channel_id"]
     start_id = st["start_message_id"]
-    BATCH = 100  # safe Telegram batch size
+    BATCH = 100         # Telegram GetMessages hard cap
+    CONCURRENCY = 20    # parallel processors
+    PREFETCH = True     # fetch next batch while processing current
 
     async def _finish(status: str):
         st["status"] = status
@@ -620,86 +688,76 @@ async def _run_job(client: Client, job_id: str) -> None:
                 "error": st.get("error"),
             })
 
+    async def _fetch(channel_id_, ids):
+        try:
+            msgs = await client.get_messages(channel_id_, message_ids=ids)
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            return msgs
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 2)
+            return await _fetch(channel_id_, ids)
+        except Exception as e:
+            logger.warning(f"Batch fetch failed: {e}")
+            return []
+
     try:
         # ── Verify bot can see the channel ──
         try:
             chat = await client.get_chat(channel_id)
             st["channel_title"] = chat.title or st.get("channel_title")
         except Exception as e:
-            st["error"] = (
-                f"Cannot access channel {channel_id}: {type(e).__name__}: {e}"
-            )
+            st["error"] = f"Cannot access channel {channel_id}: {type(e).__name__}: {e}"
             await _finish("error")
             return
 
-        # ── Iterate backward in batches of 100 using GetMessages (bot-allowed) ──
+        # ── Start live updater (every 3s) ──
+        live_task = asyncio.create_task(_live_updater(client, job_id))
+
         current = start_id
-        while current >= 1:
-            while st["status"] == "paused":
-                await asyncio.sleep(1.0)
+        pending = None
 
-            if st["status"] in ("stopped", "error"):
-                await _finish(st["status"])
-                return
+        try:
+            while current >= 1:
+                # Cooperative pause
+                while st["status"] == "paused":
+                    await asyncio.sleep(0.5)
+                if st["status"] in ("stopped", "error"):
+                    await _finish(st["status"])
+                    return
 
-            batch_ids = list(range(max(1, current - BATCH + 1), current + 1))
-            batch_ids.reverse()  # newest → oldest inside the batch
+                # Compute the current batch
+                batch_ids = list(range(max(1, current - BATCH + 1), current + 1))
+                batch_ids.reverse()
 
+                # Fetch current batch (await prefetched, or start fresh)
+                if pending is not None:
+                    msgs = await pending
+                    pending = None
+                else:
+                    msgs = await _fetch(channel_id, batch_ids)
+
+                # Kick off next batch fetch in background
+                next_current = current - BATCH
+                if PREFETCH and next_current >= 1:
+                    next_ids = list(range(max(1, next_current - BATCH + 1), next_current + 1))
+                    next_ids.reverse()
+                    pending = asyncio.create_task(_fetch(channel_id, next_ids))
+
+                # Process current batch in parallel
+                await _process_batch(msgs, st, stats, concurrency=CONCURRENCY)
+
+                current = next_current
+                if current < 1:
+                    break
+
+            await _finish("completed")
+        finally:
+            live_task.cancel()
             try:
-                msgs = await client.get_messages(channel_id, message_ids=batch_ids)
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 2)
-                continue
-            except Exception as e:
-                logger.warning(f"Batch fetch failed at {current}: {e}")
-                st["error"] = f"get_messages failed at {current}: {type(e).__name__}: {e}"
-                await _finish("error")
-                return
-
-            # `msgs` is a list of Message or None (deleted / inaccessible)
-            if not isinstance(msgs, list):
-                msgs = [msgs]
-
-            for msg in msgs:
-                if msg is None:
-                    continue
-                if getattr(msg, "empty", False):
-                    continue
-
-                st["current_message_id"] = msg.id
-                stats["processed"] += 1
-
-                try:
-                    result = await process_message(msg, mode="manual")
-                    s = result["status"]
-                    rec = result.get("record") or {}
-                    if s == "saved":
-                        stats["indexed"] += 1
-                        rtype = rec.get("type")
-                        if rtype == "movie":
-                            stats["movies"] += 1
-                        elif rtype == "series":
-                            stats["series"] += 1
-                    elif s == "duplicate":
-                        stats["duplicates"] += 1
-                    elif s == "skipped":
-                        stats["skipped"] += 1
-                    else:
-                        stats["failed"] += 1
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"Message {msg.id} failed: {e}")
-                    stats["failed"] += 1
-
-            await _render_progress(client, job_id, force=False)
-
-            # Advance to the next (older) batch
-            if current - BATCH < 1:
-                break
-            current -= BATCH
-
-        await _finish("completed")
+                await live_task
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         st["status"] = "stopped"
