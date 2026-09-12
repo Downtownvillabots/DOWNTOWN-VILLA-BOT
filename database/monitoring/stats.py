@@ -2,11 +2,11 @@ from database import db_registry
 
 class StatsRepository:
     async def get_user_count(self) -> int:
-        db = db_registry.get_core_db()
+        db = db_registry.get_user_db()
         return await db["users"].estimated_document_count()
 
     async def get_group_count(self) -> int:
-        db = db_registry.get_core_db()
+        db = db_registry.get_user_db()
         return await db["groups"].estimated_document_count()
 
     async def get_media_count(self) -> int:
