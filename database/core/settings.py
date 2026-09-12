@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from database import db_registry
 
 class SettingsRepository:
@@ -7,7 +7,7 @@ class SettingsRepository:
 
     def _get_collection(self):
         if self._collection is None:
-            db = db_registry.get_core_db()
+            db = db_registry.get_system_db()
             self._collection = db["settings"]
         return self._collection
 
