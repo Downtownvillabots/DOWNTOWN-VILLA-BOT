@@ -1,54 +1,79 @@
 import os
-from typing import List, Optional
+from typing import List, Dict
 
 class DatabaseConfig:
-    # ---------- System (Core) ----------
+    # ---------- Dynamic list readers ----------
     @staticmethod
-    def get_system_uri() -> str:
-        return os.getenv("SYSTEM_DATABASE_01", "")
+    def _read_list(prefix: str, name_prefix: str) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
+        i = 1
+        while True:
+            uri = os.getenv(f"{prefix}_{i:02d}") or os.getenv(f"{prefix}_{i}")
+            if not uri:
+                break
+            name = (
+                os.getenv(f"{name_prefix}_{i:02d}")
+                or os.getenv(f"{name_prefix}_{i}")
+                or f"{prefix}-{i:02d}"
+            )
+            items.append({"uri": uri.strip(), "label": name.strip(), "index": i})
+            i += 1
+        return items
 
+    # ---------- SYSTEM ----------
+    @staticmethod
+    def get_system_databases() -> List[Dict[str, str]]:
+        items = DatabaseConfig._read_list("SYSTEM_DATABASE", "SYSTEM_DATABASE_NAME")
+        if items:
+            return items
+        legacy = os.getenv("DATABASE_URI", "")
+        if legacy:
+            return [{
+                "uri": legacy.strip(),
+                "label": os.getenv("SYSTEM_DATABASE_NAME_01", "SYSTEM-01"),
+                "index": 1,
+            }]
+        return []
+
+    # ---------- USER ----------
+    @staticmethod
+    def get_user_databases() -> List[Dict[str, str]]:
+        items = DatabaseConfig._read_list("USER_DATABASE", "USER_DATABASE_NAME")
+        if items:
+            return items
+        sysdbs = DatabaseConfig.get_system_databases()
+        if sysdbs:
+            return [{
+                "uri": sysdbs[0]["uri"],
+                "label": "USERS-01",
+                "index": 1,
+            }]
+        return []
+
+    # ---------- MEDIA ----------
+    @staticmethod
+    def get_media_databases() -> List[Dict[str, str]]:
+        items = DatabaseConfig._read_list("MEDIA_DATABASE", "MEDIA_DATABASE_NAME")
+        if items:
+            return items
+        userdbs = DatabaseConfig.get_user_databases()
+        if userdbs:
+            return [{
+                "uri": userdbs[0]["uri"],
+                "label": "MEDIA-01",
+                "index": 1,
+            }]
+        return []
+
+    # ---------- Database names inside MongoDB ----------
     @staticmethod
     def get_system_db_name() -> str:
-        return os.getenv("SYSTEM_DATABASE_NAME", "downtown_villa_system")
-
-    # ---------- User ----------
-    @staticmethod
-    def get_user_uri() -> Optional[str]:
-        return os.getenv("USER_DATABASE_01") or DatabaseConfig.get_system_uri()
+        return os.getenv("SYSTEM_DATABASE_DB", "downtown_villa_system")
 
     @staticmethod
     def get_user_db_name() -> str:
-        return os.getenv("USER_DATABASE_NAME", "downtown_villa_user")
-
-    # ---------- Catalog (optional) ----------
-    @staticmethod
-    def get_catalog_uri() -> Optional[str]:
-        return os.getenv("CATALOG_DATABASE_01") or DatabaseConfig.get_user_uri()
-
-    @staticmethod
-    def get_catalog_db_name() -> str:
-        return os.getenv("CATALOG_DATABASE_NAME", "downtown_villa_catalog")
-
-    # ---------- Media Pool ----------
-    @staticmethod
-    def get_media_uris() -> List[str]:
-        uris = []
-        multi = os.getenv("MEDIA_DATABASE_URIS")
-        if multi:
-            uris.extend([u.strip() for u in multi.split(",") if u.strip()])
-        i = 1
-        while True:
-            uri = os.getenv(f"MEDIA_DATABASE_{i:02d}") or os.getenv(f"MEDIA_DATABASE_{i}")
-            if not uri:
-                break
-            uris.append(uri.strip())
-            i += 1
-        if not uris:
-            fallback = DatabaseConfig.get_user_uri()
-            if fallback:
-                uris.append(fallback)
-        return uris
+        return os.getenv("USER_DATABASE_DB", "downtown_villa_user")
 
     @staticmethod
     def get_media_db_name() -> str:
-        return os.getenv("MEDIA_DATABASE_NAME", "downtown_villa_media")
+        return os.getenv("MEDIA_DATABASE_DB", "downtown_villa_media")
