@@ -123,6 +123,20 @@ async def cb_pick(client: Client, q: CallbackQuery):
         try: await q.answer("❌", show_alert=True)
         except Exception: pass
 
+@Client.on_callback_query(filters.regex(r"^fl:([a-f0-9]+):(\w+)$"))
+async def cb_fl(client: Client, q: CallbackQuery):
+    """User clicked a file button (new simplified flow)."""
+    try:
+        sid = q.matches[0].group(1)
+        idx = q.matches[0].group(2)
+        await _h()._pick_file_by_index(client, q, sid, idx)
+    except Exception as e:
+        logger.exception(f"[CB] fl failed: {e}")
+        try:
+            await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
+
 
 @Client.on_callback_query(filters.regex(r"^sr:lang:([a-f0-9]+):(\d+)$"))
 async def cb_lang(client: Client, q: CallbackQuery):
