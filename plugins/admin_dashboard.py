@@ -19,6 +19,8 @@ from database import db_registry
 
 logger = logging.getLogger(__name__)
 
+logger.info("[ADMIN-DASHBOARD] plugin loaded")
+
 # ═══════════════════════ FANCY FONTS ═══════════════════════
 _M_BOLD = {
     **{chr(ord('A') + i): "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"[i] for i in range(26)},
@@ -1065,6 +1067,7 @@ async def build_view(view: str, extra: Dict[str, Any]):
 # ═══════════════════════ HANDLERS ═══════════════════════
 @Client.on_message(filters.command("database") & filters.private)
 async def cmd_database(client: Client, msg: Message):
+    logger.info(f"[ADMIN] /database from={msg.from_user.id} is_admin={is_admin(msg.from_user.id)}")
     if not is_admin(msg.from_user.id):
         await msg.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ."); return
     m = await msg.reply_text("🔄 ʟᴏᴀᴅɪɴɢ ᴅᴀᴛᴀʙᴀꜱᴇ ᴄᴏɴᴛʀᴏʟ ᴄᴇɴᴛᴇʀ...")
