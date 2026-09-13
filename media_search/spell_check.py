@@ -12,7 +12,7 @@ from core.config import (
 from media_search.engine import engine
 from media_search.metadata import metadata_provider
 from media_search.normalizer import normalize
-from services import imdb as imdb_service
+from services import metadata as imdb_service  # unified provider chain
 
 logger = logging.getLogger(__name__)
 
