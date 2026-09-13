@@ -618,7 +618,8 @@ async def cb_buttons_add(client: Client, q: CallbackQuery):
 
     # Create session
     token = await session_manager.start(
-        q.from_user.id, chat_id, "add_button", {"chat_id": chat_id}
+        q.from_user.id, chat_id, "ACTION_NAME", {"chat_id": chat_id},
+    prompt_msg_id=q.message.id,
     )
     if not token:
         await q.answer("❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ", show_alert=True)
@@ -711,7 +712,7 @@ async def cb_buttons_edit_name(client: Client, q: CallbackQuery):
 
     token = await session_manager.start(
         q.from_user.id, chat_id, "edit_button_name",
-        {"chat_id": chat_id, "btn_id": btn_id},
+        {"chat_id": chat_id, "btn_id": btn_id}, prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "✏️ <b>" + fb("CHANGE BUTTON NAME") + "</b>",
@@ -735,7 +736,7 @@ async def cb_buttons_edit_url(client: Client, q: CallbackQuery):
 
     token = await session_manager.start(
         q.from_user.id, chat_id, "edit_button_url",
-        {"chat_id": chat_id, "btn_id": btn_id},
+        {"chat_id": chat_id, "btn_id": btn_id}, prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "🔗 <b>" + fb("CHANGE BUTTON LINK") + "</b>",
@@ -1026,7 +1027,7 @@ async def cb_captions_set(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_caption", {"chat_id": chat_id}
+        q.from_user.id, chat_id, "set_caption", {"chat_id": chat_id} prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "✏️ <b>" + fb("SET CAPTION") + "</b>",
@@ -1152,7 +1153,7 @@ async def cb_links_set_movie(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_movie_link", {"chat_id": chat_id}
+        q.from_user.id, chat_id, "set_movie_link", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "🎬 <b>" + fb("SET MOVIE GROUP") + "</b>",
@@ -1174,7 +1175,7 @@ async def cb_links_set_series(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_series_link", {"chat_id": chat_id}
+        q.from_user.id, chat_id, "set_series_link", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "📺 <b>" + fb("SET SERIES GROUP") + "</b>",
@@ -1340,7 +1341,7 @@ async def cb_fsub_add(client: Client, q: CallbackQuery):
     if not await permission_manager.can_manage(client, chat_id, q.from_user.id):
         await q.answer("⛔", show_alert=True); return
     token = await session_manager.start(
-        q.from_user.id, chat_id, "fsub_add", {"chat_id": chat_id}
+        q.from_user.id, chat_id, "fsub_add", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "➕ <b>" + fb("ADD FORCE SUB CHANNEL") + "</b>",
