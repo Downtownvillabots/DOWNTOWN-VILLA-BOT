@@ -132,7 +132,8 @@ async def _show_connected_groups(client: Client, target, user_id: int):
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data=make(NS.MAIN, "close"))
         ]])
-        await _edit(target, text, kb)
+        await target.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True)
         return
 
     rows: List[List[InlineKeyboardButton]] = []
@@ -156,7 +157,9 @@ async def _show_connected_groups(client: Client, target, user_id: int):
         "",
         "⚠️ ꜱᴇʟᴇᴄᴛ ᴛʜᴇ ɢʀᴏᴜᴘ ᴡʜᴏꜱᴇ ꜱᴇᴛᴛɪɴɢꜱ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ᴄʜᴀɴɢᴇ.",
     ])
-    await _edit(target, text, InlineKeyboardMarkup(rows))
+    await target.reply_text(text, reply_markup=InlineKeyboardMarkup(rows),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True)
 
 
 # ═══════════════════════ /reload COMMAND ═══════════════════════
@@ -1760,6 +1763,8 @@ async def cmd_groupsettings(client: Client, message: Message):
     """Owner-only command to manage ALL registered groups from PM."""
     if not message.from_user:
         return
+    logger.info(f"[GADMIN] /groupsettings from={message.from_user.id} "
+                f"is_owner={permission_manager.is_bot_owner(message.from_user.id)}")
     if not permission_manager.is_bot_owner(message.from_user.id):
         await message.reply_text(
             "⛔ ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ɪꜱ ꜰᴏʀ ᴛʜᴇ ʙᴏᴛ ᴏᴡɴᴇʀ ᴏɴʟʏ.",
@@ -1776,8 +1781,13 @@ async def _render_owner_group_list(target):
         groups = await config_manager.list_groups(0, 10)
     except Exception as e:
         logger.exception(f"[GADMIN] owner list fetch failed: {e}")
-        await target.reply_text(f"⚠️ ꜰᴀɪʟᴇᴅ ᴛᴏ ʟᴏᴀᴅ ɢʀᴏᴜᴘꜱ: <code>{e}</code>",
-                                parse_mode=ParseMode.HTML)
+        try:
+            await target.reply_text(
+                f"⚠️ ꜰᴀɪʟᴇᴅ ᴛᴏ ʟᴏᴀᴅ ɢʀᴏᴜᴘꜱ: <code>{e}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     rows: List[List[InlineKeyboardButton]] = []
@@ -1810,7 +1820,6 @@ async def _render_owner_group_list(target):
         "ꜱᴇʟᴇᴄᴛ ᴀ ɢʀᴏᴜᴘ ᴛᴏ ᴍᴀɴᴀɢᴇ:",
     ])
 
-    # Only use reply_text — this is a NEW message from a user command
     try:
         await target.reply_text(
             text,
@@ -1862,14 +1871,17 @@ async def cb_owner_refresh(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════ TEXT HANDLERS (REPLY-ONLY) ═══════════════════════
-@Client.on_message(filters.private & filters.text & ~filters.command([
-    "start", "settings", "reload", "database", "index", "pm_search",
-    "autofilter", "stats", "groupsettings", "request", "s",
-]))
+@Client.on_message(
+    filters.private & filters.text & ~filters.command([
+        "start", "settings", "reload", "database", "index", "pm_search",
+        "autofilter", "stats", "groupsettings", "request", "s",
+    ]),
+    group=-50,   # runs BEFORE auto_filter so replies don't leak into search
+)
 async def session_text_handler(client: Client, message: Message):
     """
     Handle text input for active sessions.
-    Requires user to REPLY to the bot's prompt.
+    Requires the user to REPLY to the bot's prompt.
     """
     if not message.from_user or not message.text:
         return
@@ -1908,6 +1920,9 @@ async def session_text_handler(client: Client, message: Message):
 
     if not session:
         return
+
+    # ── We have an active session bound to this reply — consume the message ──
+    message.stop_propagation()
 
     action = session.get("action")
     chat_id = session.get("chat_id")
@@ -1968,9 +1983,9 @@ async def session_text_handler(client: Client, message: Message):
         if not btn_id:
             await session_manager.cancel(token)
             return
-        ok = await button_manager.edit_button(chat_id, btn_id, new_name=text)
+        ok2 = await button_manager.edit_button(chat_id, btn_id, new_name=text)
         await session_manager.cancel(token)
-        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
+        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
     # ── EDIT BUTTON URL ──
@@ -1982,9 +1997,9 @@ async def session_text_handler(client: Client, message: Message):
         if not (text.startswith("http://") or text.startswith("https://") or text.startswith("tg://")):
             await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ.")
             return
-        ok = await button_manager.edit_button(chat_id, btn_id, new_url=text)
+        ok2 = await button_manager.edit_button(chat_id, btn_id, new_url=text)
         await session_manager.cancel(token)
-        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
+        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
     # ── SET CAPTION ──
@@ -1992,26 +2007,26 @@ async def session_text_handler(client: Client, message: Message):
         if len(text) < 3:
             await message.reply_text("❌ ᴄᴀᴘᴛɪᴏɴ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
             return
-        ok = await caption_manager.set_caption(chat_id, text)
+        ok2 = await caption_manager.set_caption(chat_id, text)
         await session_manager.cancel(token)
-        await message.reply_text("✅ ᴄᴀᴘᴛɪᴏɴ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
+        await message.reply_text("✅ ᴄᴀᴘᴛɪᴏɴ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
     # ── SET MOVIE LINK ──
     if action == "set_movie_link":
-        ok = await link_manager.set_movie_link(chat_id, text)
+        ok2 = await link_manager.set_movie_link(chat_id, text)
         await session_manager.cancel(token)
         await message.reply_text(
-            "✅ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
+            "✅ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
         )
         return
 
     # ── SET SERIES LINK ──
     if action == "set_series_link":
-        ok = await link_manager.set_series_link(chat_id, text)
+        ok2 = await link_manager.set_series_link(chat_id, text)
         await session_manager.cancel(token)
         await message.reply_text(
-            "✅ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
+            "✅ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
         )
         return
 
@@ -2020,8 +2035,8 @@ async def session_text_handler(client: Client, message: Message):
         target = None
         if text.startswith("@"):
             try:
-                chat = await client.get_chat(text)
-                target = chat.id
+                chat_obj = await client.get_chat(text)
+                target = chat_obj.id
             except Exception:
                 await message.reply_text("❌ ᴄᴀɴɴᴏᴛ ʀᴇꜱᴏʟᴠᴇ ᴛʜᴀᴛ ᴜꜱᴇʀɴᴀᴍᴇ.")
                 return
