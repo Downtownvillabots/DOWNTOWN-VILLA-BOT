@@ -3,26 +3,12 @@
 🏨 DOWNTOWN VILLA — GROUP ADMIN CONTROL CENTER
 ==============================================
 Handles /settings and /reload in groups and PM.
-All group-config UI lives here:
-  - Content mode
-  - Search & filter
-  - Result buttons (add/edit/remove/reorder/preview)
-  - File caption (set/preview/variables)
-  - IMDb / metadata
-  - Force subscribe
-  - Verification
-  - Security
-  - Welcome
-  - Auto-delete
-  - Request system
-  - Group links
-  - Statistics
-  - View all
-  - Reset group
+All group-config UI lives here.
 """
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
@@ -93,14 +79,6 @@ async def _edit(target, text: str, kb: Optional[InlineKeyboardMarkup] = None):
         logger.warning(f"[GADMIN] edit failed: {type(e).__name__}: {e}")
 
 
-def _back_kb(target_ns: str = NS.MAIN, token: str = "") -> InlineKeyboardMarkup:
-    back_data = make(target_ns, "open", token) if token else make(NS.MAIN, "open")
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️ BACK", callback_data=back_data),
-        InlineKeyboardButton("❌ CLOSE", callback_data=make(NS.MAIN, "close")),
-    ]])
-
-
 # ═══════════════════════ /settings COMMAND ═══════════════════════
 @Client.on_message(filters.command("settings"))
 async def cmd_settings(client: Client, message: Message):
@@ -111,7 +89,6 @@ async def cmd_settings(client: Client, message: Message):
 
     # ── In a group: ask where to open ──
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        # Permission check
         ok = await permission_manager.can_manage(client, chat.id, user_id)
         if not ok:
             await message.reply_text(
@@ -121,12 +98,9 @@ async def cmd_settings(client: Client, message: Message):
             )
             return
 
-        # Register user↔group connection so PM access works
         await config_manager.connect_user_group(user_id, chat.id)
-        # Also ensure group is registered in DB
         await config_manager.register_group(chat.id, chat.title or "Group", chat.username)
 
-        # Ask where to open
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("👤 OPEN IN PRIVATE CHAT",
                                    callback_data=make(NS.OWNER, "pm_open", str(chat.id)))],
@@ -146,7 +120,6 @@ async def cmd_settings(client: Client, message: Message):
 
 
 async def _show_connected_groups(client: Client, target, user_id: int):
-    """List all groups a user can manage. Only in PM."""
     group_ids = await config_manager.get_connected_groups(user_id)
     if not group_ids:
         text = (
@@ -392,7 +365,6 @@ async def cb_content_open(client: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^gs:content:set:(-?\d+):(movies|series|both)$"))
 async def cb_content_set(client: Client, q: CallbackQuery):
     parts = q.data.split(":")
-    # gs : content : set : chat_id : mode
     chat_id = int(parts[3])
     mode = parts[4]
 
@@ -500,7 +472,7 @@ async def cb_search_rpp_menu(client: Client, q: CallbackQuery):
 
     options = [5, 10, 15, 20]
     rows = [[InlineKeyboardButton(
-        f"{'✅ ' if o == cur else ''}{o}", 
+        f"{'✅ ' if o == cur else ''}{o}",
         callback_data=make(NS.SEARCH, "set_rpp", f"{chat_id}:{o}")
     )] for o in options]
     rows.append([InlineKeyboardButton("◀️ BACK",
@@ -608,7 +580,6 @@ async def cb_buttons_open(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-# ── ADD BUTTON (multi-step) ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:add:(-?\d+)$"))
 async def cb_buttons_add(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -616,10 +587,10 @@ async def cb_buttons_add(client: Client, q: CallbackQuery):
     if not await permission_manager.can_manage(client, chat_id, q.from_user.id):
         await q.answer("⛔", show_alert=True); return
 
-    # Create session
     token = await session_manager.start(
-        q.from_user.id, chat_id, "ACTION_NAME", {"chat_id": chat_id},
-    prompt_msg_id=q.message.id,
+        q.from_user.id, chat_id, "add_button",
+        {"chat_id": chat_id},
+        prompt_msg_id=q.message.id,
     )
     if not token:
         await q.answer("❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ", show_alert=True)
@@ -630,7 +601,7 @@ async def cb_buttons_add(client: Client, q: CallbackQuery):
         DIV, "",
         "ꜱᴛᴇᴘ <b>1/2</b>",
         "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ɴᴀᴍᴇ ɪɴ ᴛʜɪꜱ ᴄʜᴀᴛ.",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ɴᴀᴍᴇ.",
         "",
         f"<i>ᴇxᴀᴍᴘʟᴇ: 📥 ꜱʜᴀʀᴇ ꜰɪʟᴇ</i>",
     ])
@@ -641,7 +612,6 @@ async def cb_buttons_add(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-# ── EDIT PICK ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:edit_pick:(-?\d+)$"))
 async def cb_buttons_edit_pick(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -712,12 +682,13 @@ async def cb_buttons_edit_name(client: Client, q: CallbackQuery):
 
     token = await session_manager.start(
         q.from_user.id, chat_id, "edit_button_name",
-        {"chat_id": chat_id, "btn_id": btn_id}, prompt_msg_id=q.message.id,
+        {"chat_id": chat_id, "btn_id": btn_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "✏️ <b>" + fb("CHANGE BUTTON NAME") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ɴᴇᴡ ɴᴀᴍᴇ:",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ɴᴇᴡ ɴᴀᴍᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.BUTTONS, "cancel", token))],
@@ -736,12 +707,13 @@ async def cb_buttons_edit_url(client: Client, q: CallbackQuery):
 
     token = await session_manager.start(
         q.from_user.id, chat_id, "edit_button_url",
-        {"chat_id": chat_id, "btn_id": btn_id}, prompt_msg_id=q.message.id,
+        {"chat_id": chat_id, "btn_id": btn_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "🔗 <b>" + fb("CHANGE BUTTON LINK") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ɴᴇᴡ ᴜʀʟ (ᴍᴜꜱᴛ ꜱᴛᴀʀᴛ ᴡɪᴛʜ http/https):",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ɴᴇᴡ ᴜʀʟ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.BUTTONS, "cancel", token))],
@@ -764,7 +736,6 @@ async def cb_buttons_edit_toggle(client: Client, q: CallbackQuery):
     await cb_buttons_edit_pick_btn(client, q)
 
 
-# ── REMOVE PICK ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:remove_pick:(-?\d+)$"))
 async def cb_buttons_remove_pick(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -830,7 +801,6 @@ async def cb_buttons_remove_confirm(client: Client, q: CallbackQuery):
     await cb_buttons_open(client, q)
 
 
-# ── REORDER ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:reorder:(-?\d+)$"))
 async def cb_buttons_reorder(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -903,7 +873,6 @@ async def cb_buttons_move_do(client: Client, q: CallbackQuery):
     await cb_buttons_reorder(client, q)
 
 
-# ── PREVIEW ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:preview:(-?\d+)$"))
 async def cb_buttons_preview(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -933,7 +902,6 @@ async def cb_buttons_preview(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-# ── RESET CONFIRM ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:reset_confirm:(-?\d+)$"))
 async def cb_buttons_reset_confirm(client: Client, q: CallbackQuery):
     _, _, cid = parse(q.data)
@@ -967,7 +935,6 @@ async def cb_buttons_reset_do(client: Client, q: CallbackQuery):
     await cb_buttons_open(client, q)
 
 
-# ── CANCEL SESSION ──
 @Client.on_callback_query(filters.regex(r"^gs:buttons:cancel:(\w+)$"))
 async def cb_buttons_cancel(client: Client, q: CallbackQuery):
     _, _, token = parse(q.data)
@@ -1027,12 +994,14 @@ async def cb_captions_set(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_caption", {"chat_id": chat_id} prompt_msg_id=q.message.id,
+        q.from_user.id, chat_id, "set_caption",
+        {"chat_id": chat_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "✏️ <b>" + fb("SET CAPTION") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ʏᴏᴜʀ ᴄᴀᴘᴛɪᴏɴ ᴛᴇᴍᴘʟᴀᴛᴇ.",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ʏᴏᴜʀ ᴄᴀᴘᴛɪᴏɴ ᴛᴇᴍᴘʟᴀᴛᴇ.",
         "",
         "<i>ᴜꜱᴇ ᴠᴀʀɪᴀʙʟᴇꜱ ʟɪᴋᴇ {ᴛɪᴛʟᴇ}, {Qᴜᴀʟɪᴛʏ} ᴇᴛᴄ.</i>",
     ])
@@ -1153,12 +1122,14 @@ async def cb_links_set_movie(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_movie_link", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
+        q.from_user.id, chat_id, "set_movie_link",
+        {"chat_id": chat_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "🎬 <b>" + fb("SET MOVIE GROUP") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ (ᴍᴜꜱᴛ ꜱᴛᴀʀᴛ ᴡɪᴛʜ http/https):",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.LINKS, "cancel", token))],
@@ -1175,12 +1146,14 @@ async def cb_links_set_series(client: Client, q: CallbackQuery):
         await q.answer("⛔", show_alert=True); return
 
     token = await session_manager.start(
-        q.from_user.id, chat_id, "set_series_link", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
+        q.from_user.id, chat_id, "set_series_link",
+        {"chat_id": chat_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "📺 <b>" + fb("SET SERIES GROUP") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ:",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.LINKS, "cancel", token))],
@@ -1341,12 +1314,14 @@ async def cb_fsub_add(client: Client, q: CallbackQuery):
     if not await permission_manager.can_manage(client, chat_id, q.from_user.id):
         await q.answer("⛔", show_alert=True); return
     token = await session_manager.start(
-        q.from_user.id, chat_id, "fsub_add", {"chat_id": chat_id}, prompt_msg_id=q.message.id,
+        q.from_user.id, chat_id, "fsub_add",
+        {"chat_id": chat_id},
+        prompt_msg_id=q.message.id,
     )
     text = "\n".join([
         "➕ <b>" + fb("ADD FORCE SUB CHANNEL") + "</b>",
         DIV, "",
-        "ꜱᴇɴᴅ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ ɪᴅ (ʟɪᴋᴇ <code>-100xxxxxxxxxx</code>) ᴏʀ ᴜꜱᴇʀɴᴀᴍᴇ (ʟɪᴋᴇ <code>@channel</code>).",
+        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ ɪᴅ ᴏʀ @ᴜꜱᴇʀɴᴀᴍᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.FSUB, "cancel", token))],
@@ -1781,20 +1756,131 @@ async def cb_reset_do(client: Client, q: CallbackQuery):
     await _edit(q, text, kb)
 
 
-# ═══════════════════════ TEXT HANDLERS ═══════════════════════
+# ═══════════════════════ /groupsettings (OWNER) ═══════════════════════
+@Client.on_message(filters.command("groupsettings") & filters.private)
+async def cmd_groupsettings(client: Client, message: Message):
+    """Owner-only command to manage ALL registered groups from PM."""
+    if not message.from_user:
+        return
+    if not permission_manager.is_bot_owner(message.from_user.id):
+        await message.reply_text(
+            "⛔ ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ɪꜱ ꜰᴏʀ ᴛʜᴇ ʙᴏᴛ ᴏᴡɴᴇʀ ᴏɴʟʏ.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await _render_owner_group_list(message)
+
+
+async def _render_owner_group_list(target):
+    total = await config_manager.count_groups()
+    groups = await config_manager.list_groups(0, 10)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for g in groups:
+        gid = g.get("chat_id")
+        title = (g.get("title") or str(gid))[:40]
+        status = "🟢" if g.get("enabled", True) else "🔴"
+        rows.append([InlineKeyboardButton(
+            f"{status} {title.upper()}",
+            callback_data=make(NS.MAIN, "open", str(gid)),
+        )])
+
+    rows.append([
+        InlineKeyboardButton("➕ ADD GROUP",
+                              callback_data=make(NS.ADD, "start", "0")),
+    ])
+    rows.append([
+        InlineKeyboardButton("🔄 REFRESH",
+                              callback_data=make(NS.OWNER, "refresh", "0")),
+        InlineKeyboardButton("❌ CLOSE",
+                              callback_data=make(NS.MAIN, "close")),
+    ])
+
+    text = "\n".join([
+        "⚙️ <b>" + fb("GROUP MANAGEMENT") + "</b>",
+        DIV, "",
+        f"📊 ʀᴇɢɪꜱᴛᴇʀᴇᴅ ɢʀᴏᴜᴘꜱ · <b>{total}</b>",
+        "",
+        DIV_S,
+        "ꜱᴇʟᴇᴄᴛ ᴀ ɢʀᴏᴜᴘ ᴛᴏ ᴍᴀɴᴀɢᴇ:",
+    ])
+    try:
+        await target.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await _edit(target, text, InlineKeyboardMarkup(rows))
+
+
+@Client.on_callback_query(filters.regex(r"^gs:owner:refresh:(\d+)$"))
+async def cb_owner_refresh(client: Client, q: CallbackQuery):
+    if not permission_manager.is_bot_owner(q.from_user.id):
+        await q.answer("⛔", show_alert=True); return
+
+    total = await config_manager.count_groups()
+    groups = await config_manager.list_groups(0, 10)
+    rows: List[List[InlineKeyboardButton]] = []
+    for g in groups:
+        gid = g.get("chat_id")
+        title = (g.get("title") or str(gid))[:40]
+        status = "🟢" if g.get("enabled", True) else "🔴"
+        rows.append([InlineKeyboardButton(
+            f"{status} {title.upper()}",
+            callback_data=make(NS.MAIN, "open", str(gid)),
+        )])
+    rows.append([
+        InlineKeyboardButton("➕ ADD GROUP",
+                              callback_data=make(NS.ADD, "start", "0")),
+    ])
+    rows.append([
+        InlineKeyboardButton("🔄 REFRESH",
+                              callback_data=make(NS.OWNER, "refresh", "0")),
+        InlineKeyboardButton("❌ CLOSE",
+                              callback_data=make(NS.MAIN, "close")),
+    ])
+    text = "\n".join([
+        "⚙️ <b>" + fb("GROUP MANAGEMENT") + "</b>",
+        DIV, "",
+        f"📊 ʀᴇɢɪꜱᴛᴇʀᴇᴅ ɢʀᴏᴜᴘꜱ · <b>{total}</b>",
+        "",
+        DIV_S,
+        "ꜱᴇʟᴇᴄᴛ ᴀ ɢʀᴏᴜᴘ ᴛᴏ ᴍᴀɴᴀɢᴇ:",
+    ])
+    await _edit(q, text, InlineKeyboardMarkup(rows))
+    await q.answer("🔄 ʀᴇꜰʀᴇꜱʜᴇᴅ")
+
+
+# ═══════════════════════ TEXT HANDLERS (REPLY-ONLY) ═══════════════════════
 @Client.on_message(filters.private & filters.text & ~filters.command([
     "start", "settings", "reload", "database", "index", "pm_search",
     "autofilter", "stats", "groupsettings", "request", "s",
 ]))
 async def session_text_handler(client: Client, message: Message):
-    """Handle text input for active sessions (add button, set caption, etc.)."""
+    """
+    Handle text input for active sessions.
+
+    RULES:
+    - User MUST reply to the bot's prompt message.
+    - Only that exact prompt message is accepted.
+    - Any non-reply text is ignored.
+    """
     if not message.from_user or not message.text:
         return
 
-    # Check for active session
+    # ── Require reply to bot ──
+    if not message.reply_to_message:
+        return
+    if not message.reply_to_message.from_user:
+        return
+    if not message.reply_to_message.from_user.is_self:
+        return
+
     uid = message.from_user.id
-    # Look up most recent session for this user in MongoDB
-    db = None
+    reply_id = message.reply_to_message.id
+
+    # ── Fetch the session bound to this prompt ──
     try:
         from database import db_registry
         db = db_registry.get_system_db()
@@ -1803,25 +1889,28 @@ async def session_text_handler(client: Client, message: Message):
     if db is None:
         return
 
-    import time
     session = None
     try:
         session = await db["group_sessions"].find_one(
-            {"user_id": uid, "expires_at": {"$gt": time.time()}},
+            {
+                "user_id": uid,
+                "expires_at": {"$gt": time.time()},
+                "prompt_msg_id": reply_id,
+            },
             sort=[("created_at", -1)],
         )
     except Exception:
         return
 
     if not session:
-        return  # No active session; let other handlers work
+        return
 
     action = session.get("action")
     chat_id = session.get("chat_id")
     token = session.get("token")
     payload = session.get("payload", {}) or {}
 
-    # Verify user still has permission
+    # ── Permission re-check ──
     ok = await permission_manager.can_manage(client, chat_id, uid)
     if not ok:
         await session_manager.cancel(token)
@@ -1830,22 +1919,29 @@ async def session_text_handler(client: Client, message: Message):
 
     text = message.text.strip()
 
-    # ── ADD BUTTON: step 1 → name, step 2 → url ──
+    # ── ADD BUTTON (2 steps) ──
     if action == "add_button":
         step = session.get("step", 1)
         if step == 1:
-            if len(text) < 1 or len(text) > 60:
+            if not (1 <= len(text) <= 60):
                 await message.reply_text("❌ ɴᴀᴍᴇ ᴍᴜꜱᴛ ʙᴇ 1-60 ᴄʜᴀʀꜱ.")
                 return
             await session_manager.advance(token, {"name": text})
-            await message.reply_text(
+            prompt = await message.reply_text(
                 f"➕ <b>ꜱᴛᴇᴘ 2/2</b>\n\n"
                 f"ɴᴀᴍᴇ · <b>{text}</b>\n\n"
-                f"ɴᴏᴡ ꜱᴇɴᴅ ᴛʜᴇ ᴜʀʟ (ʜᴛᴛᴘ/ʜᴛᴛᴘꜱ/ᴛɢ):",
+                f"📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴜʀʟ.",
                 parse_mode=ParseMode.HTML,
             )
+            try:
+                await db["group_sessions"].update_one(
+                    {"token": token},
+                    {"$set": {"prompt_msg_id": prompt.id}},
+                )
+            except Exception:
+                pass
             return
-        # step 2 → url
+
         url = text
         if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
             await message.reply_text("❌ ᴜʀʟ ᴍᴜꜱᴛ ꜱᴛᴀʀᴛ ᴡɪᴛʜ http:// ᴏʀ https:// ᴏʀ tg://")
@@ -1918,7 +2014,6 @@ async def session_text_handler(client: Client, message: Message):
 
     # ── FSUB ADD CHANNEL ──
     if action == "fsub_add":
-        # Accept @username or -100xxxxxxxxxx
         target = None
         if text.startswith("@"):
             try:
@@ -1946,7 +2041,7 @@ async def session_text_handler(client: Client, message: Message):
                                  parse_mode=ParseMode.HTML)
         return
 
-    # Unknown action
+    # ── Fallback ──
     await session_manager.cancel(token)
 
 
