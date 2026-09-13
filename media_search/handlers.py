@@ -682,13 +682,8 @@ async def _pick_quality(client: Client, q: CallbackQuery, sid: str, idx: int):
 
 
 # ═══════════════════════ FILES ═══════════════════════
-async def _show_files(target, sid: str):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    hits = await _filter_hits(session)
-    hits = ranker.rank(hits)
-
+def _dedupe_sorted_asc(hits: List[FileHit]) -> List[FileHit]:
+    """Dedupe by file_unique_id, sort ascending by size (small → big)."""
     seen = set()
     uniq: List[FileHit] = []
     for h in hits:
@@ -697,32 +692,100 @@ async def _show_files(target, sid: str):
             continue
         seen.add(k)
         uniq.append(h)
+    # Sort small → big (None sizes go to the end)
+    uniq.sort(key=lambda h: (h.file_size is None, h.file_size or 0))
+    return uniq
 
+
+def _quality_summary(hits: List[FileHit]) -> str:
+    """Comma-joined list of unique qualities, sorted by resolution order."""
+    order = ["2160P", "1440P", "1080P", "1080I", "720P", "576P", "480P", "360P"]
+    quals = {(h.quality or "").upper() for h in hits if h.quality}
+    return ", ".join([q for q in order if q in quals]) or "—"
+
+
+def _codec_summary(hits: List[FileHit]) -> str:
+    order = ["AV1", "HEVC", "H264", "VP9", "VP8", "MPEG4", "MPEG2"]
+    codecs = {(h.codec or "").upper() for h in hits if h.codec}
+    return ", ".join([c for c in order if c in codecs]) or "—"
+
+
+def _audio_summary(hits: List[FileHit]) -> str:
+    langs = sorted({l for h in hits for l in (h.audio_languages or [])})
+    return ", ".join(langs) if langs else "—"
+
+
+def _subtitle_summary(hits: List[FileHit]) -> str:
+    subs = sorted({s for h in hits for s in (h.subtitle_languages or [])})
+    if subs:
+        return ", ".join(subs)
+    if any(h.has_subtitle for h in hits):
+        return "YES"
+    return "—"
+
+
+async def _show_files(target, sid: str):
+    session = await sessions.get(sid)
+    if not session:
+        return
+    hits = await _filter_hits(session)
+    uniq = _dedupe_sorted_asc(hits)
     if not uniq:
         await _edit(target, "❌ ɴᴏ ʀᴇʟᴇᴀꜱᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇʟᴇᴄᴛɪᴏɴ.")
         return
 
+    # Show only first 10 in buttons (smallest 10)
+    display = uniq[:10]
+
     rows: List[List[InlineKeyboardButton]] = []
-    for i, h in enumerate(uniq[:10]):
+    for i, h in enumerate(display):
+        size = _human_size(h.file_size)
         codec = (h.codec or "?").upper()
-        label = f"📦 {_human_size(h.file_size)} • {codec}"
+        audio = (h.audio_languages or [])
+        audio_txt = audio[0][:3].upper() if audio else "—"
+        # Label like: "📦 1.40 GB · HEVC · ENG"
+        label = f"📦 {size} · {codec} · {audio_txt}"
         rows.append([InlineKeyboardButton(
-            label, callback_data=f"sr:file:{sid}:{i}",
+            label,
+            callback_data=f"sr:file:{sid}:{i}",
         )])
+
+    if len(uniq) > 10:
+        rows.append([InlineKeyboardButton(
+            f"➕ {len(uniq) - 10} MORE RELEASES",
+            callback_data=f"sr:q_back:{sid}",  # user can adjust filters
+        )])
+
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{sid}")])
     rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
 
-    lines = ["🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>"]
-    lines.append(f"🎬 <b>{_display_title(session.selected_title, session.selected_year)}</b>")
+    # ── Build header with full metadata ──
+    title = session.selected_title or "?"
+    year = session.selected_year
+    title_line = f"🎬 <b>{_display_title(title, year)}</b>"
     if session.selected_season and session.selected_episode:
-        lines.append(f"🎞️ S{session.selected_season:02d}E{session.selected_episode:02d}")
-    lines.append(f"🌐 ʟᴀɴɢᴜᴀɢᴇ: <code>{session.selected_language or '—'}</code>")
-    lines.append(f"🎞️ Qᴜᴀʟɪᴛʏ: <code>{session.selected_quality or '—'}</code>")
-    lines.append(f"📦 ʀᴇʟᴇᴀꜱᴇꜱ: <code>{len(uniq)}</code>")
-    lines.append(DIV)
-    lines.append("")
-    lines.append("ᴘɪᴄᴋ ᴀ ʀᴇʟᴇᴀꜱᴇ:")
+        title_line = (
+            f"📺 <b>{_display_title(title, year)}</b> · "
+            f"<code>S{session.selected_season:02d}E{session.selected_episode:02d}</code>"
+        )
 
+    lines = [
+        "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+        DIV,
+        "",
+        title_line,
+        "",
+        f"🎞️ <b>Qᴜᴀʟɪᴛʏ</b> · <code>{_quality_summary(uniq)}</code>",
+        f"🧬 <b>Cᴏᴅᴇᴄ</b> · <code>{_codec_summary(uniq)}</code>",
+        f"🔊 <b>Aᴜᴅɪᴏ</b> · <code>{_audio_summary(uniq)}</code>",
+        f"📝 <b>Sᴜʙᴛɪᴛʟᴇ</b> · <code>{_subtitle_summary(uniq)}</code>",
+        "",
+        DIV,
+        "",
+        f"📦 <b>{len(uniq)} ʀᴇʟᴇᴀꜱᴇꜱ</b> · ꜱᴍᴀʟʟ → ʙɪɢ",
+        "",
+        "ᴘɪᴄᴋ ᴀ ʀᴇʟᴇᴀꜱᴇ:",
+    ]
     await _edit(target, "\n".join(lines), kb=InlineKeyboardMarkup(rows))
 
 
@@ -732,19 +795,12 @@ async def _pick_file(client: Client, q: CallbackQuery, sid: str, idx: int):
         await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         return
     hits = await _filter_hits(session)
-    hits = ranker.rank(hits)
-    seen = set()
-    uniq: List[FileHit] = []
-    for h in hits:
-        k = h.file_unique_id or h.file_id
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(h)
+    uniq = _dedupe_sorted_asc(hits)
     if idx >= len(uniq):
         await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
         return
 
+    # Force-sub check
     ok, missing = await subscription.is_subscribed(client, q.from_user.id)
     if not ok:
         await q.answer()
@@ -767,7 +823,6 @@ async def _pick_file(client: Client, q: CallbackQuery, sid: str, idx: int):
             await q.message.reply_text(err)
         except Exception:
             pass
-
 
 # ═══════════════════════ BACK NAVIGATION ═══════════════════════
 async def _back_to_titles(client: Client, q: CallbackQuery, sid: str):
