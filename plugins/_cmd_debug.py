@@ -6,13 +6,12 @@ from pyrogram.types import Message
 logger = logging.getLogger(__name__)
 
 
-@Client.on_message(
-    filters.private
-    & filters.command(["start", "database", "index", "indexing",
-                       "pm_search", "autofilter", "stats"])
-)
+# group=-100 → runs BEFORE every other handler
+@Client.on_message(filters.private & filters.text, group=-100)
 async def _cmd_debug(client: Client, message: Message):
-    logger.info(
-        f"[CMD-DEBUG] got command: {message.text!r} "
-        f"from={message.from_user.id}"
-    )
+    txt = (message.text or "").strip()
+    logger.info(f"[CMD-DEBUG] got: {txt[:60]!r}")
+    try:
+        await message.reply_text(f"🔔 DEBUG: got {txt[:80]!r}")
+    except Exception as e:
+        logger.warning(f"[CMD-DEBUG] reply failed: {type(e).__name__}: {e}")
