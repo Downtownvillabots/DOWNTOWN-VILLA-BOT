@@ -850,7 +850,7 @@ async def _run_job(client: Client, job_id: str) -> None:
             await _finish("error")
             return
 
-        live_task = asyncio.create_task(_live_updater(client, job_id))
+               live_task = asyncio.create_task(_live_updater(client, job_id))
 
         current = start_id
         pending = None
@@ -894,12 +894,18 @@ async def _run_job(client: Client, job_id: str) -> None:
 
             await _finish("completed")
         finally:
+            # Cancel any in-flight prefetch
+            if pending is not None and not pending.done():
+                pending.cancel()
+                try:
+                    await pending
+                except Exception:
+                    pass
             live_task.cancel()
             try:
                 await live_task
             except Exception:
                 pass
-
     except asyncio.CancelledError:
         st["status"] = "stopped"
         raise
