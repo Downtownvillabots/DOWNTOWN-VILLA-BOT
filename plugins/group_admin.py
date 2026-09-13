@@ -3,7 +3,8 @@
 🏨 DOWNTOWN VILLA — GROUP ADMIN CONTROL CENTER
 ==============================================
 Handles /settings and /reload in groups and PM.
-All group-config UI lives here.
+Session text input uses old-bot logic: any non-command text
+while a session is active is treated as the input.
 """
 import asyncio
 import logging
@@ -602,7 +603,7 @@ async def cb_buttons_add(client: Client, q: CallbackQuery):
         DIV, "",
         "ꜱᴛᴇᴘ <b>1/2</b>",
         "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ɴᴀᴍᴇ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ɴᴀᴍᴇ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
         "",
         f"<i>ᴇxᴀᴍᴘʟᴇ: 📥 ꜱʜᴀʀᴇ ꜰɪʟᴇ</i>",
     ])
@@ -689,7 +690,7 @@ async def cb_buttons_edit_name(client: Client, q: CallbackQuery):
     text = "\n".join([
         "✏️ <b>" + fb("CHANGE BUTTON NAME") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ɴᴇᴡ ɴᴀᴍᴇ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ɴᴇᴡ ɴᴀᴍᴇ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.BUTTONS, "cancel", token))],
@@ -714,7 +715,7 @@ async def cb_buttons_edit_url(client: Client, q: CallbackQuery):
     text = "\n".join([
         "🔗 <b>" + fb("CHANGE BUTTON LINK") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ɴᴇᴡ ᴜʀʟ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ɴᴇᴡ ᴜʀʟ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.BUTTONS, "cancel", token))],
@@ -1002,7 +1003,7 @@ async def cb_captions_set(client: Client, q: CallbackQuery):
     text = "\n".join([
         "✏️ <b>" + fb("SET CAPTION") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ʏᴏᴜʀ ᴄᴀᴘᴛɪᴏɴ ᴛᴇᴍᴘʟᴀᴛᴇ.",
+        "📝 ꜱᴇɴᴅ ʏᴏᴜʀ ᴄᴀᴘᴛɪᴏɴ ᴛᴇᴍᴘʟᴀᴛᴇ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
         "",
         "<i>ᴜꜱᴇ ᴠᴀʀɪᴀʙʟᴇꜱ ʟɪᴋᴇ {ᴛɪᴛʟᴇ}, {Qᴜᴀʟɪᴛʏ} ᴇᴛᴄ.</i>",
     ])
@@ -1130,7 +1131,7 @@ async def cb_links_set_movie(client: Client, q: CallbackQuery):
     text = "\n".join([
         "🎬 <b>" + fb("SET MOVIE GROUP") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.LINKS, "cancel", token))],
@@ -1154,7 +1155,7 @@ async def cb_links_set_series(client: Client, q: CallbackQuery):
     text = "\n".join([
         "📺 <b>" + fb("SET SERIES GROUP") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.LINKS, "cancel", token))],
@@ -1322,7 +1323,7 @@ async def cb_fsub_add(client: Client, q: CallbackQuery):
     text = "\n".join([
         "➕ <b>" + fb("ADD FORCE SUB CHANNEL") + "</b>",
         DIV, "",
-        "📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ ɪᴅ ᴏʀ @ᴜꜱᴇʀɴᴀᴍᴇ.",
+        "📝 ꜱᴇɴᴅ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ ɪᴅ ᴏʀ @ᴜꜱᴇʀɴᴀᴍᴇ ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ CANCEL", callback_data=make(NS.FSUB, "cancel", token))],
@@ -1775,7 +1776,6 @@ async def cmd_groupsettings(client: Client, message: Message):
 
 
 async def _render_owner_group_list(target):
-    """Render the owner group list. `target` must be a Message."""
     try:
         total = await config_manager.count_groups()
         groups = await config_manager.list_groups(0, 10)
@@ -1819,7 +1819,6 @@ async def _render_owner_group_list(target):
         DIV_S,
         "ꜱᴇʟᴇᴄᴛ ᴀ ɢʀᴏᴜᴘ ᴛᴏ ᴍᴀɴᴀɢᴇ:",
     ])
-
     try:
         await target.reply_text(
             text,
@@ -1870,40 +1869,39 @@ async def cb_owner_refresh(client: Client, q: CallbackQuery):
     await q.answer("🔄 ʀᴇꜰʀᴇꜱʜᴇᴅ")
 
 
-# ═══════════════════════ TEXT HANDLERS (REPLY-ONLY) ═══════════════════════
+# ═══════════════════════ TEXT HANDLER (OLD BOT LOGIC) ═══════════════════════
 @Client.on_message(
     filters.private & filters.text & ~filters.command([
         "start", "settings", "reload", "database", "index", "pm_search",
         "autofilter", "stats", "groupsettings", "request", "s",
     ]),
-    group=-50,
+    group=-50,   # runs BEFORE auto_filter so sessions consume the text
 )
 async def session_text_handler(client: Client, message: Message):
     """
-    Handle text input for active group-settings sessions.
+    Session text input — old bot logic.
 
-    Rules:
-      • If user has exactly ONE active session → consume ANY text
-      • If MULTIPLE sessions → must reply to the specific bot prompt
-      • Commands are ignored
+    • Commands (start with /) are filtered out by `~filters.command(...)`
+    • If user has active session(s), this text IS the session input
+    • Otherwise pass through to auto_filter (search)
     """
     if not message.from_user or not message.text:
         return
 
     txt = message.text.strip()
-    if not txt or txt.startswith("/"):
+    if not txt:
         return
 
     uid = message.from_user.id
 
-    # ── Fetch all active sessions for this user ──
+    # ── Look up active sessions ──
     try:
         from database import db_registry
         db = db_registry.get_system_db()
         if db is None:
             return
         cursor = db["group_sessions"].find(
-            {"user_id": uid, "expires_at": {"$gt": time.time()}},
+            {"user_id": uid, "expires_at": {"$gt": time.time()}}
         ).sort("created_at", -1)
         active = await cursor.to_list(length=10)
     except Exception as e:
@@ -1911,63 +1909,46 @@ async def session_text_handler(client: Client, message: Message):
         return
 
     if not active:
-        return  # no session — let auto_filter handle it
+        return  # no session — let auto_filter handle
 
-    # ── Pick which session to consume ──
-    session = None
-    if len(active) == 1:
-        # Only one session — accept ANY text
-        session = active[0]
-    else:
-        # Multiple — must reply to the specific bot prompt
-        if (message.reply_to_message
-                and message.reply_to_message.from_user
-                and message.reply_to_message.from_user.is_self):
-            rid = message.reply_to_message.id
-            session = next(
-                (s for s in active if s.get("prompt_msg_id") == rid),
-                None,
-            )
-        if not session:
-            # Ambiguous — ask user to reply
-            message.stop_propagation()
-            await message.reply_text(
-                "⚠️ ʏᴏᴜ ʜᴀᴠᴇ ᴍᴜʟᴛɪᴘʟᴇ ᴀᴄᴛɪᴠᴇ ꜱᴇᴛᴛɪɴɢꜱ.\n\n"
-                "📝 ᴘʟᴇᴀꜱᴇ <b>ʀᴇᴘʟʏ</b> ᴛᴏ ᴛʜᴇ ꜱᴘᴇᴄɪꜰɪᴄ ʙᴏᴛ ᴍᴇꜱꜱᴀɢᴇ.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-    # ── We have a session — consume the message ──
+    logger.info(f"[GADMIN-SESSION] consuming text={txt[:40]!r} sessions={len(active)}")
     message.stop_propagation()
-    logger.info(f"[GADMIN-SESSION] consuming — action={session.get('action')} token={session.get('token')}")
+
+    # If multiple sessions, prefer one that matches the replied message
+    session = active[0]
+    if (len(active) > 1
+            and message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.is_self):
+        rid = message.reply_to_message.id
+        match = next((s for s in active if s.get("prompt_msg_id") == rid), None)
+        if match:
+            session = match
 
     action = session.get("action")
     chat_id = session.get("chat_id")
     token = session.get("token")
     payload = session.get("payload", {}) or {}
 
-    # ── Permission re-check ──
+    # Permission re-check
     ok = await permission_manager.can_manage(client, chat_id, uid)
     if not ok:
         await session_manager.cancel(token)
         await message.reply_text("⛔ ʏᴏᴜ ᴀʀᴇ ɴᴏ ʟᴏɴɢᴇʀ ᴀɴ ᴀᴅᴍɪɴ ᴏꜰ ᴛʜᴀᴛ ɢʀᴏᴜᴘ.")
         return
 
-    text = txt
-
-    # ═══════════════════ ADD BUTTON (2 steps) ═══════════════════
+    # ═══ ADD BUTTON ═══
     if action == "add_button":
         step = session.get("step", 1)
         if step == 1:
-            if not (1 <= len(text) <= 60):
+            if not (1 <= len(txt) <= 60):
                 await message.reply_text("❌ ɴᴀᴍᴇ ᴍᴜꜱᴛ ʙᴇ 1-60 ᴄʜᴀʀꜱ.")
                 return
-            await session_manager.advance(token, {"name": text})
+            await session_manager.advance(token, {"name": txt})
             prompt = await message.reply_text(
                 f"➕ <b>ꜱᴛᴇᴘ 2/2</b>\n\n"
-                f"ɴᴀᴍᴇ · <b>{text}</b>\n\n"
-                f"📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴜʀʟ (http/https/tg).",
+                f"ɴᴀᴍᴇ · <b>{txt}</b>\n\n"
+                f"📝 ꜱᴇɴᴅ ᴛʜᴇ ᴜʀʟ (http/https/tg) ᴀꜱ ᴛʜᴇ ɴᴇxᴛ ᴍᴇꜱꜱᴀɢᴇ.",
                 parse_mode=ParseMode.HTML,
             )
             try:
@@ -1979,8 +1960,7 @@ async def session_text_handler(client: Client, message: Message):
                 pass
             return
 
-        # step 2 → url
-        url = text
+        url = txt
         if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
             await message.reply_text("❌ ᴜʀʟ ᴍᴜꜱᴛ ꜱᴛᴀʀᴛ ᴡɪᴛʜ http:// ᴏʀ https:// ᴏʀ tg://")
             return
@@ -1997,72 +1977,68 @@ async def session_text_handler(client: Client, message: Message):
             await message.reply_text("❌ ꜰᴀɪʟᴇᴅ (ᴍᴀx 8 ʙᴜᴛᴛᴏɴꜱ ᴏʀ ɪɴᴠᴀʟɪᴅ).")
         return
 
-    # ═══════════════════ EDIT BUTTON NAME ═══════════════════
+    # ═══ EDIT BUTTON NAME ═══
     if action == "edit_button_name":
         btn_id = payload.get("btn_id")
         if not btn_id:
             await session_manager.cancel(token)
             return
-        ok2 = await button_manager.edit_button(chat_id, btn_id, new_name=text)
+        ok2 = await button_manager.edit_button(chat_id, btn_id, new_name=txt)
         await session_manager.cancel(token)
         await message.reply_text("✅ ɴᴀᴍᴇ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ═══════════════════ EDIT BUTTON URL ═══════════════════
+    # ═══ EDIT BUTTON URL ═══
     if action == "edit_button_url":
         btn_id = payload.get("btn_id")
         if not btn_id:
             await session_manager.cancel(token)
             return
-        if not (text.startswith("http://") or text.startswith("https://") or text.startswith("tg://")):
+        if not (txt.startswith("http://") or txt.startswith("https://") or txt.startswith("tg://")):
             await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ.")
             return
-        ok2 = await button_manager.edit_button(chat_id, btn_id, new_url=text)
+        ok2 = await button_manager.edit_button(chat_id, btn_id, new_url=txt)
         await session_manager.cancel(token)
         await message.reply_text("✅ ᴜʀʟ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ═══════════════════ SET CAPTION ═══════════════════
+    # ═══ SET CAPTION ═══
     if action == "set_caption":
-        if len(text) < 3:
+        if len(txt) < 3:
             await message.reply_text("❌ ᴄᴀᴘᴛɪᴏɴ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
             return
-        ok2 = await caption_manager.set_caption(chat_id, text)
+        ok2 = await caption_manager.set_caption(chat_id, txt)
         await session_manager.cancel(token)
         await message.reply_text("✅ ᴄᴀᴘᴛɪᴏɴ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ═══════════════════ SET MOVIE LINK ═══════════════════
+    # ═══ SET MOVIE LINK ═══
     if action == "set_movie_link":
-        ok2 = await link_manager.set_movie_link(chat_id, text)
+        ok2 = await link_manager.set_movie_link(chat_id, txt)
         await session_manager.cancel(token)
-        await message.reply_text(
-            "✅ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
-        )
+        await message.reply_text("✅ ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ")
         return
 
-    # ═══════════════════ SET SERIES LINK ═══════════════════
+    # ═══ SET SERIES LINK ═══
     if action == "set_series_link":
-        ok2 = await link_manager.set_series_link(chat_id, text)
+        ok2 = await link_manager.set_series_link(chat_id, txt)
         await session_manager.cancel(token)
-        await message.reply_text(
-            "✅ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ"
-        )
+        await message.reply_text("✅ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ ʟɪɴᴋ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ")
         return
 
-    # ═══════════════════ FSUB ADD CHANNEL ═══════════════════
+    # ═══ FSUB ADD CHANNEL ═══
     if action == "fsub_add":
         target = None
-        if text.startswith("@"):
+        if txt.startswith("@"):
             try:
-                chat_obj = await client.get_chat(text)
+                chat_obj = await client.get_chat(txt)
                 target = chat_obj.id
             except Exception:
                 await message.reply_text("❌ ᴄᴀɴɴᴏᴛ ʀᴇꜱᴏʟᴠᴇ ᴛʜᴀᴛ ᴜꜱᴇʀɴᴀᴍᴇ.")
                 return
         else:
             try:
-                target = int(text)
+                target = int(txt)
             except ValueError:
                 await message.reply_text("❌ ꜱᴇɴᴅ ᴀ ᴄʜᴀɴɴᴇʟ ɪᴅ ᴏʀ @ᴜꜱᴇʀɴᴀᴍᴇ.")
                 return
@@ -2079,9 +2055,9 @@ async def session_text_handler(client: Client, message: Message):
                                  parse_mode=ParseMode.HTML)
         return
 
-    # ── Unknown action — clean up ──
     logger.warning(f"[GADMIN-SESSION] unknown action: {action}")
     await session_manager.cancel(token)
+
 
 # ═══════════════════════ STARTUP LOG ═══════════════════════
 logger.info("[GADMIN] group admin plugin loaded")
