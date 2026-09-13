@@ -850,7 +850,7 @@ async def _run_job(client: Client, job_id: str) -> None:
             await _finish("error")
             return
 
-               live_task = asyncio.create_task(_live_updater(client, job_id))
+        live_task = asyncio.create_task(_live_updater(client, job_id))
 
         current = start_id
         pending = None
