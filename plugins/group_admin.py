@@ -1770,8 +1770,15 @@ async def cmd_groupsettings(client: Client, message: Message):
 
 
 async def _render_owner_group_list(target):
-    total = await config_manager.count_groups()
-    groups = await config_manager.list_groups(0, 10)
+    """Render the owner group list. `target` must be a Message."""
+    try:
+        total = await config_manager.count_groups()
+        groups = await config_manager.list_groups(0, 10)
+    except Exception as e:
+        logger.exception(f"[GADMIN] owner list fetch failed: {e}")
+        await target.reply_text(f"⚠️ ꜰᴀɪʟᴇᴅ ᴛᴏ ʟᴏᴀᴅ ɢʀᴏᴜᴘꜱ: <code>{e}</code>",
+                                parse_mode=ParseMode.HTML)
+        return
 
     rows: List[List[InlineKeyboardButton]] = []
     for g in groups:
@@ -1802,14 +1809,18 @@ async def _render_owner_group_list(target):
         DIV_S,
         "ꜱᴇʟᴇᴄᴛ ᴀ ɢʀᴏᴜᴘ ᴛᴏ ᴍᴀɴᴀɢᴇ:",
     ])
+
+    # Only use reply_text — this is a NEW message from a user command
     try:
         await target.reply_text(
-            text, reply_markup=InlineKeyboardMarkup(rows),
+            text,
+            reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except Exception:
-        await _edit(target, text, InlineKeyboardMarkup(rows))
+        logger.info(f"[GADMIN] owner group list shown to {target.from_user.id}")
+    except Exception as e:
+        logger.exception(f"[GADMIN] failed to send owner group list: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^gs:owner:refresh:(\d+)$"))
