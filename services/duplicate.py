@@ -34,14 +34,15 @@ def compute_fingerprint(tg_file_id: str) -> str:
     Excludes file_reference which rotates.
     """
     if not _HAS_FILEID or not tg_file_id:
-        # Fallback: hash the file_id itself (still useful when IDs are stable)
+        logger.debug(f"[DUP] no FileId module; hashing raw file_id")
         return hashlib.sha256((tg_file_id or "").encode("utf-8")).hexdigest()
     try:
         d = FileId.decode(tg_file_id)
         raw = f"{d.file_type}|{d.dc_id}|{d.media_id}|{d.access_hash}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
     except Exception as e:
-        logger.warning(f"[DUP] decode failed: {e}")
+        # Decode failed — fallback hashing is unreliable but prevents crashes.
+        logger.warning(f"[DUP] decode failed, using raw hash: {type(e).__name__}: {e}")
         return hashlib.sha256((tg_file_id or "").encode("utf-8")).hexdigest()
 
 
