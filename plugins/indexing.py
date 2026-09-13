@@ -394,7 +394,7 @@ async def cb_series(client: Client, q: CallbackQuery):
     await q.answer()
 
 # ═══════════════════════ FORWARD DETECTION ═══════════════════════
-@Client.on_message(filters.private & ~filters.service)
+@Client.on_message(filters.private & filters.forwarded & ~filters.service)
 async def forward_detect(client: Client, message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
