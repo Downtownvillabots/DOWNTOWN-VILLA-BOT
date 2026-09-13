@@ -6,12 +6,17 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
+
 from core.config import (
     SPELL_CHECK_THRESHOLD, SPELL_CHECK_CANDIDATES, MAX_LIST_ELM,
 )
 from media_search.engine import engine
 from media_search.metadata import metadata_provider
 from media_search.normalizer import normalize
+
+# Fallback metadata import — resilient
 try:
     from services import metadata as imdb_service
     logger.info("[SPELL] using unified metadata service")
@@ -22,7 +27,6 @@ except Exception as _e1:
     except Exception as _e2:
         imdb_service = None
         logger.warning(f"[SPELL] no metadata provider available: {_e2}")
-logger = logging.getLogger(__name__)
 
 try:
     from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
