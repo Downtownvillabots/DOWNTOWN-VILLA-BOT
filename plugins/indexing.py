@@ -182,12 +182,15 @@ class _Jobs:
                 pass
         self.drop(job_id)
         return True
-
+        
     def force_clear(self, job_id: str) -> None:
-        """Remove state without touching the task (for dead jobs)."""
+        """Kill the task if alive, then remove state."""
+        task = self.tasks.pop(job_id, None)
         self.state.pop(job_id, None)
-        self.tasks.pop(job_id, None)
-
+        if task and not task.done():
+            task.cancel()
+            logger.info(f"force_clear: cancelled task {job_id}")
+            
     def has_running_for_channel(self, channel_id: int) -> Optional[str]:
         """Return job_id if a live task exists for this channel. Auto-cleans dead ones."""
         for jid, st in list(self.state.items()):
