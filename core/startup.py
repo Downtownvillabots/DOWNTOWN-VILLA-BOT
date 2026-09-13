@@ -55,6 +55,23 @@ async def start_bot():
     except Exception as e:
         logging.warning(f"Search index setup failed: {e}")
 
+        # ── Media file indexes (search + lookup performance) ──
+    try:
+        from database import db_registry
+        for entry in db_registry.media_entries():
+            col = entry.db["media_files"]
+            await col.create_index("normalized_title")
+            await col.create_index("normalized_series_title")
+            await col.create_index("type")
+            await col.create_index([("type", 1), ("normalized_title", 1)])
+            await col.create_index([("type", 1), ("normalized_series_title", 1)])
+            await col.create_index([("type", 1), ("normalized_series_title", 1), ("season", 1), ("episode", 1)])
+            await col.create_index("norm_name")
+        logging.info("media_files indexes ensured")
+    except Exception as e:
+        logging.warning(f"media_files index setup failed: {e}")
+        
+
     await bot_started()
 
     logging.info("Bot idle. Waiting for commands...")
