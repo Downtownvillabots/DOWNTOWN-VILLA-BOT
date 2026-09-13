@@ -1876,68 +1876,87 @@ async def cb_owner_refresh(client: Client, q: CallbackQuery):
         "start", "settings", "reload", "database", "index", "pm_search",
         "autofilter", "stats", "groupsettings", "request", "s",
     ]),
-    group=-50,   # runs BEFORE auto_filter so replies don't leak into search
+    group=-50,
 )
 async def session_text_handler(client: Client, message: Message):
     """
-    Handle text input for active sessions.
-    Requires the user to REPLY to the bot's prompt.
+    Handle text input for active group-settings sessions.
+
+    Rules:
+      • If user has exactly ONE active session → consume ANY text
+      • If MULTIPLE sessions → must reply to the specific bot prompt
+      • Commands are ignored
     """
     if not message.from_user or not message.text:
         return
 
-    # Require reply to bot
-    if not message.reply_to_message:
-        return
-    if not message.reply_to_message.from_user:
-        return
-    if not message.reply_to_message.from_user.is_self:
+    txt = message.text.strip()
+    if not txt or txt.startswith("/"):
         return
 
     uid = message.from_user.id
-    reply_id = message.reply_to_message.id
 
+    # ── Fetch all active sessions for this user ──
     try:
         from database import db_registry
         db = db_registry.get_system_db()
-    except Exception:
-        return
-    if db is None:
+        if db is None:
+            return
+        cursor = db["group_sessions"].find(
+            {"user_id": uid, "expires_at": {"$gt": time.time()}},
+        ).sort("created_at", -1)
+        active = await cursor.to_list(length=10)
+    except Exception as e:
+        logger.warning(f"[GADMIN-SESSION] db error: {e}")
         return
 
+    if not active:
+        return  # no session — let auto_filter handle it
+
+    # ── Pick which session to consume ──
     session = None
-    try:
-        session = await db["group_sessions"].find_one(
-            {
-                "user_id": uid,
-                "expires_at": {"$gt": time.time()},
-                "prompt_msg_id": reply_id,
-            },
-            sort=[("created_at", -1)],
-        )
-    except Exception:
-        return
+    if len(active) == 1:
+        # Only one session — accept ANY text
+        session = active[0]
+    else:
+        # Multiple — must reply to the specific bot prompt
+        if (message.reply_to_message
+                and message.reply_to_message.from_user
+                and message.reply_to_message.from_user.is_self):
+            rid = message.reply_to_message.id
+            session = next(
+                (s for s in active if s.get("prompt_msg_id") == rid),
+                None,
+            )
+        if not session:
+            # Ambiguous — ask user to reply
+            message.stop_propagation()
+            await message.reply_text(
+                "⚠️ ʏᴏᴜ ʜᴀᴠᴇ ᴍᴜʟᴛɪᴘʟᴇ ᴀᴄᴛɪᴠᴇ ꜱᴇᴛᴛɪɴɢꜱ.\n\n"
+                "📝 ᴘʟᴇᴀꜱᴇ <b>ʀᴇᴘʟʏ</b> ᴛᴏ ᴛʜᴇ ꜱᴘᴇᴄɪꜰɪᴄ ʙᴏᴛ ᴍᴇꜱꜱᴀɢᴇ.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-    if not session:
-        return
-
-    # ── We have an active session bound to this reply — consume the message ──
+    # ── We have a session — consume the message ──
     message.stop_propagation()
+    logger.info(f"[GADMIN-SESSION] consuming — action={session.get('action')} token={session.get('token')}")
 
     action = session.get("action")
     chat_id = session.get("chat_id")
     token = session.get("token")
     payload = session.get("payload", {}) or {}
 
+    # ── Permission re-check ──
     ok = await permission_manager.can_manage(client, chat_id, uid)
     if not ok:
         await session_manager.cancel(token)
         await message.reply_text("⛔ ʏᴏᴜ ᴀʀᴇ ɴᴏ ʟᴏɴɢᴇʀ ᴀɴ ᴀᴅᴍɪɴ ᴏꜰ ᴛʜᴀᴛ ɢʀᴏᴜᴘ.")
         return
 
-    text = message.text.strip()
+    text = txt
 
-    # ── ADD BUTTON (2 steps) ──
+    # ═══════════════════ ADD BUTTON (2 steps) ═══════════════════
     if action == "add_button":
         step = session.get("step", 1)
         if step == 1:
@@ -1948,7 +1967,7 @@ async def session_text_handler(client: Client, message: Message):
             prompt = await message.reply_text(
                 f"➕ <b>ꜱᴛᴇᴘ 2/2</b>\n\n"
                 f"ɴᴀᴍᴇ · <b>{text}</b>\n\n"
-                f"📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴜʀʟ.",
+                f"📝 <b>ʀᴇᴘʟʏ ᴛᴏ ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ</b> ᴡɪᴛʜ ᴛʜᴇ ᴜʀʟ (http/https/tg).",
                 parse_mode=ParseMode.HTML,
             )
             try:
@@ -1960,6 +1979,7 @@ async def session_text_handler(client: Client, message: Message):
                 pass
             return
 
+        # step 2 → url
         url = text
         if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
             await message.reply_text("❌ ᴜʀʟ ᴍᴜꜱᴛ ꜱᴛᴀʀᴛ ᴡɪᴛʜ http:// ᴏʀ https:// ᴏʀ tg://")
@@ -1977,7 +1997,7 @@ async def session_text_handler(client: Client, message: Message):
             await message.reply_text("❌ ꜰᴀɪʟᴇᴅ (ᴍᴀx 8 ʙᴜᴛᴛᴏɴꜱ ᴏʀ ɪɴᴠᴀʟɪᴅ).")
         return
 
-    # ── EDIT BUTTON NAME ──
+    # ═══════════════════ EDIT BUTTON NAME ═══════════════════
     if action == "edit_button_name":
         btn_id = payload.get("btn_id")
         if not btn_id:
@@ -1985,10 +2005,10 @@ async def session_text_handler(client: Client, message: Message):
             return
         ok2 = await button_manager.edit_button(chat_id, btn_id, new_name=text)
         await session_manager.cancel(token)
-        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
+        await message.reply_text("✅ ɴᴀᴍᴇ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ── EDIT BUTTON URL ──
+    # ═══════════════════ EDIT BUTTON URL ═══════════════════
     if action == "edit_button_url":
         btn_id = payload.get("btn_id")
         if not btn_id:
@@ -1999,10 +2019,10 @@ async def session_text_handler(client: Client, message: Message):
             return
         ok2 = await button_manager.edit_button(chat_id, btn_id, new_url=text)
         await session_manager.cancel(token)
-        await message.reply_text("✅ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
+        await message.reply_text("✅ ᴜʀʟ ᴜᴘᴅᴀᴛᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ── SET CAPTION ──
+    # ═══════════════════ SET CAPTION ═══════════════════
     if action == "set_caption":
         if len(text) < 3:
             await message.reply_text("❌ ᴄᴀᴘᴛɪᴏɴ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
@@ -2012,7 +2032,7 @@ async def session_text_handler(client: Client, message: Message):
         await message.reply_text("✅ ᴄᴀᴘᴛɪᴏɴ ꜱᴀᴠᴇᴅ" if ok2 else "❌ ꜰᴀɪʟᴇᴅ")
         return
 
-    # ── SET MOVIE LINK ──
+    # ═══════════════════ SET MOVIE LINK ═══════════════════
     if action == "set_movie_link":
         ok2 = await link_manager.set_movie_link(chat_id, text)
         await session_manager.cancel(token)
@@ -2021,7 +2041,7 @@ async def session_text_handler(client: Client, message: Message):
         )
         return
 
-    # ── SET SERIES LINK ──
+    # ═══════════════════ SET SERIES LINK ═══════════════════
     if action == "set_series_link":
         ok2 = await link_manager.set_series_link(chat_id, text)
         await session_manager.cancel(token)
@@ -2030,7 +2050,7 @@ async def session_text_handler(client: Client, message: Message):
         )
         return
 
-    # ── FSUB ADD CHANNEL ──
+    # ═══════════════════ FSUB ADD CHANNEL ═══════════════════
     if action == "fsub_add":
         target = None
         if text.startswith("@"):
@@ -2059,8 +2079,9 @@ async def session_text_handler(client: Client, message: Message):
                                  parse_mode=ParseMode.HTML)
         return
 
+    # ── Unknown action — clean up ──
+    logger.warning(f"[GADMIN-SESSION] unknown action: {action}")
     await session_manager.cancel(token)
-
 
 # ═══════════════════════ STARTUP LOG ═══════════════════════
 logger.info("[GADMIN] group admin plugin loaded")
