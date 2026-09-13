@@ -1,12 +1,13 @@
 """
-🏨 DOWNTOWN VILLA — Auto-filter handlers.
-PM search → title → language → quality → files → deliver to PM.
-Filenames cleaned. Audio from file record ONLY (no IMDb enrichment).
+🏨 DOWNTOWN VILLA — Simplified Auto-filter handlers.
+Search → file list (sorted small→big) → deliver.
+Misspelled → IMDb picker → click → file list → deliver.
+No language / quality / season / episode pickers.
 """
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
@@ -18,7 +19,6 @@ from media_search.delivery import delivery
 from media_search.engine import engine
 from media_search.models import FileHit
 from media_search.normalizer import normalize, parse_query
-from media_search.ranker import ranker
 from media_search.requests import requests as request_repo
 from media_search.sessions import sessions
 from media_search.subscription import subscription
@@ -33,10 +33,6 @@ DIV = "━" * 26
 def _display_title(t: str, year: Optional[int]) -> str:
     base = (t or "?").strip().title()
     return f"{base} ({year})" if year else base
-
-
-def _strip_trailing_digits(s: str) -> str:
-    return re.sub(r"\s+\d+\s*$", "", (s or "").strip()).strip()
 
 
 async def _edit(target, text: str, kb: Optional[InlineKeyboardMarkup] = None):
@@ -67,40 +63,10 @@ def _sub_keyboard(missing: List[int]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _filter_by_title(hits, title, year):
-    norm = normalize(title)
-    out = []
-    for h in hits:
-        base = (h.series_title or h.title or "").strip()
-        base_clean = _strip_trailing_digits(base)
-        if normalize(base_clean) != norm:
-            continue
-        if year and h.year and h.year != year:
-            continue
-        out.append(h)
-    if not out:
-        for h in hits:
-            if year and h.year and h.year != year:
-                continue
-            bn = normalize(h.series_title or h.title or "")
-            if bn.startswith(norm) or norm.startswith(bn):
-                out.append(h)
-    return out
-
-
-def _group_hits(hits):
-    groups = {}
-    for h in hits:
-        base = (h.series_title or h.title or "?").strip()
-        base_clean = _strip_trailing_digits(base) or base
-        groups.setdefault((base_clean, h.year), []).append(h)
-    return groups
-
-
 def _dedupe_sorted_asc(hits: List[FileHit]) -> List[FileHit]:
-    """Dedupe by file_unique_id, then sort ascending by size."""
+    """Dedupe by file_unique_id, sort ascending by size (small → big)."""
     seen = set()
-    uniq = []
+    uniq: List[FileHit] = []
     for h in hits:
         k = h.file_unique_id or h.file_id
         if k in seen:
@@ -109,33 +75,6 @@ def _dedupe_sorted_asc(hits: List[FileHit]) -> List[FileHit]:
         uniq.append(h)
     uniq.sort(key=lambda h: (h.file_size is None, h.file_size or 0))
     return uniq
-
-
-def _quality_summary(hits):
-    order = ["2160P", "1440P", "1080P", "1080I", "720P", "576P", "480P", "360P"]
-    quals = {(h.quality or "").upper() for h in hits if h.quality}
-    return ", ".join([q for q in order if q in quals]) or "—"
-
-
-def _codec_summary(hits):
-    order = ["AV1", "HEVC", "H264", "VP9", "VP8", "MPEG4", "MPEG2"]
-    codecs = {(h.codec or "").upper() for h in hits if h.codec}
-    return ", ".join([c for c in order if c in codecs]) or "—"
-
-
-def _audio_summary(hits):
-    """Audio comes ONLY from file records."""
-    langs = sorted({l for h in hits for l in (h.audio_languages or [])})
-    return ", ".join(langs) if langs else "—"
-
-
-def _subtitle_summary(hits):
-    subs = sorted({s for h in hits for s in (h.subtitle_languages or [])})
-    if subs:
-        return ", ".join(subs)
-    if any(h.has_subtitle for h in hits):
-        return "YES"
-    return "—"
 
 
 # ═══════════════════════ MAIN ENTRY ═══════════════════════
@@ -154,6 +93,7 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
         await _edit(status, "❌ ᴘʟᴇᴀꜱᴇ ᴇɴᴛᴇʀ ᴀ ᴠᴀʟɪᴅ ꜱᴇᴀʀᴄʜ.")
         return
 
+    # ── Search across all shards ──
     if is_series:
         result = await engine.search_series(norm, year=year)
     else:
@@ -168,6 +108,7 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
     hits = result.hits
     logger.info(f"[SEARCH] {len(hits)} hits complete={result.complete}")
 
+    # ── No results → suggestions ──
     if not hits:
         if not result.complete:
             await _edit(
@@ -179,52 +120,8 @@ async def _handle_search(client: Client, message: Message, raw_query: str,
         await _handle_no_results(client, message, status, raw_query, norm, is_series)
         return
 
-    groups = _group_hits(hits)
-    candidates = [
-        {"title": t, "year": y, "type": th[0].type, "count": len(th)}
-        for (t, y), th in groups.items()
-    ]
-
-    session = await sessions.create(
-        user_id=message.from_user.id,
-        chat_id=message.chat.id,
-        query=raw_query,
-        normalized_query=norm,
-        mode="series" if is_series else "movie",
-        candidates=candidates,
-    )
-    if not session:
-        await _edit(status, "❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ. ᴛʀʏ ᴀɢᴀɪɴ.")
-        return
-
-    sid = session.session_id
-
-    if len(candidates) == 1:
-        c = candidates[0]
-        await sessions.update(sid, selected_title=c["title"], selected_year=c["year"])
-        await _show_next_after_title(status, sid)
-        return
-
-    rows: List[List[InlineKeyboardButton]] = []
-    for i, c in enumerate(candidates[:10]):
-        label = _display_title(c["title"], c["year"])
-        rows.append([InlineKeyboardButton(
-            label.upper(), callback_data=f"sr:pick:{sid}:{i}",
-        )])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-
-    await _edit(
-        status,
-        "\n".join([
-            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-            f"🔎 <b>{len(candidates)} ᴛɪᴛʟᴇꜱ ꜰᴏᴜɴᴅ</b>",
-            DIV, "",
-            f"🔍 Qᴜᴇʀʏ: <code>{raw_query}</code>",
-            "",
-            "ꜱᴇʟᴇᴄᴛ ᴀ ᴛɪᴛʟᴇ:",
-        ]),
-        kb=InlineKeyboardMarkup(rows),
-    )
+    # ── Directly show file list ──
+    await _show_files(status, raw_query, hits)
 
 
 # ═══════════════════════ NO-RESULTS → IMDb ═══════════════════════
@@ -305,21 +202,6 @@ async def _handle_no_results(client, message, status, raw_query, norm, is_series
     )
 
 
-# ═══════════════════════ TITLE PICKER ═══════════════════════
-async def _pick_title(client, q, sid, idx):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        return
-    if idx >= len(session.candidates):
-        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        return
-    c = session.candidates[idx]
-    await sessions.update(sid, selected_title=c["title"], selected_year=c["year"])
-    await q.answer()
-    await _show_next_after_title(q.message, sid)
-
-
 # ═══════════════════════ SPOL (IMDb PICK) ═══════════════════════
 async def _pick_suggestion(client, q, sid, idx):
     session = await sessions.get(sid)
@@ -338,10 +220,10 @@ async def _pick_suggestion(client, q, sid, idx):
 
     norm = normalize(title)
     result = await engine.search_any(norm, year=year)
-    hits = _filter_by_title(result.hits, title, year)
+    hits = result.hits
     if not hits and year:
         result = await engine.search_any(norm, year=None)
-        hits = _filter_by_title(result.hits, title, None)
+        hits = result.hits
 
     # ── Not found → request channel ──
     if not hits:
@@ -391,331 +273,115 @@ async def _pick_suggestion(client, q, sid, idx):
             pass
         return
 
-    # ── Found → continue ──
-    await sessions.update(sid, selected_title=title, selected_year=year)
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-
-    class _FakeMsg:
-        def __init__(self, msg, from_user, chat):
-            self._msg = msg
-            self.from_user = from_user
-            self.chat = chat
-            self.text = title
-            self.id = msg.id
-        async def reply_text(self, *a, **kw):
-            return await self._msg.reply_text(*a, **kw)
-
-    fake = _FakeMsg(q.message, q.from_user, q.message.chat)
-    try:
-        status = await fake.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
-    except Exception:
-        return
-    await _show_next_after_title(status, sid)
+    # ── Found → show file list directly ──
+    title_line = title + (f" ({year})" if year else "")
+    await _show_files(q.message, title_line, hits)
 
 
-# ═══════════════════════ TITLE → LANG ═══════════════════════
-async def _show_next_after_title(target, sid):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    hits = await _search_for_session(session)
-    if not hits:
-        await _edit(target, "❌ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ᴛɪᴛʟᴇ.")
-        return
-    langs = sorted({l for h in hits for l in (h.audio_languages or [])})
-    if not langs:
-        await sessions.update(sid, selected_language="")
-        await _show_qualities(target, sid)
-        return
-    await _show_languages(target, sid, langs)
-
-
-# ═══════════════════════ LANGUAGE ═══════════════════════
-async def _show_languages(target, sid, langs):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    rows = []
-    pair = []
-    for i, lang in enumerate(langs[:12]):
-        pair.append(InlineKeyboardButton(
-            lang.upper(), callback_data=f"sr:lang:{sid}:{i}",
-        ))
-        if len(pair) == 2:
-            rows.append(pair); pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:back:{sid}")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-
-    await _edit(
-        target,
-        "\n".join([
-            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-            f"🎬 <b>{_display_title(session.selected_title, session.selected_year)}</b>",
-            DIV, "",
-            "🌐 ꜱᴇʟᴇᴄᴛ ʟᴀɴɢᴜᴀɢᴇ:",
-        ]),
-        kb=InlineKeyboardMarkup(rows),
-    )
-
-
-async def _pick_lang(client, q, sid, idx):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _search_for_session(session)
-    langs = sorted({l for h in hits for l in (h.audio_languages or [])})
-    if idx >= len(langs):
-        await q.answer("❌", show_alert=True); return
-    lang = langs[idx]
-    await sessions.update(sid, selected_language=lang)
-    await q.answer()
-
-    if session.mode == "series" or any(h.type == "series" for h in hits):
-        seasons = sorted({h.season for h in hits
-                          if h.season is not None and lang in (h.audio_languages or [])})
-        if seasons:
-            await _show_seasons(q.message, sid, seasons)
-            return
-    await _show_qualities(q.message, sid)
-
-
-# ═══════════════════════ SEASONS ═══════════════════════
-async def _show_seasons(target, sid, seasons_list):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    rows = []
-    pair = []
-    for i, s in enumerate(seasons_list[:12]):
-        pair.append(InlineKeyboardButton(
-            f"SEASON {s:02d}", callback_data=f"sr:seas:{sid}:{i}",
-        ))
-        if len(pair) == 2:
-            rows.append(pair); pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:lang_back:{sid}")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-
-    await _edit(
-        target,
-        "\n".join([
-            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-            f"📺 <b>{_display_title(session.selected_title, session.selected_year)}</b>",
-            f"🌐 ʟᴀɴɢᴜᴀɢᴇ: <code>{session.selected_language or '—'}</code>",
-            DIV, "",
-            "📚 ꜱᴇʟᴇᴄᴛ ꜱᴇᴀꜱᴏɴ:",
-        ]),
-        kb=InlineKeyboardMarkup(rows),
-    )
-
-
-async def _pick_season(client, q, sid, idx):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _search_for_session(session)
-    lang = session.selected_language
-    seasons = sorted({h.season for h in hits
-                      if h.season is not None and (not lang or lang in (h.audio_languages or []))})
-    if idx >= len(seasons):
-        await q.answer("❌", show_alert=True); return
-    season = seasons[idx]
-    await sessions.update(sid, selected_season=season)
-    await q.answer()
-    eps = sorted({h.episode for h in hits
-                  if h.season == season and h.episode is not None
-                  and (not lang or lang in (h.audio_languages or []))})
-    if not eps:
-        await q.answer("❌ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True); return
-    await _show_episodes(q.message, sid, season, eps)
-
-
-# ═══════════════════════ EPISODES ═══════════════════════
-async def _show_episodes(target, sid, season, eps, page=0, per_page=20):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    start = page * per_page
-    slice_ = eps[start:start + per_page]
-
-    rows = []
-    trio = []
-    for i, ep in enumerate(slice_):
-        idx = start + i
-        trio.append(InlineKeyboardButton(
-            f"EP {ep:02d}", callback_data=f"sr:ep:{sid}:{idx}",
-        ))
-        if len(trio) == 3:
-            rows.append(trio); trio = []
-    if trio:
-        rows.append(trio)
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️ PREV", callback_data=f"sr:ep_page:{sid}:{page-1}"))
-    if start + per_page < len(eps):
-        nav.append(InlineKeyboardButton("NEXT ▶️", callback_data=f"sr:ep_page:{sid}:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:seas_back:{sid}")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-
-    await _edit(
-        target,
-        "\n".join([
-            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-            f"📺 <b>{_display_title(session.selected_title, session.selected_year)}</b>",
-            f"🎞️ Sᴇᴀꜱᴏɴ {season}",
-            DIV, "",
-            "📄 ꜱᴇʟᴇᴄᴛ ᴇᴘɪꜱᴏᴅᴇ:",
-        ]),
-        kb=InlineKeyboardMarkup(rows),
-    )
-
-
-async def _pick_episode(client, q, sid, idx):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _search_for_session(session)
-    lang = session.selected_language
-    season = session.selected_season
-    eps = sorted({h.episode for h in hits
-                  if h.season == season and h.episode is not None
-                  and (not lang or lang in (h.audio_languages or []))})
-    if idx >= len(eps):
-        await q.answer("❌", show_alert=True); return
-    ep = eps[idx]
-    await sessions.update(sid, selected_episode=ep)
-    await q.answer()
-    await _show_qualities(q.message, sid)
-
-
-# ═══════════════════════ QUALITY ═══════════════════════
-async def _show_qualities(target, sid):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    hits = await _filter_hits(session)
-    quals = sorted({(h.quality or "").upper() for h in hits if h.quality})
-    if not quals:
-        await _edit(target, "❌ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇʟᴇᴄᴛɪᴏɴ.")
-        return
-
-    rows = []
-    pair = []
-    for i, qv in enumerate(quals[:10]):
-        pair.append(InlineKeyboardButton(
-            qv, callback_data=f"sr:q:{sid}:{i}",
-        ))
-        if len(pair) == 2:
-            rows.append(pair); pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{sid}")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-
-    lines = ["🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>"]
-    lines.append(f"🎬 <b>{_display_title(session.selected_title, session.selected_year)}</b>")
-    if session.selected_season and session.selected_episode:
-        lines.append(f"🎞️ S{session.selected_season:02d}E{session.selected_episode:02d}")
-    lines.append(f"🌐 ʟᴀɴɢᴜᴀɢᴇ: <code>{session.selected_language or '—'}</code>")
-    lines.append(DIV)
-    lines.append("")
-    lines.append("🎞️ ꜱᴇʟᴇᴄᴛ ǫᴜᴀʟɪᴛʏ:")
-
-    await _edit(target, "\n".join(lines), kb=InlineKeyboardMarkup(rows))
-
-
-async def _pick_quality(client, q, sid, idx):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _filter_hits(session)
-    quals = sorted({(h.quality or "").upper() for h in hits if h.quality})
-    if idx >= len(quals):
-        await q.answer("❌", show_alert=True); return
-    qv = quals[idx]
-    await sessions.update(sid, selected_quality=qv)
-    await q.answer()
-    await _show_files(q.message, sid)
-
-
-# ═══════════════════════ FILES — CLEAN NAMES ═══════════════════════
-async def _show_files(target, sid):
-    session = await sessions.get(sid)
-    if not session:
-        return
-    hits = await _filter_hits(session)
+# ═══════════════════════ FILE LIST (SORTED SMALL → BIG) ═══════════════════════
+async def _show_files(target, display_title: str, hits: List[FileHit]):
+    """Show all matching files as buttons: size + clean name. Small → big."""
     uniq = _dedupe_sorted_asc(hits)
     if not uniq:
-        await _edit(target, "❌ ɴᴏ ʀᴇʟᴇᴀꜱᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇʟᴇᴄᴛɪᴏɴ.")
+        await _edit(target, "❌ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ.")
         return
+
+    # Create a session so we can reference hits later
+    from pyrogram.types import Message as _Msg
+    # We need user_id/chat_id — try to extract
+    msg = getattr(target, "message", target)
+    user_id = getattr(msg, "from_user", None)
+    user_id = getattr(user_id, "id", None) if user_id else None
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+
+    # Store the file list in a session-less key so we can retrieve on click
+    # Simplest approach: encode the index into the callback; re-fetch on click
+    sid = f"fl_{abs(hash(display_title + str(len(uniq)))):x}"
+
+    # Create a minimal session with the hits stored
+    session = await sessions.create(
+        user_id=user_id or 0,
+        chat_id=chat_id or 0,
+        query=display_title,
+        normalized_query=normalize(display_title),
+        mode="movie",
+        candidates=[{
+            "file_id": h.file_id,
+            "file_unique_id": h.file_unique_id,
+            "file_name": h.file_name,
+            "file_size": h.file_size,
+            "title": h.title,
+            "year": h.year,
+            "quality": h.quality,
+            "codec": h.codec,
+            "audio_languages": h.audio_languages,
+            "subtitle_languages": h.subtitle_languages,
+            "has_subtitle": h.has_subtitle,
+            "type": h.type,
+            "series_title": h.series_title,
+            "season": h.season,
+            "episode": h.episode,
+            "caption": h.caption,
+        } for h in uniq[:30]],
+    )
+    if not session:
+        await _edit(target, "❌ ꜱᴇꜱꜱɪᴏɴ ᴇʀʀᴏʀ.")
+        return
+
+    sid = session.session_id
 
     display = uniq[:10]
 
-        # ── Clean button labels: size + clean filename (no emojis in name) ──
-    rows = []
+    rows: List[List[InlineKeyboardButton]] = []
     for i, h in enumerate(display):
-        size = human_size_short(h.file_size)          # "1.5GB"
-        clean = clean_filename(h.file_name, max_len=42)  # preserves case
+        size = human_size_short(h.file_size)
+        clean = clean_filename(h.file_name, max_len=42)
         label = f"📦 {size} · {clean}"
-        if len(label) > 64:
-            label = label[:61] + "…"
+        if len(label) > 62:
+            label = label[:59] + "…"
         rows.append([InlineKeyboardButton(
-            label,
-            callback_data=f"sr:file:{sid}:{i}",
+            label, callback_data=f"fl:{sid}:{i}",
         )])
 
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{sid}")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
+    if len(uniq) > 10:
+        rows.append([InlineKeyboardButton(
+            f"➕ {len(uniq) - 10} ᴍᴏʀᴇ ʀᴇʟᴇᴀꜱᴇꜱ",
+            callback_data=f"fl:{sid}:more",
+        )])
 
-    # ── Header: audio comes from FILES only ──
-    title = session.selected_title or "?"
-    year = session.selected_year
-    title_line = f"🎬 <b>{_display_title(title, year)}</b>"
-    if session.selected_season and session.selected_episode:
-        title_line = (
-            f"📺 <b>{_display_title(title, year)}</b> · "
-            f"<code>S{session.selected_season:02d}E{session.selected_episode:02d}</code>"
-        )
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
 
     lines = [
         "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-        DIV,
+        DIV, "",
+        f"🎬 <b>{display_title}</b>",
+        f"📦 <b>{len(uniq)}</b> ꜰɪʟᴇꜱ · ꜱᴍᴀʟʟ → ʙɪɢ",
         "",
-        title_line,
-        "",
-        f"🎞️ <b>Qᴜᴀʟɪᴛʏ</b> · <code>{_quality_summary(uniq)}</code>",
-        f"🧬 <b>Cᴏᴅᴇᴄ</b> · <code>{_codec_summary(uniq)}</code>",
-        f"🔊 <b>Aᴜᴅɪᴏ</b> · <code>{_audio_summary(uniq)}</code>",
-        f"📝 <b>Sᴜʙᴛɪᴛʟᴇ</b> · <code>{_subtitle_summary(uniq)}</code>",
-        "",
-        DIV,
-        "",
-        f"📦 <b>{len(uniq)} ʀᴇʟᴇᴀꜱᴇꜱ</b> · ꜱᴍᴀʟʟ → ʙɪɢ",
-        "",
-        "ᴘɪᴄᴋ ᴀ ʀᴇʟᴇᴀꜱᴇ:",
+        "ᴘɪᴄᴋ ᴀ ꜰɪʟᴇ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪᴛ ɪɴ ᴘᴍ:",
     ]
     await _edit(target, "\n".join(lines), kb=InlineKeyboardMarkup(rows))
 
 
-# ═══════════════════════ DELIVER FILE ═══════════════════════
-async def _pick_file(client, q, sid, idx):
+# ═══════════════════════ FILE CLICK → DELIVER ═══════════════════════
+async def _pick_file_by_index(client, q, sid, idx):
+    """User clicked a file button. Deliver to their PM."""
     session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _filter_hits(session)
-    uniq = _dedupe_sorted_asc(hits)
-    if idx >= len(uniq):
-        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True); return
+    if not session:
+        await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        return
 
+    # Determine index (ignore if `more` payload)
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        await q.answer("ᴜꜱᴇ ᴛʜᴇ ꜰɪʀꜱᴛ 10 ʀᴇʟᴇᴀꜱᴇꜱ", show_alert=True)
+        return
+
+    if i >= len(session.candidates):
+        await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        return
+
+    # Force-sub check
     ok, missing = await subscription.is_subscribed(client, q.from_user.id)
     if not ok:
         await q.answer()
@@ -731,105 +397,32 @@ async def _pick_file(client, q, sid, idx):
         return
 
     await q.answer("📤 ꜱᴇɴᴅɪɴɢ ᴛᴏ ʏᴏᴜʀ ᴘᴍ...")
-    hit = uniq[idx]
 
-    # Deliver to USER'S PM (never to the current chat)
+    data = session.candidates[i]
+    # Rebuild a FileHit from the stored data
+    hit = FileHit(
+        file_id=data.get("file_id", ""),
+        file_unique_id=data.get("file_unique_id"),
+        file_name=data.get("file_name"),
+        file_size=data.get("file_size"),
+        title=data.get("title", ""),
+        normalized_title=normalize(data.get("title") or ""),
+        year=data.get("year"),
+        type=data.get("type", "movie"),
+        quality=data.get("quality"),
+        codec=data.get("codec"),
+        audio_languages=list(data.get("audio_languages") or []),
+        subtitle_languages=list(data.get("subtitle_languages") or []),
+        has_subtitle=bool(data.get("has_subtitle")),
+        series_title=data.get("series_title"),
+        season=data.get("season"),
+        episode=data.get("episode"),
+        caption=data.get("caption"),
+    )
+
     ok, err = await delivery.send_file(client, q.from_user.id, hit)
     if not ok and err:
         try:
             await q.message.reply_text(err)
         except Exception:
             pass
-
-
-# ═══════════════════════ BACK NAVIGATION ═══════════════════════
-async def _back_to_titles(client, q, sid):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    if len(session.candidates) == 1:
-        await q.answer()
-        await _show_next_after_title(q.message, sid)
-        return
-    rows = []
-    for i, c in enumerate(session.candidates[:10]):
-        label = _display_title(c["title"], c.get("year"))
-        rows.append([InlineKeyboardButton(
-            label.upper(), callback_data=f"sr:pick:{sid}:{i}",
-        )])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sr:close")])
-    await _edit(
-        q.message,
-        "\n".join([
-            "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
-            f"🔎 <b>{len(session.candidates)} ᴛɪᴛʟᴇꜱ</b>",
-            DIV, "",
-            "ꜱᴇʟᴇᴄᴛ ᴀ ᴛɪᴛʟᴇ:",
-        ]),
-        kb=InlineKeyboardMarkup(rows),
-    )
-    await q.answer()
-
-
-async def _back_to_langs(client, q, sid):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    await q.answer()
-    await _show_next_after_title(q.message, sid)
-
-
-async def _back_to_quality(client, q, sid):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    await q.answer()
-    await _show_qualities(q.message, sid)
-
-
-async def _back_to_seasons(client, q, sid):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _search_for_session(session)
-    lang = session.selected_language
-    seasons = sorted({h.season for h in hits
-                      if h.season is not None and (not lang or lang in (h.audio_languages or []))})
-    if not seasons:
-        await q.answer("❌ ɴᴏ ꜱᴇᴀꜱᴏɴꜱ", show_alert=True); return
-    await q.answer()
-    await _show_seasons(q.message, sid, seasons)
-
-
-async def _episode_page(client, q, sid, page):
-    session = await sessions.get(sid)
-    if not session or session.user_id != q.from_user.id:
-        await q.answer("⚠️ ᴇxᴘɪʀᴇᴅ", show_alert=True); return
-    hits = await _search_for_session(session)
-    lang = session.selected_language
-    season = session.selected_season
-    eps = sorted({h.episode for h in hits
-                  if h.season == season and h.episode is not None
-                  and (not lang or lang in (h.audio_languages or []))})
-    await q.answer()
-    await _show_episodes(q.message, sid, season, eps, page=page)
-
-
-# ═══════════════════════ INTERNAL ═══════════════════════
-async def _search_for_session(session):
-    norm = normalize(session.selected_title or session.normalized_query)
-    result = await engine.search_any(norm, year=session.selected_year)
-    return _filter_by_title(result.hits, session.selected_title or "", session.selected_year)
-
-
-async def _filter_hits(session):
-    hits = await _search_for_session(session)
-    if session.selected_language:
-        hits = [h for h in hits if session.selected_language in (h.audio_languages or [])]
-    if session.selected_season is not None:
-        hits = [h for h in hits if h.season == session.selected_season]
-    if session.selected_episode is not None:
-        hits = [h for h in hits if h.episode == session.selected_episode]
-    if session.selected_quality:
-        hits = [h for h in hits if (h.quality or "").upper() == session.selected_quality.upper()]
-    return hits
