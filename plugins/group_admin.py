@@ -87,7 +87,6 @@ async def cmd_settings(client: Client, message: Message):
     user_id = message.from_user.id
     chat = message.chat
 
-    # ── In a group: ask where to open ──
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         ok = await permission_manager.can_manage(client, chat.id, user_id)
         if not ok:
@@ -114,7 +113,6 @@ async def cmd_settings(client: Client, message: Message):
         )
         return
 
-    # ── In PM: list connected groups ──
     if chat.type == ChatType.PRIVATE:
         await _show_connected_groups(client, message, user_id)
 
@@ -1860,16 +1858,12 @@ async def cb_owner_refresh(client: Client, q: CallbackQuery):
 async def session_text_handler(client: Client, message: Message):
     """
     Handle text input for active sessions.
-
-    RULES:
-    - User MUST reply to the bot's prompt message.
-    - Only that exact prompt message is accepted.
-    - Any non-reply text is ignored.
+    Requires user to REPLY to the bot's prompt.
     """
     if not message.from_user or not message.text:
         return
 
-    # ── Require reply to bot ──
+    # Require reply to bot
     if not message.reply_to_message:
         return
     if not message.reply_to_message.from_user:
@@ -1880,7 +1874,6 @@ async def session_text_handler(client: Client, message: Message):
     uid = message.from_user.id
     reply_id = message.reply_to_message.id
 
-    # ── Fetch the session bound to this prompt ──
     try:
         from database import db_registry
         db = db_registry.get_system_db()
@@ -1910,7 +1903,6 @@ async def session_text_handler(client: Client, message: Message):
     token = session.get("token")
     payload = session.get("payload", {}) or {}
 
-    # ── Permission re-check ──
     ok = await permission_manager.can_manage(client, chat_id, uid)
     if not ok:
         await session_manager.cancel(token)
@@ -2041,7 +2033,6 @@ async def session_text_handler(client: Client, message: Message):
                                  parse_mode=ParseMode.HTML)
         return
 
-    # ── Fallback ──
     await session_manager.cancel(token)
 
 
