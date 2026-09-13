@@ -34,7 +34,8 @@ class GroupSessionManager:
 
     async def start(self, user_id: int, chat_id: int, action: str,
                     payload: Optional[Dict[str, Any]] = None,
-                    ttl: int = DEFAULT_TTL_SECONDS) -> str:
+                    ttl: int = DEFAULT_TTL_SECONDS,
+                    prompt_msg_id: Optional[int] = None) -> str:
         c = self._coll()
         if c is None:
             return ""
@@ -47,6 +48,7 @@ class GroupSessionManager:
             "action": action,
             "step": 1,
             "payload": payload or {},
+            "prompt_msg_id": prompt_msg_id,     # ← NEW: which message to reply to
             "created_at": now,
             "expires_at": now + ttl,
         }
