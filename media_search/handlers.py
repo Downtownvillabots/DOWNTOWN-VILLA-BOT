@@ -660,24 +660,17 @@ async def _show_files(target, sid):
 
     display = uniq[:10]
 
-    # ── Clean button labels ──
+        # ── Clean button labels: size + clean filename (no emojis in name) ──
     rows = []
     for i, h in enumerate(display):
-        size = human_size_short(h.file_size)
-        codec = (h.codec or "?").upper()
-        clean = clean_filename(h.file_name, max_len=40)
-        label = f"📦 {size} · {codec} · {clean}"
+        size = human_size_short(h.file_size)          # "1.5GB"
+        clean = clean_filename(h.file_name, max_len=42)  # preserves case
+        label = f"📦 {size} · {clean} . {codec}"
         if len(label) > 64:
             label = label[:61] + "…"
         rows.append([InlineKeyboardButton(
             label,
             callback_data=f"sr:file:{sid}:{i}",
-        )])
-
-    if len(uniq) > 10:
-        rows.append([InlineKeyboardButton(
-            f"➕ {len(uniq) - 10} MORE",
-            callback_data=f"sr:q_back:{sid}",
         )])
 
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"sr:q_back:{sid}")])
