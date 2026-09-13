@@ -35,6 +35,17 @@ async def pm_text(client: Client, message: Message):
         if len(txt) < 2 or len(txt) > 120:
             return
 
+        # ── Enforce /pm_search toggle ──
+        try:
+            from database import db_registry
+            db = db_registry.get_system_db()
+            if db is not None:
+                doc = await db["bot_settings"].find_one({"bot_id": client.me.id})
+                if doc and doc.get("pm_search") is False:
+                    return  # PM search disabled
+        except Exception as e:
+            logger.debug(f"[PM] toggle check failed: {e}")
+
         logger.info(f"[PM] from={message.from_user.id} text={txt[:60]!r}")
 
         h = _h()
@@ -45,7 +56,6 @@ async def pm_text(client: Client, message: Message):
 
     except Exception as e:
         logger.exception(f"[PM] handler failed: {type(e).__name__}: {e}")
-
 
 # ═══════════════════════ /pm_search TOGGLE ═══════════════════════
 @Client.on_message(filters.private & filters.command("pm_search"))
