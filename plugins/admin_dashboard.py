@@ -3,7 +3,7 @@
 🏨 DOWNTOWN VILLA — ULTIMATE DATABASE CONTROL CENTER (FANCY EDITION)
 Beautiful typography + colorful progress bars. Real MongoDB data only.
 """
-import asyncio, logging, re, time
+import asyncio, logging, os, re, time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +20,12 @@ from database import db_registry
 logger = logging.getLogger(__name__)
 
 logger.info("[ADMIN-DASHBOARD] plugin loaded")
+
+# ═══════════════════════ STORAGE CAPACITY ═══════════════════════
+try:
+    DB_CAPACITY_MB = int(os.getenv("DB_CAPACITY_MB", "512"))
+except (TypeError, ValueError):
+    DB_CAPACITY_MB = 512
 
 # ═══════════════════════ FANCY FONTS ═══════════════════════
 _M_BOLD = {
@@ -111,16 +117,47 @@ def pbar(p: float, w: int = BAR_W) -> str:
     return TICK * filled + EMPTY * (w - filled)
 
 def pcolor(p: float) -> str:
-    """Colour emoji for progress state."""
+    """Colour emoji for capacity usage:
+       < 50%  🟢
+       50–69% 🟡
+       70–84% 🟠
+       85%+   🔴
+    """
     try:
         p = float(p)
     except (TypeError, ValueError):
         return "⚪"
-    if p >= 100: return "🔴"
-    if p >= 90:  return "🔴"
-    if p >= 75:  return "🟠"
-    if p >= 60:  return "🟡"
+    if p >= 85:
+        return "🔴"
+    if p >= 70:
+        return "🟠"
+    if p >= 50:
+        return "🟡"
     return "🟢"
+
+def _colorful_bar(p: float, width: int = 10) -> str:
+    """Colored emoji progress bar for storage capacity:
+       🟩 filled  ·  ⬛ empty
+       Color shifts 🟩 → 🟨 → 🟧 → 🟥 based on percent.
+    """
+    try:
+        p = max(0.0, min(100.0, float(p)))
+    except (TypeError, ValueError):
+        p = 0.0
+    filled = int(round(width * p / 100.0))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+
+    if p >= 85:
+        block = "🟥"
+    elif p >= 70:
+        block = "🟧"
+    elif p >= 50:
+        block = "🟨"
+    else:
+        block = "🟩"
+
+    return block * filled + "⬛" * empty
 
 def progress_line(label: str, p: float, w: int = BAR_W) -> str:
     """One-line colorful progress with label."""
@@ -480,6 +517,18 @@ def _db_block(cat: str, d: Dict[str, Any], share_pct: Optional[float] = None) ->
         f"🧩 {sc('indexes')} · <code>{fmt_bytes(d['index_size'])}</code>",
         f"🗂️ {sc('collections')} · <code>{fmt_int(d['collections'])}</code>",
     ]
+
+    # ── Colored capacity bar ──
+    storage = d.get("storage_size") or 0
+    used_mb = storage / (1024 * 1024)
+    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
+    lines.append("")
+    lines.append(
+        f"{pcolor(cap_pct)} <b>{sc('capacity')}</b> · "
+        f"<code>{fmt_bytes(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>"
+    )
+    lines.append(f"{_colorful_bar(cap_pct)} {cap_pct:.1f}%")
+
     if share_pct is not None:
         lines.append("")
         lines.append(progress_line("share of category", share_pct))
@@ -518,7 +567,6 @@ async def view_main():
     data = await stats.overall()
     s, u, m = data["system"], data["user"], data["media"]
     tot = data["totals"]
-    # category shares by documents
     total_docs = max(1, s["totals"]["objects"] + u["totals"]["objects"] + m["totals"]["objects"])
     sp = pct(s["totals"]["objects"], total_docs)
     up = pct(u["totals"]["objects"], total_docs)
@@ -624,10 +672,12 @@ async def view_db(cat, index):
     status = "🟢 ᴏɴʟɪɴᴇ" if info["online"] else "🔴 ᴏꜰꜰʟɪɴᴇ"
     ping = f"{info['ping_ms']}ms" if info["ping_ms"] is not None else "—"
     ver = info["version"] or "—"
-    # index overhead vs data size
     overhead = pct(info["index_size"], max(1, info["data_size"]))
-    # storage efficiency: data / storage
     eff = pct(info["data_size"], max(1, info["storage_size"]))
+    # Capacity
+    storage = info.get("storage_size") or 0
+    used_mb = storage / (1024 * 1024)
+    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
     lines = [
         _header(), "",
         f"🗄️ <b>{fb(cat.upper() + ' DATABASE ' + f'{info['index']:02d}')}</b>",
@@ -643,6 +693,10 @@ async def view_db(cat, index):
         f"💾 {sc('storage')} · <code>{fmt_bytes(info['storage_size'])}</code>",
         f"🧩 {sc('indexes')} · <code>{fmt_bytes(info['index_size'])}</code>",
         f"📐 {sc('avg object')} · <code>{fmt_bytes(int(info['avg_obj'] or 0))}</code>",
+        "",
+        f"<b>{fb('STORAGE CAPACITY')}</b>",
+        f"{pcolor(cap_pct)} <code>{fmt_bytes(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>",
+        f"{_colorful_bar(cap_pct)} {cap_pct:.1f}%",
         "",
         f"<b>{fb('PERFORMANCE METRICS')}</b>",
         progress_line("index overhead", overhead),
@@ -862,9 +916,8 @@ async def view_perf(cat):
             lines.append(f"<b>{name.upper()} · {esc(i['label'])}</b>")
             lines.append(f"  ᴄᴜʀ · <code>{cur}ms</code>   ᴀᴠɢ · <code>{avg}ms</code>")
             lines.append(f"  ᴍɪɴ · <code>{mn}ms</code>   ᴍᴀx · <code>{mx}ms</code>")
-            # latency bar (relative to 200ms max)
             if isinstance(st["cur"], (int, float)):
-                lat_pct = min(100.0, st["cur"] / 2.0)  # 200ms = 100%
+                lat_pct = min(100.0, st["cur"] / 2.0)
                 lines.append(f"  {pcolor(lat_pct)} <code>{pbar(lat_pct, 16)}</code>")
             lines.append("")
     back = "db_main" if cat == "overall" else f"db_cat:{cat}"
@@ -973,7 +1026,7 @@ async def view_dup_scan(cat, index):
         lines.append(f"🔴 ꜱᴄᴀɴ ꜰᴀɪʟᴇᴅ · {esc(result.get('reason'))}")
         return "\n".join(lines), kb_dups(cat, index)
     total_docs = max(1, info["objects"])
-    scanned = total_docs  # simplified
+    scanned = total_docs
     lines.append(f"📦 ꜱᴄᴀɴɴᴇᴅ · <code>{fmt_int(scanned)}</code>")
     lines.append(f"🧹 ᴅᴜᴘʟɪᴄᴀᴛᴇ ɢʀᴏᴜᴘꜱ · <code>{fmt_int(result['total'])}</code>")
     lines.append("")
