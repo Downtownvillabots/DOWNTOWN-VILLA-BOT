@@ -45,6 +45,20 @@ async def start_bot():
     except Exception as e:
         logging.error(f"Database initialization failed: {e}")
 
+
+        # ── Group settings indexes ──
+    try:
+        from group_settings import (
+            config_manager, session_manager, statistics_manager,
+        )
+        await config_manager.ensure_indexes()
+        await session_manager.ensure_indexes()
+        await statistics_manager.ensure_indexes()
+        logging.info("Group settings indexes ensured.")
+    except Exception as e:
+        logging.warning(f"Group settings index setup failed: {e}")
+        
+
     # ── Search engine indexes (sessions + requests TTL) ──
     try:
         from media_search.sessions import sessions
