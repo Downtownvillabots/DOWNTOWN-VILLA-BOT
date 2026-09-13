@@ -422,7 +422,7 @@ async def cb_content_set(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════ SEARCH & FILTER ═══════════════════════
-@SEARCH_TOGGLES := [
+SEARCH_TOGGLES = [
     ("auto_filter", "AUTO FILTER"),
     ("spell_check", "SPELL CHECK"),
     ("query_cleaning", "QUERY CLEANING"),
