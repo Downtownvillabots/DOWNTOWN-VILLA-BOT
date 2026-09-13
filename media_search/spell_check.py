@@ -12,8 +12,16 @@ from core.config import (
 from media_search.engine import engine
 from media_search.metadata import metadata_provider
 from media_search.normalizer import normalize
-from services import metadata as imdb_service  # unified provider chain
-
+try:
+    from services import metadata as imdb_service
+    logger.info("[SPELL] using unified metadata service")
+except Exception as _e1:
+    try:
+        from services import imdb as imdb_service
+        logger.warning(f"[SPELL] unified metadata missing ({_e1}); using IMDb only")
+    except Exception as _e2:
+        imdb_service = None
+        logger.warning(f"[SPELL] no metadata provider available: {_e2}")
 logger = logging.getLogger(__name__)
 
 try:
