@@ -181,3 +181,7 @@ try:
     REQST_CHANNEL = int(_req_raw) if _req_raw and _req_raw.lstrip("-").isdigit() and int(_req_raw) != 0 else None
 except (TypeError, ValueError):
     REQST_CHANNEL = None
+
+
+# ═══════════════════════ METADATA PROVIDERS ═══════════════════════
+OMDB_API_KEY = environ.get("OMDB_API_KEY", "")
