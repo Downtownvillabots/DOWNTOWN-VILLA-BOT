@@ -57,7 +57,6 @@ async def start_bot():
 
         # ── Media file indexes (search + lookup performance) ──
     try:
-        from database import db_registry
         for entry in db_registry.media_entries():
             col = entry.db["media_files"]
             await col.create_index("normalized_title")
