@@ -23,7 +23,10 @@ def _h():
 
 
 # ═══════════════════════ PM TEXT → SEARCH ═══════════════════════
-@Client.on_message(filters.private & filters.text)
+@Client.on_message(
+filters.private & filters.text & ~filters.regex(r"^/"),
+    group=500,   # ← LOW priority — commands run first
+)
 async def pm_text(client: Client, message: Message):
     """Any PM text (not command, not URL) triggers a search."""
     try:
