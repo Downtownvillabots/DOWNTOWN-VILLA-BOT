@@ -20,7 +20,16 @@ from pyrogram.types import (
 )
 
 from database import db_manager
-from info import ADMINS
+
+# ─── ADMINS: try core.config first, then info, then empty ───
+try:
+    from core.config import ADMINS
+except ImportError:
+    try:
+        from info import ADMINS  # legacy fallback
+    except ImportError:
+        ADMINS = []
+
 
 logger = logging.getLogger(__name__)
 logger.info("[GADMIN] module import starting")
