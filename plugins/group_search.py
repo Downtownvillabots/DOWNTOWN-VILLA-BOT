@@ -479,8 +479,9 @@ def _clean_filename(name: Optional[str], max_len: int = 70) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButton]]:
-    """Convert stored button dicts to InlineKeyboardButton rows."""
+    """Convert stored button dicts to InlineKeyboardButton rows. Permissive."""
     if not isinstance(raw_buttons, list):
+        logger.info(f"[CUSTOM-BTNS] not a list: {type(raw_buttons)}")
         return []
 
     # Sort by position
@@ -489,20 +490,47 @@ def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButto
     except Exception:
         pass
 
+    logger.info(f"[CUSTOM-BTNS] raw data: {raw_buttons!r}")
+
     rows: List[List[InlineKeyboardButton]] = []
-    for b in raw_buttons:
+    for i, b in enumerate(raw_buttons):
         if not isinstance(b, dict):
+            logger.info(f"[CUSTOM-BTNS] skip #{i}: not a dict")
             continue
+
         if b.get("enabled") is False:
+            logger.info(f"[CUSTOM-BTNS] skip #{i}: disabled")
             continue
-        name = (b.get("name") or "").strip()
-        url = (b.get("url") or "").strip()
-        if not name or not url:
+
+        name = (b.get("name") or b.get("text") or b.get("title") or "").strip()
+        url = (b.get("url") or b.get("link") or b.get("href") or "").strip()
+
+        if not name:
+            logger.info(f"[CUSTOM-BTNS] skip #{i}: no name (keys: {list(b.keys())})")
             continue
-        if not (url.startswith("http://") or url.startswith("https://")
-                or url.startswith("tg://")):
+
+        if not url:
+            logger.info(f"[CUSTOM-BTNS] skip #{i}: no url (keys: {list(b.keys())})")
             continue
+
+        # Normalize URL — accept t.me/xxx, @xxx, or bare domain
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif url.startswith("t.me/"):
+            url = f"https://{url}"
+        elif not (url.startswith("http://") or url.startswith("https://")
+                  or url.startswith("tg://")):
+            # Try to make it a valid URL
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                logger.info(f"[CUSTOM-BTNS] skip #{i}: invalid url {url!r}")
+                continue
+
         rows.append([InlineKeyboardButton(name[:60], url=url)])
+        logger.info(f"[CUSTOM-BTNS] ✅ added: {name!r} → {url!r}")
+
+    logger.info(f"[CUSTOM-BTNS] built {len(rows)} buttons")
     return rows
 
 
