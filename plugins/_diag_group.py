@@ -1,8 +1,7 @@
 # plugins/_diag_group.py
 """
 DOWNTOWN VILLA — Group search diagnostic.
-Logs everything that happens when a text message arrives in a group.
-DELETE THIS FILE after debugging.
+DELETE after debugging.
 """
 
 import logging
@@ -10,11 +9,12 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
+logger.info("[DIAG] _diag_group.py loaded")   # ← confirms file is loaded
 
 
 @Client.on_message(
     filters.group & filters.text & filters.incoming & ~filters.regex(r"^/"),
-    group=-999,   # runs FIRST — before any other handler
+    group=-999,
 )
 async def diag_group_search(client: Client, message: Message):
     logger.info(
@@ -24,7 +24,7 @@ async def diag_group_search(client: Client, message: Message):
         f"text={message.text!r}"
     )
 
-    # 1) Check DB availability
+    # Check DB
     from database import db_manager
     try:
         user_db = db_manager.get_user_db() if hasattr(db_manager, "get_user_db") else None
@@ -34,16 +34,16 @@ async def diag_group_search(client: Client, message: Message):
     except Exception as e:
         logger.error(f"[DIAG] db_manager check failed: {e}")
 
-    # 2) Check group settings
+    # Group settings
     try:
         from database.users_chats_db import db as legacy_db
         settings = await legacy_db.get_settings(message.chat.id)
-        logger.info(f"[DIAG] settings.auto_ffilter={settings.get('auto_ffilter')} "
-                    f"settings.button={settings.get('button')}")
+        logger.info(f"[DIAG] auto_ffilter={settings.get('auto_ffilter')} "
+                    f"button={settings.get('button')}")
     except Exception as e:
         logger.warning(f"[DIAG] settings check failed: {e}")
 
-    # 3) Check media DB count
+    # Media count
     try:
         from database import db_manager as dm
         db = dm.get_media_db() if hasattr(dm, "get_media_db") else None
@@ -51,11 +51,11 @@ async def diag_group_search(client: Client, message: Message):
             total = await db["media_files"].count_documents({})
             logger.info(f"[DIAG] media_files count={total}")
         else:
-            logger.error("[DIAG] media DB is None — nothing was indexed yet!")
+            logger.error("[DIAG] media DB is None")
     except Exception as e:
         logger.warning(f"[DIAG] count check failed: {e}")
 
-    # 4) Run the actual search that auto_filter would do
+    # Search
     try:
         from services.media_service import get_search_results
         files, offset, total = await get_search_results(
