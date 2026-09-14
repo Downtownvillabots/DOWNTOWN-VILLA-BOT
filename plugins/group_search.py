@@ -1,12 +1,6 @@
 # plugins/group_search.py
 """
 🏨 DOWNTOWN VILLA — Complete standalone group search + PM delivery.
-
-NO imports from media_search.
-- Group handler: search DB → show file list buttons in group
-- Group click handler: redirect to bot PM
-- PM /start handler: deliver file with SHARE + UPDATES buttons
-- Auto-delete: file + warning after 10 minutes
 """
 
 import asyncio
@@ -14,13 +8,12 @@ import logging
 import re
 import secrets
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ParseMode
-from pyrogram.errors import FloodWait, MessageDeleteForbidden, MessageIdInvalid
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -34,9 +27,7 @@ logger = logging.getLogger(__name__)
 logger.info("[GROUP-SEARCH] module loaded (standalone)")
 
 
-# ═══════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════
+# ─── CONFIG ───
 AUTO_DELETE_ENABLED = True
 AUTO_DELETE_MINUTES = 10
 MAX_FILES_IN_LIST = 10
@@ -49,18 +40,15 @@ except Exception:
 DIV = "━" * 26
 
 
-# ═══════════════════════════════════════════════════════════
-# IN-MEMORY SESSION STORE
-# ═══════════════════════════════════════════════════════════
-# { session_id: {"hits": [dict,...], "user_id": int, "chat_id": int, "expires": float} }
+# ─── SESSIONS ───
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
-_SESSION_TTL = 1800   # 30 min
+_SESSION_TTL = 1800
 
 
 def _new_session(hits: List[Dict], user_id: int, chat_id: int) -> str:
     sid = secrets.token_hex(8)
     _SESSIONS[sid] = {
-        "hits": hits[:50],           # cap at 50 to keep memory bounded
+        "hits": hits[:50],
         "user_id": user_id,
         "chat_id": chat_id,
         "expires": time.time() + _SESSION_TTL,
@@ -85,9 +73,7 @@ def _cleanup_sessions() -> None:
             _SESSIONS.pop(sid, None)
 
 
-# ═══════════════════════════════════════════════════════════
-# QUERY NORMALIZATION
-# ═══════════════════════════════════════════════════════════
+# ─── QUERY NORMALIZATION ───
 _STOP_WORDS = {
     "movie", "movies", "film", "films", "download", "watch",
     "online", "free", "hd", "full", "the", "and",
@@ -120,7 +106,6 @@ def _normalize(text: str) -> str:
     t = re.sub(r"[.\-_/,;:\\]+", " ", t)
     t = re.sub(r"\s+", " ", t)
 
-    # K G F → KGF
     tokens = t.split()
     out, buf = [], []
     for tok in tokens:
@@ -163,11 +148,8 @@ def _parse_query(raw: str) -> Tuple[str, Optional[int], bool]:
     return " ".join(words).strip(), year, is_series
 
 
-# ═══════════════════════════════════════════════════════════
-# SEARCH (direct DB access)
-# ═══════════════════════════════════════════════════════════
+# ─── SEARCH ───
 def _media_collections() -> List[Tuple[int, Any]]:
-    """List of (index, collection) across all media shards."""
     out = []
     try:
         if hasattr(db_manager, "get_media_db_list"):
@@ -189,7 +171,6 @@ def _media_collections() -> List[Tuple[int, Any]]:
 
 async def _search_all_shards(norm: str, year: Optional[int],
                               is_series: bool, limit: int = 100) -> List[Dict]:
-    """Search all shards, return deduped list of file dicts."""
     collections = _media_collections()
     if not collections:
         return []
@@ -232,7 +213,6 @@ async def _search_all_shards(norm: str, year: Optional[int],
     for chunk in results:
         all_docs.extend(chunk)
 
-    # Dedupe by file_unique_id or file_id
     seen = set()
     uniq = []
     for d in all_docs:
@@ -242,14 +222,11 @@ async def _search_all_shards(norm: str, year: Optional[int],
         seen.add(key)
         uniq.append(d)
 
-    # Sort by file_size ascending (small → big)
     uniq.sort(key=lambda x: (x.get("file_size") is None, x.get("file_size") or 0))
     return uniq
 
 
-# ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
+# ─── HELPERS ───
 def _human_size(size) -> str:
     if not size:
         return "0 B"
@@ -286,7 +263,6 @@ def _clean_filename(name: Optional[str], max_len: int = 70) -> str:
     if not name:
         return ""
     n = str(name)
-    # strip ext
     n = re.sub(
         r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg|3gp|srt|vtt|ass)$",
         "", n, flags=re.IGNORECASE,
@@ -333,7 +309,6 @@ async def group_search_handler(client: Client, message: Message):
         if len(raw) < 2 or len(raw) > 100:
             return
 
-        # status message
         try:
             status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
         except Exception as e:
@@ -348,11 +323,9 @@ async def group_search_handler(client: Client, message: Message):
         docs = await _search_all_shards(norm, year, is_series)
         logger.info(f"[GROUP-SEARCH] {len(docs)} hits")
 
-        if not docs:
-            # fallback: no year filter
-            if year:
-                docs = await _search_all_shards(norm, None, is_series)
-                logger.info(f"[GROUP-SEARCH] retry without year: {len(docs)} hits")
+        if not docs and year:
+            docs = await _search_all_shards(norm, None, is_series)
+            logger.info(f"[GROUP-SEARCH] retry without year: {len(docs)} hits")
 
         if not docs:
             try:
@@ -365,14 +338,12 @@ async def group_search_handler(client: Client, message: Message):
                 pass
             return
 
-        # Build session
         sid = _new_session(
             docs,
             user_id=message.from_user.id if message.from_user else 0,
             chat_id=message.chat.id,
         )
 
-        # Build file list buttons
         rows: List[List[InlineKeyboardButton]] = []
         for i, d in enumerate(docs[:MAX_FILES_IN_LIST]):
             size = _human_size_short(d.get("file_size"))
@@ -402,6 +373,8 @@ async def group_search_handler(client: Client, message: Message):
             f"ᴛᴀᴘ ᴀ ꜰɪʟᴇ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪᴛ ɪɴ ᴘᴍ:"
         )
 
+        logger.info(f"[GROUP-SEARCH] session={sid} buttons={len(rows)} text_len={len(text)}")
+
         try:
             await status.edit_text(
                 text,
@@ -409,15 +382,16 @@ async def group_search_handler(client: Client, message: Message):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+            logger.info(f"[GROUP-SEARCH] ✅ file list shown in group (sid={sid})")
         except Exception as e:
-            logger.warning(f"[GROUP-SEARCH] edit failed: {e}")
+            logger.warning(f"[GROUP-SEARCH] ❌ edit failed: {type(e).__name__}: {e}")
 
     except Exception as e:
         logger.exception(f"[GROUP-SEARCH] crashed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) FILE CLICK HANDLER (GROUP ONLY → REDIRECT TO PM)
+# 2) FILE CLICK HANDLER
 # ═══════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^gfile:"), group=-100)
 async def gfile_callback(client: Client, q: CallbackQuery):
@@ -425,6 +399,8 @@ async def gfile_callback(client: Client, q: CallbackQuery):
         _, sid, idx = q.data.split(":", 2)
     except Exception:
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+
+    logger.info(f"[GROUP-SEARCH] callback fired by user={q.from_user.id} data={q.data!r}")
 
     session = _get_session(sid)
     if not session:
@@ -441,7 +417,6 @@ async def gfile_callback(client: Client, q: CallbackQuery):
     if i < 0 or i >= len(session["hits"]):
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
-    # In a group? Redirect to PM. In PM? handled by other handler.
     is_group = q.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
     if is_group:
@@ -461,7 +436,6 @@ async def gfile_callback(client: Client, q: CallbackQuery):
             await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
         return
 
-    # PM: deliver directly
     await _deliver_file(client, q.from_user.id, session, i)
 
 
@@ -470,6 +444,8 @@ async def gfile_callback(client: Client, q: CallbackQuery):
 # ═══════════════════════════════════════════════════════════
 @Client.on_message(filters.command("start") & filters.private)
 async def pm_start_handler(client: Client, message: Message):
+    logger.info(f"[START-PM] user={message.from_user.id} text={message.text!r}")
+
     if len(message.command) < 2:
         return await _send_welcome(client, message)
 
@@ -481,6 +457,8 @@ async def pm_start_handler(client: Client, message: Message):
             i = int(idx)
         except Exception:
             return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ʟɪɴᴋ.")
+
+        logger.info(f"[START-PM] file payload: sid={sid} idx={i}")
 
         session = _get_session(sid)
         if not session:
@@ -496,7 +474,6 @@ async def pm_start_handler(client: Client, message: Message):
         await _deliver_file(client, message.from_user.id, session, i)
         return
 
-    # other payloads → welcome
     return await _send_welcome(client, message)
 
 
@@ -511,13 +488,14 @@ async def _send_welcome(client: Client, message: Message):
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) DELIVER FILE IN PM (with buttons + auto-delete)
+# 4) DELIVER FILE
 # ═══════════════════════════════════════════════════════════
 async def _deliver_file(client: Client, chat_id: int,
                         session: Dict[str, Any], idx: int):
     doc = session["hits"][idx]
     file_id = doc.get("file_id") or doc.get("_id")
     if not file_id:
+        logger.warning("[DELIVERY] no file_id")
         return
 
     title = doc.get("title") or doc.get("series_title") or "file"
@@ -529,7 +507,6 @@ async def _deliver_file(client: Client, chat_id: int,
     size = _human_size(doc.get("file_size"))
     year = doc.get("year")
 
-    # Caption
     lines = [f"🎬 <b>{_clean_filename(file_name, max_len=80)}</b>"]
     if year:
         lines.append(f"📅 {year}")
@@ -545,7 +522,6 @@ async def _deliver_file(client: Client, chat_id: int,
     lines.append("⚡ <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>")
     caption = "\n".join(lines)
 
-    # Buttons
     try:
         me = await client.get_me()
         bot_username = me.username
@@ -562,7 +538,6 @@ async def _deliver_file(client: Client, chat_id: int,
         InlineKeyboardButton("📢 UPDATES", url=UPDATE_CHNL_LNK or "https://t.me/"),
     ]])
 
-    # Send file
     sent = None
     try:
         sent = await client.send_cached_media(
@@ -588,7 +563,6 @@ async def _deliver_file(client: Client, chat_id: int,
         logger.warning(f"[DELIVERY] failed: {e}")
         return
 
-    # Auto-delete warning
     if sent and AUTO_DELETE_ENABLED and AUTO_DELETE_MINUTES > 0:
         warning_msg_id = None
         try:
@@ -629,7 +603,7 @@ async def _auto_delete(client: Client, chat_id: int, msg_id: int,
 
 
 # ═══════════════════════════════════════════════════════════
-# 5) CLOSE CALLBACK
+# 5) CLOSE
 # ═══════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^gclose$"))
 async def gclose(client: Client, q: CallbackQuery):
@@ -641,7 +615,7 @@ async def gclose(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════
-# 6) BACKGROUND CLEANUP
+# 6) CLEANUP TASK
 # ═══════════════════════════════════════════════════════════
 async def _cleanup_loop():
     while True:
