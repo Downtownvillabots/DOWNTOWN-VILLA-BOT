@@ -1449,7 +1449,7 @@ async def _confirm_cleanup():
         except Exception: pass
         await asyncio.sleep(60)
 
-@Client.on_message(filters.command("database_cleanup") & filters.private)
+@Client.on_message(filters.command("database_cleanup") & filters.private, group=-500)
 async def cmd_cleanup(client, msg):
     if not is_admin(msg.from_user.id):
         await msg.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ."); return
