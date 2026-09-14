@@ -1,6 +1,21 @@
 # plugins/group_search.py
 """
-🏨 DOWNTOWN VILLA — Complete standalone group search + PM delivery.
+🏨 DOWNTOWN VILLA — ULTIMATE Standalone Group Search.
+
+Per-group settings:
+  • auto_ffilter          → enable/disable search
+  • result_buttons        → custom buttons on delivered file
+  • fsub                  → custom force-sub channels
+  • is_verify             → verification (shortener) — TODO
+  • caption               → custom file caption
+  • auto_delete           → toggle auto-delete of delivered files
+  • delete_time           → seconds before delete (default 600)
+
+Group flow:
+  User types in group → read THAT group's settings → search → show file buttons
+  User clicks file → Telegram switches to bot PM → /start file_{sid}_{idx}
+  PM delivers file WITH that group's custom buttons + SHARE/UPDATES
+  File auto-deletes per group's setting
 """
 
 import asyncio
@@ -24,34 +39,48 @@ from pyrogram.types import (
 from database import db_manager
 
 logger = logging.getLogger(__name__)
-logger.info("[GROUP-SEARCH] module loaded (standalone)")
+logger.info("[GROUP-SEARCH] module loaded (ultimate)")
 
 
-# ─── CONFIG ───
-AUTO_DELETE_ENABLED = True
-AUTO_DELETE_MINUTES = 10
+# ═══════════════════════════════════════════════════════════
+# DEFAULTS
+# ═══════════════════════════════════════════════════════════
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "auto_ffilter": True,
+    "auto_delete": True,
+    "delete_time": 600,
+    "result_buttons": [],
+    "fsub": [],
+    "caption": None,
+    "is_verify": False,
+}
+
 MAX_FILES_IN_LIST = 10
+SESSION_TTL = 1800
+DIV = "━" * 26
 
 try:
     from core.config import UPDATE_CHNL_LNK
 except Exception:
     UPDATE_CHNL_LNK = "https://t.me/"
 
-DIV = "━" * 26
 
-
-# ─── SESSIONS ───
+# ═══════════════════════════════════════════════════════════
+# SESSION STORE (in-memory)
+# ═══════════════════════════════════════════════════════════
+# { sid: {"hits": [...], "user_id": int, "chat_id": int, "expires": float, "buttons": [...]} }
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
-_SESSION_TTL = 1800
 
 
-def _new_session(hits: List[Dict], user_id: int, chat_id: int) -> str:
+def _new_session(hits: List[Dict], user_id: int, chat_id: int,
+                 custom_buttons: List[Dict]) -> str:
     sid = secrets.token_hex(8)
     _SESSIONS[sid] = {
         "hits": hits[:50],
         "user_id": user_id,
         "chat_id": chat_id,
-        "expires": time.time() + _SESSION_TTL,
+        "custom_buttons": custom_buttons or [],
+        "expires": time.time() + SESSION_TTL,
     }
     return sid
 
@@ -73,7 +102,84 @@ def _cleanup_sessions() -> None:
             _SESSIONS.pop(sid, None)
 
 
-# ─── QUERY NORMALIZATION ───
+# ═══════════════════════════════════════════════════════════
+# DB HELPERS
+# ═══════════════════════════════════════════════════════════
+def _groups_coll():
+    """Return groups collection."""
+    try:
+        for name in ("get_user_db", "get_system_db", "get_media_db"):
+            fn = getattr(db_manager, name, None)
+            if callable(fn):
+                db = fn()
+                if db is not None:
+                    return db["groups"]
+    except Exception:
+        pass
+    return None
+
+
+def _media_collections() -> List[Tuple[int, Any]]:
+    """All media shards: [(index, collection)]."""
+    out: List[Tuple[int, Any]] = []
+    try:
+        if hasattr(db_manager, "get_media_db_list"):
+            for idx in db_manager.get_media_db_list():
+                db = db_manager.get_media_db(idx)
+                if db is not None:
+                    out.append((idx, db["media_files"]))
+        if not out and hasattr(db_manager, "get_media_db"):
+            try:
+                db = db_manager.get_media_db()
+            except TypeError:
+                db = db_manager.get_media_db(1)
+            if db is not None:
+                out.append((1, db["media_files"]))
+    except Exception as e:
+        logger.warning(f"[GROUP-SEARCH] media colls failed: {e}")
+    return out
+
+
+async def _get_group_settings(chat_id: int) -> Dict[str, Any]:
+    """
+    Load full per-group settings.
+    Merges: DEFAULTS → settings sub-doc → top-level fields.
+    """
+    if not chat_id:
+        return dict(DEFAULT_SETTINGS)
+
+    coll = _groups_coll()
+    if coll is None:
+        return dict(DEFAULT_SETTINGS)
+
+    try:
+        doc = await coll.find_one({"chat_id": int(chat_id)})
+    except Exception as e:
+        logger.warning(f"[GROUP-SEARCH] settings load failed: {e}")
+        return dict(DEFAULT_SETTINGS)
+
+    merged = dict(DEFAULT_SETTINGS)
+    if not doc:
+        return merged
+
+    # Merge "settings" sub-doc first
+    sub = doc.get("settings") or {}
+    if isinstance(sub, dict):
+        for k, v in sub.items():
+            if v is not None:
+                merged[k] = v
+
+    # Then overlay top-level fields
+    for k in list(DEFAULT_SETTINGS.keys()):
+        if k in doc and doc[k] is not None:
+            merged[k] = doc[k]
+
+    return merged
+
+
+# ═══════════════════════════════════════════════════════════
+# QUERY NORMALIZATION
+# ═══════════════════════════════════════════════════════════
 _STOP_WORDS = {
     "movie", "movies", "film", "films", "download", "watch",
     "online", "free", "hd", "full", "the", "and",
@@ -148,27 +254,9 @@ def _parse_query(raw: str) -> Tuple[str, Optional[int], bool]:
     return " ".join(words).strip(), year, is_series
 
 
-# ─── SEARCH ───
-def _media_collections() -> List[Tuple[int, Any]]:
-    out = []
-    try:
-        if hasattr(db_manager, "get_media_db_list"):
-            for idx in db_manager.get_media_db_list():
-                db = db_manager.get_media_db(idx)
-                if db is not None:
-                    out.append((idx, db["media_files"]))
-        if not out and hasattr(db_manager, "get_media_db"):
-            try:
-                db = db_manager.get_media_db()
-            except TypeError:
-                db = db_manager.get_media_db(1)
-            if db is not None:
-                out.append((1, db["media_files"]))
-    except Exception as e:
-        logger.warning(f"[GROUP-SEARCH] media colls failed: {e}")
-    return out
-
-
+# ═══════════════════════════════════════════════════════════
+# SEARCH
+# ═══════════════════════════════════════════════════════════
 async def _search_all_shards(norm: str, year: Optional[int],
                               is_series: bool, limit: int = 100) -> List[Dict]:
     collections = _media_collections()
@@ -213,6 +301,7 @@ async def _search_all_shards(norm: str, year: Optional[int],
     for chunk in results:
         all_docs.extend(chunk)
 
+    # Dedupe
     seen = set()
     uniq = []
     for d in all_docs:
@@ -226,7 +315,9 @@ async def _search_all_shards(norm: str, year: Optional[int],
     return uniq
 
 
-# ─── HELPERS ───
+# ═══════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════
 def _human_size(size) -> str:
     if not size:
         return "0 B"
@@ -277,12 +368,31 @@ def _clean_filename(name: Optional[str], max_len: int = 70) -> str:
     return n or "file"
 
 
-async def _get_settings_safe(chat_id: int) -> Dict[str, Any]:
+def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButton]]:
+    """Convert saved button dicts → InlineKeyboardButton rows."""
+    if not isinstance(raw_buttons, list):
+        return []
+    # sort by position
     try:
-        from services.settings_service import get_settings
-        return await get_settings(chat_id)
+        raw_buttons = sorted(raw_buttons, key=lambda b: b.get("position", 999))
     except Exception:
-        return {"auto_ffilter": True}
+        pass
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for b in raw_buttons:
+        if not isinstance(b, dict):
+            continue
+        if b.get("enabled") is False:
+            continue
+        name = (b.get("name") or "").strip()
+        url = (b.get("url") or "").strip()
+        if not name or not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")
+                or url.startswith("tg://")):
+            continue
+        rows.append([InlineKeyboardButton(name[:60], url=url)])
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════
@@ -300,19 +410,20 @@ async def group_search_handler(client: Client, message: Message):
     )
 
     try:
-        settings = await _get_settings_safe(message.chat.id)
+        # ── Load per-group settings ──
+        settings = await _get_group_settings(message.chat.id)
         if not settings.get("auto_ffilter", True):
             logger.info("[GROUP-SEARCH] auto_ffilter OFF — skip")
             return
 
-        raw = message.text.strip()
+        raw = (message.text or "").strip()
         if len(raw) < 2 or len(raw) > 100:
             return
 
         try:
             status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
         except Exception as e:
-            logger.warning(f"[GROUP-SEARCH] cannot reply: {e}")
+            logger.warning(f"[GROUP-SEARCH] reply failed: {e}")
             return
 
         norm, year, is_series = _parse_query(raw)
@@ -338,12 +449,16 @@ async def group_search_handler(client: Client, message: Message):
                 pass
             return
 
+        # ── Snapshot the group's custom buttons NOW ──
+        raw_buttons = settings.get("result_buttons") or []
         sid = _new_session(
             docs,
             user_id=message.from_user.id if message.from_user else 0,
             chat_id=message.chat.id,
+            custom_buttons=raw_buttons,
         )
 
+        # ── Build file list buttons ──
         rows: List[List[InlineKeyboardButton]] = []
         for i, d in enumerate(docs[:MAX_FILES_IN_LIST]):
             size = _human_size_short(d.get("file_size"))
@@ -373,7 +488,10 @@ async def group_search_handler(client: Client, message: Message):
             f"ᴛᴀᴘ ᴀ ꜰɪʟᴇ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪᴛ ɪɴ ᴘᴍ:"
         )
 
-        logger.info(f"[GROUP-SEARCH] session={sid} buttons={len(rows)} text_len={len(text)}")
+        logger.info(
+            f"[GROUP-SEARCH] session={sid} buttons={len(rows)} "
+            f"custom_btns={len(raw_buttons)}"
+        )
 
         try:
             await status.edit_text(
@@ -382,16 +500,16 @@ async def group_search_handler(client: Client, message: Message):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-            logger.info(f"[GROUP-SEARCH] ✅ file list shown in group (sid={sid})")
+            logger.info(f"[GROUP-SEARCH] ✅ file list shown (sid={sid})")
         except Exception as e:
-            logger.warning(f"[GROUP-SEARCH] ❌ edit failed: {type(e).__name__}: {e}")
+            logger.warning(f"[GROUP-SEARCH] edit failed: {e}")
 
     except Exception as e:
         logger.exception(f"[GROUP-SEARCH] crashed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) FILE CLICK HANDLER
+# 2) FILE CLICK → REDIRECT
 # ═══════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^gfile:"), group=-100)
 async def gfile_callback(client: Client, q: CallbackQuery):
@@ -400,7 +518,7 @@ async def gfile_callback(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
-    logger.info(f"[GROUP-SEARCH] callback fired by user={q.from_user.id} data={q.data!r}")
+    logger.info(f"[GROUP-SEARCH] callback user={q.from_user.id} data={q.data!r}")
 
     session = _get_session(sid)
     if not session:
@@ -423,9 +541,7 @@ async def gfile_callback(client: Client, q: CallbackQuery):
         try:
             me = await client.get_me()
             deep_link = f"https://t.me/{me.username}?start=file_{sid}_{i}"
-            logger.info(
-                f"[GROUP-SEARCH] redirect user={q.from_user.id} → {deep_link}"
-            )
+            logger.info(f"[GROUP-SEARCH] redirect user={q.from_user.id} → {deep_link}")
             try:
                 q.stop_propagation()
             except Exception:
@@ -440,7 +556,7 @@ async def gfile_callback(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════
-# 3) PM /start HANDLER
+# 3) PM /start
 # ═══════════════════════════════════════════════════════════
 @Client.on_message(filters.command("start") & filters.private)
 async def pm_start_handler(client: Client, message: Message):
@@ -458,7 +574,7 @@ async def pm_start_handler(client: Client, message: Message):
         except Exception:
             return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ʟɪɴᴋ.")
 
-        logger.info(f"[START-PM] file payload: sid={sid} idx={i}")
+        logger.info(f"[START-PM] sid={sid} idx={i}")
 
         session = _get_session(sid)
         if not session:
@@ -470,6 +586,18 @@ async def pm_start_handler(client: Client, message: Message):
 
         if i < 0 or i >= len(session["hits"]):
             return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ꜰɪʟᴇ ɪɴᴅᴇx.")
+
+        # ── Verify user still has access to the group ──
+        group_id = session.get("chat_id")
+        if group_id:
+            try:
+                await client.get_chat_member(group_id, message.from_user.id)
+            except Exception:
+                # User left the group — still allow delivery? No, block.
+                return await message.reply_text(
+                    "⚠️ ʏᴏᴜ ᴀʀᴇ ɴᴏ ʟᴏɴɢᴇʀ ɪɴ ᴛʜᴀᴛ ɢʀᴏᴜᴘ.",
+                    parse_mode=ParseMode.HTML,
+                )
 
         await _deliver_file(client, message.from_user.id, session, i)
         return
@@ -488,7 +616,7 @@ async def _send_welcome(client: Client, message: Message):
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) DELIVER FILE
+# 4) DELIVER FILE (uses session's stored group buttons)
 # ═══════════════════════════════════════════════════════════
 async def _deliver_file(client: Client, chat_id: int,
                         session: Dict[str, Any], idx: int):
@@ -507,6 +635,7 @@ async def _deliver_file(client: Client, chat_id: int,
     size = _human_size(doc.get("file_size"))
     year = doc.get("year")
 
+    # ── Caption ──
     lines = [f"🎬 <b>{_clean_filename(file_name, max_len=80)}</b>"]
     if year:
         lines.append(f"📅 {year}")
@@ -522,6 +651,14 @@ async def _deliver_file(client: Client, chat_id: int,
     lines.append("⚡ <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>")
     caption = "\n".join(lines)
 
+    # ── Build keyboard ──
+    # 1) Custom group buttons (from the ORIGINAL group)
+    kb_rows: List[List[InlineKeyboardButton]] = []
+    custom = _build_custom_button_rows(session.get("custom_buttons") or [])
+    if custom:
+        kb_rows.extend(custom)
+
+    # 2) SHARE + UPDATES always on top row(s)
     try:
         me = await client.get_me()
         bot_username = me.username
@@ -533,11 +670,14 @@ async def _deliver_file(client: Client, chat_id: int,
         f"url=https://t.me/{bot_username}&"
         f"text={quote_plus(f'🎬 {title} — via @{bot_username}')}"
     )
-    kb = InlineKeyboardMarkup([[
+    kb_rows.append([
         InlineKeyboardButton("📤 SHARE", url=share_url),
         InlineKeyboardButton("📢 UPDATES", url=UPDATE_CHNL_LNK or "https://t.me/"),
-    ]])
+    ])
 
+    kb = InlineKeyboardMarkup(kb_rows)
+
+    # ── Send file ──
     sent = None
     try:
         sent = await client.send_cached_media(
@@ -546,7 +686,10 @@ async def _deliver_file(client: Client, chat_id: int,
             caption=caption,
             reply_markup=kb,
         )
-        logger.info(f"[DELIVERY] sent file_id={file_id[:20]}… to={chat_id}")
+        logger.info(
+            f"[DELIVERY] sent file_id={file_id[:20]}… to={chat_id} "
+            f"custom_btns={len(custom)}"
+        )
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
         try:
@@ -563,14 +706,21 @@ async def _deliver_file(client: Client, chat_id: int,
         logger.warning(f"[DELIVERY] failed: {e}")
         return
 
-    if sent and AUTO_DELETE_ENABLED and AUTO_DELETE_MINUTES > 0:
+    # ── Auto-delete using ORIGINAL group's setting ──
+    group_id = session.get("chat_id") or 0
+    group_settings = await _get_group_settings(group_id)
+    if not group_settings.get("auto_delete", True):
+        return
+
+    minutes = max(1, int(group_settings.get("delete_time", 600)) // 60)
+    if sent:
         warning_msg_id = None
         try:
             warn = await client.send_message(
                 chat_id=chat_id,
                 text=(
                     f"⚠️ ᴛʜɪꜱ ꜰɪʟᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ "
-                    f"<b>{AUTO_DELETE_MINUTES} ᴍɪɴᴜᴛᴇꜱ</b>."
+                    f"<b>{minutes} ᴍɪɴᴜᴛᴇꜱ</b>."
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -579,8 +729,7 @@ async def _deliver_file(client: Client, chat_id: int,
             pass
 
         asyncio.create_task(
-            _auto_delete(client, chat_id, sent.id, warning_msg_id,
-                         AUTO_DELETE_MINUTES)
+            _auto_delete(client, chat_id, sent.id, warning_msg_id, minutes)
         )
 
 
@@ -632,3 +781,143 @@ try:
     asyncio.get_event_loop().create_task(_cleanup_loop())
 except Exception:
     pass
+
+
+# ═══════════════════════════════════════════════════════════
+# 7) ADMIN IN-GROUP BUTTON MANAGEMENT
+# ═══════════════════════════════════════════════════════════
+async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    try:
+        m = await client.get_chat_member(chat_id, user_id)
+        st = getattr(m, "status", None)
+        st = st.name.lower() if hasattr(st, "name") else str(st).lower()
+        return st in ("administrator", "creator", "owner")
+    except Exception:
+        return False
+
+
+@Client.on_message(filters.command("add_button") & filters.group)
+async def cmd_add_button(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or "|" not in args[1]:
+        return await message.reply_text(
+            "ᴜꜱᴀɢᴇ:\n<code>/add_button NAME | URL</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    name, url = [p.strip() for p in args[1].split("|", 1)]
+    if not (url.startswith("http://") or url.startswith("https://")
+            or url.startswith("tg://")):
+        return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ.")
+
+    coll = _groups_coll()
+    if coll is None:
+        return await message.reply_text("❌ ᴅʙ ᴇʀʀᴏʀ.")
+
+    try:
+        doc = await coll.find_one({"chat_id": message.chat.id}) or {}
+        btns = list(doc.get("result_buttons") or
+                    (doc.get("settings") or {}).get("result_buttons") or [])
+        if len(btns) >= 8:
+            return await message.reply_text("⚠️ ᴍᴀx 8 ʙᴜᴛᴛᴏɴꜱ.")
+        btns.append({
+            "name": name[:60],
+            "url": url,
+            "position": len(btns) + 1,
+            "enabled": True,
+        })
+        await coll.update_one(
+            {"chat_id": message.chat.id},
+            {"$set": {"result_buttons": btns}},
+            upsert=True,
+        )
+        await message.reply_text(
+            f"✅ ᴀᴅᴅᴇᴅ ʙᴜᴛᴛᴏɴ: <b>{name}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.exception(f"[GROUP-SEARCH] add_button failed: {e}")
+        await message.reply_text(f"❌ {e}")
+
+
+@Client.on_message(filters.command("list_buttons") & filters.group)
+async def cmd_list_buttons(client: Client, message: Message):
+    coll = _groups_coll()
+    if coll is None:
+        return await message.reply_text("❌ ᴅʙ ᴇʀʀᴏʀ.")
+    try:
+        doc = await coll.find_one({"chat_id": message.chat.id}) or {}
+        btns = doc.get("result_buttons") or \
+               (doc.get("settings") or {}).get("result_buttons") or []
+        if not btns:
+            return await message.reply_text("⚪ ɴᴏ ʙᴜᴛᴛᴏɴꜱ.")
+        lines = ["📦 <b>ʀᴇꜱᴜʟᴛ ʙᴜᴛᴛᴏɴꜱ</b>", DIV, ""]
+        for i, b in enumerate(btns, 1):
+            lines.append(f"{i}. <b>{b.get('name')}</b> → <code>{b.get('url')}</code>")
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.reply_text(f"❌ {e}")
+
+
+@Client.on_message(filters.command("remove_button") & filters.group)
+async def cmd_remove_button(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+    args = (message.text or "").split()
+    if len(args) < 2:
+        return await message.reply_text(
+            "ᴜꜱᴀɢᴇ: <code>/remove_button NUMBER</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    try:
+        idx = int(args[1]) - 1
+    except ValueError:
+        return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ɴᴜᴍʙᴇʀ.")
+    coll = _groups_coll()
+    if coll is None:
+        return await message.reply_text("❌ ᴅʙ ᴇʀʀᴏʀ.")
+    try:
+        doc = await coll.find_one({"chat_id": message.chat.id}) or {}
+        btns = list(doc.get("result_buttons") or
+                    (doc.get("settings") or {}).get("result_buttons") or [])
+        if idx < 0 or idx >= len(btns):
+            return await message.reply_text("❌ ᴏᴜᴛ ᴏꜰ ʀᴀɴɢᴇ.")
+        removed = btns.pop(idx)
+        for i, b in enumerate(btns, 1):
+            b["position"] = i
+        await coll.update_one(
+            {"chat_id": message.chat.id},
+            {"$set": {"result_buttons": btns}},
+        )
+        await message.reply_text(
+            f"✅ ʀᴇᴍᴏᴠᴇᴅ: <b>{removed.get('name')}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ {e}")
+
+
+@Client.on_message(filters.command("clear_buttons") & filters.group)
+async def cmd_clear_buttons(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+    coll = _groups_coll()
+    if coll is None:
+        return await message.reply_text("❌ ᴅʙ ᴇʀʀᴏʀ.")
+    try:
+        await coll.update_one(
+            {"chat_id": message.chat.id},
+            {"$set": {"result_buttons": []}},
+        )
+        await message.reply_text("✅ ᴀʟʟ ᴄᴜꜱᴛᴏᴍ ʙᴜᴛᴛᴏɴꜱ ᴄʟᴇᴀʀᴇᴅ.")
+    except Exception as e:
+        await message.reply_text(f"❌ {e}")
