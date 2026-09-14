@@ -249,7 +249,7 @@ async def _build_main() -> str:
     ])
 
 # ═══════════════════════ COMMANDS ═══════════════════════
-@Client.on_message(filters.command(["index", "indexing"]) & filters.private)
+@Client.on_message(filters.command(["index", "indexing"]) & filters.private, group=-500)
 async def cmd_index(client: Client, message: Message):
     if not is_admin(message.from_user.id):
         await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ.")
@@ -1110,7 +1110,7 @@ async def cb_live(client: Client, q: CallbackQuery):
     await q.answer()
 
 # ═══════════════════════ RESET COMMAND ═══════════════════════
-@Client.on_message(filters.command("index_reset") & filters.private)
+@Client.on_message(filters.command("index_reset") & filters.private, group=-500)
 async def cmd_index_reset(client: Client, message: Message):
     if not is_admin(message.from_user.id):
         await message.reply_text("⛔ ᴜɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ."); return
