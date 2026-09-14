@@ -1118,7 +1118,7 @@ async def build_view(view: str, extra: Dict[str, Any]):
             InlineKeyboardButton("🏠 HOME", callback_data="db_main")]])
 
 # ═══════════════════════ HANDLERS ═══════════════════════
-@Client.on_message(filters.command("database") & filters.private)
+@Client.on_message(filters.command("database") & filters.private, group=-500)
 async def cmd_database(client: Client, msg: Message):
     logger.info(f"[ADMIN] /database from={msg.from_user.id} is_admin={is_admin(msg.from_user.id)}")
     if not is_admin(msg.from_user.id):
