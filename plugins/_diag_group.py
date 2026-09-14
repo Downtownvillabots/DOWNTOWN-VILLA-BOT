@@ -1,6 +1,6 @@
 # plugins/_diag_group.py
 """
-DOWNTOWN VILLA — Group search diagnostic.
+DOWNTOWN VILLA — Group search diagnostic (extended).
 DELETE after debugging.
 """
 
@@ -9,7 +9,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
-logger.info("[DIAG] _diag_group.py loaded")   # ← confirms file is loaded
+logger.info("[DIAG] _diag_group.py loaded")
 
 
 @Client.on_message(
@@ -19,29 +19,44 @@ logger.info("[DIAG] _diag_group.py loaded")   # ← confirms file is loaded
 async def diag_group_search(client: Client, message: Message):
     logger.info(
         f"[DIAG] group msg | chat={message.chat.id} "
-        f"type={message.chat.type} "
         f"user={message.from_user.id if message.from_user else '?'} "
         f"text={message.text!r}"
     )
 
-    # Check DB
+    # DB check
     from database import db_manager
+    user_db = None
+    media_db = None
     try:
         user_db = db_manager.get_user_db() if hasattr(db_manager, "get_user_db") else None
         media_db = db_manager.get_media_db() if hasattr(db_manager, "get_media_db") else None
-        logger.info(f"[DIAG] user_db={'OK' if user_db is not None else 'None'} "
-                    f"media_db={'OK' if media_db is not None else 'None'}")
-    except Exception as e:
-        logger.error(f"[DIAG] db_manager check failed: {e}")
+    except Exception:
+        pass
+    logger.info(f"[DIAG] user_db={'OK' if user_db else 'None'} media_db={'OK' if media_db else 'None'}")
 
-    # Group settings
+    # Settings
     try:
-        from database.users_chats_db import db as legacy_db
-        settings = await legacy_db.get_settings(message.chat.id)
-        logger.info(f"[DIAG] auto_ffilter={settings.get('auto_ffilter')} "
-                    f"button={settings.get('button')}")
+        from services.settings_service import get_settings
+        s = await get_settings(message.chat.id)
+        logger.info(
+            f"[DIAG] settings | auto_ffilter={s.get('auto_ffilter')} "
+            f"button={s.get('button')} imdb={s.get('imdb')} "
+            f"spell_check={s.get('spell_check')} auto_delete={s.get('auto_delete')}"
+        )
     except Exception as e:
-        logger.warning(f"[DIAG] settings check failed: {e}")
+        logger.exception(f"[DIAG] settings check failed: {e}")
+
+    # Bot admin rights in this chat
+    try:
+        me = await client.get_me()
+        member = await client.get_chat_member(message.chat.id, me.id)
+        status = getattr(member, "status", None)
+        status = status.name.lower() if hasattr(status, "name") else str(status).lower()
+        can_send = getattr(member, "can_send_messages", None)
+        can_media = getattr(member, "can_send_media_messages", None)
+        logger.info(f"[DIAG] bot status={status} can_send={can_send} can_media={can_media}")
+    except Exception as e:
+        logger.exception(f"[DIAG] bot member check failed: {e}")
 
     # Media count
     try:
@@ -50,12 +65,10 @@ async def diag_group_search(client: Client, message: Message):
         if db is not None:
             total = await db["media_files"].count_documents({})
             logger.info(f"[DIAG] media_files count={total}")
-        else:
-            logger.error("[DIAG] media DB is None")
     except Exception as e:
         logger.warning(f"[DIAG] count check failed: {e}")
 
-    # Search
+    # Search directly
     try:
         from services.media_service import get_search_results
         files, offset, total = await get_search_results(
@@ -64,9 +77,17 @@ async def diag_group_search(client: Client, message: Message):
             offset=0,
             filter=True,
         )
-        logger.info(f"[DIAG] get_search_results → files={len(files) if files else 0} "
-                    f"total={total} offset={offset}")
-    except ImportError as e:
-        logger.error(f"[DIAG] services.media_service missing: {e}")
+        logger.info(f"[DIAG] search → files={len(files) if files else 0} total={total}")
     except Exception as e:
-        logger.exception(f"[DIAG] get_search_results crashed: {e}")
+        logger.exception(f"[DIAG] search crashed: {e}")
+
+    # Run the actual group handler manually to see if it crashes
+    try:
+        from plugins.auto_filter import give_filter
+        logger.info("[DIAG] invoking group auto_filter manually...")
+        await give_filter(client, message)
+        logger.info("[DIAG] group auto_filter completed OK")
+    except ImportError as e:
+        logger.error(f"[DIAG] auto_filter handler not found: {e}")
+    except Exception as e:
+        logger.exception(f"[DIAG] auto_filter raised: {e}")
