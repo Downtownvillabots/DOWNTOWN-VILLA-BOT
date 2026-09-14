@@ -1,27 +1,31 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# 🏨 DOWNTOWN VILLA — ULTIMATE GROUP SEARCH (COMPLETE STANDALONE)
+# 🏨 DOWNTOWN VILLA — ULTIMATE GROUP SEARCH SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# This is a fully self-contained file. It does NOT import from media_search.
+# VERSION: 3.0 (Complete)
 #
-# FEATURES:
+# This file is COMPLETELY STANDALONE. No media_search imports.
+#
+# EVERYTHING INCLUDED:
 #   ✔ Group auto-search (per-group settings)
-#   ✔ File list shown in group (small → big)
-#   ✔ File click → redirect to PM (Telegram switches automatically)
-#   ✔ PM /start file_{sid}_{idx} → delivers with per-group custom buttons
-#   ✔ No results → IMDb suggestions (with years)
-#   ✔ Suggestion click → retry search → if found show files
-#   ✔ Suggestion click → still no files → post to REQUEST CHANNEL
-#   ✔ Request channel has admin action buttons (uploaded/not found/etc.)
-#   ✔ Admin action → user gets DM notification
-#   ✔ Auto-delete (per-group setting)
+#   ✔ File list in group (small → big)
+#   ✔ File click → redirect to bot PM
+#   ✔ PM /start file_{sid}_{idx} → delivers file with buttons
+#   ✔ Per-group custom buttons (with FULL logging to debug)
+#   ✔ No results → IMDb suggestions WITH YEARS
+#   ✔ Suggestion click → retry search → show files
+#   ✔ Suggestion click → no files → post to REQUEST CHANNEL
+#   ✔ Request channel has admin action buttons
+#   ✔ Admin actions → user gets DM notification
+#   ✔ Auto-delete per group (configurable seconds)
 #   ✔ Admin commands: /add_button, /list_buttons, /remove_button,
 #                     /clear_buttons, /set_delete_time, /debug_buttons
-#   ✔ All handlers use group=-999 (highest priority)
-#   ✔ Full error handling & logging
+#   ✔ All handlers at group=-999 (highest priority)
+#   ✔ Complete error handling + logging
 #
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ─── STANDARD LIBRARY ───────────────────────────────────────────────────────
 import asyncio
 import logging
 import re
@@ -32,93 +36,139 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
+# ─── PYROGRAM ───────────────────────────────────────────────────────────────
 from pyrogram import Client, filters, StopPropagation
 from pyrogram.enums import ChatType, ParseMode
 from pyrogram.errors import (
-    FloodWait, MessageIdInvalid, MessageNotModified, UserIsBlocked,
+    FloodWait,
+    MessageIdInvalid,
+    MessageNotModified,
+    UserIsBlocked,
+    ChatAdminRequired,
+    ChannelPrivate,
+    PeerIdInvalid,
 )
 from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
+# ─── LOCAL IMPORTS ──────────────────────────────────────────────────────────
 from database import db_manager
 
-# Optional config imports (failsafe)
+# Optional config imports (each with failsafe defaults)
 try:
-    from core.config import UPDATE_CHNL_LNK as _U
-    UPDATE_CHNL_LNK = _U or "https://t.me/"
+    from core.config import UPDATE_CHNL_LNK as _UPDATE_LNK
+    UPDATE_CHNL_LNK = _UPDATE_LNK or "https://t.me/"
 except Exception:
     UPDATE_CHNL_LNK = "https://t.me/"
 
 try:
-    from core.config import SUPPORT_CHAT as _S
-    SUPPORT_CHAT = _S or "https://t.me/"
+    from core.config import SUPPORT_CHAT as _SUPPORT
+    SUPPORT_CHAT = _SUPPORT or "https://t.me/"
 except Exception:
     SUPPORT_CHAT = "https://t.me/"
 
 try:
-    from core.config import REQST_CHANNEL as _R
-    REQST_CHANNEL = _R
+    from core.config import REQST_CHANNEL as _REQST
+    REQST_CHANNEL = _REQST
 except Exception:
     REQST_CHANNEL = None
 
 try:
-    from core.config import OWNER_LNK as _O
-    OWNER_LNK = _O or "https://t.me/"
+    from core.config import OWNER_LNK as _OWNER
+    OWNER_LNK = _OWNER or "https://t.me/"
 except Exception:
     OWNER_LNK = "https://t.me/"
 
 try:
-    from core.config import ADMINS as _A
-    ADMINS = list(_A or [])
+    from core.config import ADMINS as _ADMINS
+    ADMINS = list(_ADMINS or [])
 except Exception:
     ADMINS = []
 
-# Optional IMDb service
+try:
+    from core.config import AUTH_CHANNELS as _FSUB
+    AUTH_CHANNELS = list(_FSUB or [])
+except Exception:
+    AUTH_CHANNELS = []
+
+# Optional IMDb
 try:
     from imdbkit import IMDBKit
-    _IMDB = IMDBKit()
+    _IMDB_INSTANCE = IMDBKit()
     _HAS_IMDB = True
-except Exception as _e:
-    _IMDB = None
+except Exception as _imdb_err:
+    _IMDB_INSTANCE = None
     _HAS_IMDB = False
 
+# ─── LOGGER ─────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
-logger.info("[GROUP-SEARCH] ═══════════════════════════════════════════")
-logger.info("[GROUP-SEARCH] ULTIMATE module loading...")
+logger.info("")
+logger.info("╔════════════════════════════════════════════════════════════════╗")
+logger.info("║  [GROUP-SEARCH] ULTIMATE v3.0 — LOADING...                    ║")
+logger.info("╚════════════════════════════════════════════════════════════════╝")
 logger.info(f"[GROUP-SEARCH] IMDb available: {_HAS_IMDB}")
 logger.info(f"[GROUP-SEARCH] Request channel: {REQST_CHANNEL}")
-logger.info(f"[GROUP-SEARCH] Admins: {len(ADMINS)}")
-logger.info("[GROUP-SEARCH] ═══════════════════════════════════════════")
+logger.info(f"[GROUP-SEARCH] Admins loaded: {len(ADMINS)}")
+logger.info(f"[GROUP-SEARCH] Force-sub channels: {len(AUTH_CHANNELS)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-DEFAULT_DELETE_TIME = 600          # 10 min
-DEFAULT_MAX_BUTTONS = 8
-FILES_PER_PAGE = 10
-SESSION_TTL = 1800                 # 30 min
-SUGGESTION_LIMIT = 10
+DEFAULT_DELETE_TIME = 600            # 10 minutes
+DEFAULT_MAX_BUTTONS = 8              # per group
+FILES_PER_PAGE = 10                  # files shown at once
+SESSION_TTL = 1800                   # 30 minutes
+SUGGESTION_LIMIT = 10                # IMDb suggestions to show
+MIN_DELETE_TIME = 30                 # minimum auto-delete
+
 DIV = "━" * 26
 DIV2 = "─" * 26
+DIV3 = "═" * 26
+
+# Default settings for every group (used when a group has no DB row)
+DEFAULT_SETTINGS = {
+    "auto_ffilter": True,
+    "auto_delete": True,
+    "delete_time": DEFAULT_DELETE_TIME,
+    "result_buttons": [],
+    "fsub": [],
+    "is_verify": False,
+    "send_suggestions": True,
+    "request_enabled": True,
+    "caption": None,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2 — IN-MEMORY SESSION STORE
+# SECTION 2 — SESSION STORE (in-memory)
+# ═══════════════════════════════════════════════════════════════════════════
+# Two separate stores:
+#   _SEARCH_SESSIONS: file lists from successful searches
+#   _SUGGEST_SESSIONS: IMDb suggestions from failed searches
+# Both use token-based IDs and TTL.
 # ═══════════════════════════════════════════════════════════════════════════
 
-_SESSIONS: Dict[str, Dict[str, Any]] = {}
-_SUGGESTIONS: Dict[str, Dict[str, Any]] = {}
+_SEARCH_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_SUGGEST_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
-def _new_search_session(hits: List[Dict], user_id: int, chat_id: int,
-                        custom_buttons: List[Dict],
-                        query: str = "") -> str:
+def _new_search_session(
+    hits: List[Dict],
+    user_id: int,
+    chat_id: int,
+    custom_buttons: List[Dict],
+    query: str = "",
+) -> str:
+    """Create a search session and return its token."""
     sid = secrets.token_hex(8)
-    _SESSIONS[sid] = {
-        "hits": hits[:60],
+    _SEARCH_SESSIONS[sid] = {
+        "hits": hits[:60],   # cap at 60 to bound memory
         "user_id": int(user_id or 0),
         "chat_id": int(chat_id or 0),
         "custom_buttons": list(custom_buttons or []),
@@ -127,27 +177,33 @@ def _new_search_session(hits: List[Dict], user_id: int, chat_id: int,
         "expires": time.time() + SESSION_TTL,
     }
     logger.info(
-        f"[SESSION] created sid={sid} hits={len(hits)} "
+        f"[SESSION-SEARCH] created sid={sid} hits={len(hits)} "
         f"user={user_id} chat={chat_id} btns={len(custom_buttons or [])}"
     )
     return sid
 
 
 def _get_search_session(sid: str) -> Optional[Dict[str, Any]]:
-    s = _SESSIONS.get(sid)
+    """Fetch a search session if not expired."""
+    s = _SEARCH_SESSIONS.get(sid)
     if not s:
         return None
     if time.time() > s["expires"]:
-        _SESSIONS.pop(sid, None)
+        _SEARCH_SESSIONS.pop(sid, None)
         return None
     return s
 
 
-def _new_suggestion_session(suggestions: List[Dict], user_id: int,
-                            chat_id: int, query: str,
-                            custom_buttons: List[Dict]) -> str:
+def _new_suggest_session(
+    suggestions: List[Dict],
+    user_id: int,
+    chat_id: int,
+    query: str,
+    custom_buttons: List[Dict],
+) -> str:
+    """Create a suggestion session and return its token."""
     sid = secrets.token_hex(8)
-    _SUGGESTIONS[sid] = {
+    _SUGGEST_SESSIONS[sid] = {
         "suggestions": suggestions[:15],
         "user_id": int(user_id or 0),
         "chat_id": int(chat_id or 0),
@@ -156,29 +212,38 @@ def _new_suggestion_session(suggestions: List[Dict], user_id: int,
         "expires": time.time() + SESSION_TTL,
     }
     logger.info(
-        f"[SUGGEST] session created sid={sid} count={len(suggestions)} query={query!r}"
+        f"[SESSION-SUGGEST] created sid={sid} "
+        f"count={len(suggestions)} query={query!r}"
     )
     return sid
 
 
-def _get_suggestion_session(sid: str) -> Optional[Dict[str, Any]]:
-    s = _SUGGESTIONS.get(sid)
+def _get_suggest_session(sid: str) -> Optional[Dict[str, Any]]:
+    """Fetch a suggestion session if not expired."""
+    s = _SUGGEST_SESSIONS.get(sid)
     if not s:
         return None
     if time.time() > s["expires"]:
-        _SUGGESTIONS.pop(sid, None)
+        _SUGGEST_SESSIONS.pop(sid, None)
         return None
     return s
 
 
-def _cleanup_expired() -> None:
+def _cleanup_expired_sessions() -> None:
+    """Remove expired sessions from both stores."""
     now = time.time()
-    for sid in list(_SESSIONS.keys()):
-        if _SESSIONS[sid]["expires"] < now:
-            _SESSIONS.pop(sid, None)
-    for sid in list(_SUGGESTIONS.keys()):
-        if _SUGGESTIONS[sid]["expires"] < now:
-            _SUGGESTIONS.pop(sid, None)
+    n1 = 0
+    n2 = 0
+    for sid in list(_SEARCH_SESSIONS.keys()):
+        if _SEARCH_SESSIONS[sid]["expires"] < now:
+            _SEARCH_SESSIONS.pop(sid, None)
+            n1 += 1
+    for sid in list(_SUGGEST_SESSIONS.keys()):
+        if _SUGGEST_SESSIONS[sid]["expires"] < now:
+            _SUGGEST_SESSIONS.pop(sid, None)
+            n2 += 1
+    if n1 or n2:
+        logger.debug(f"[SESSION] cleaned {n1} search + {n2} suggest")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -186,6 +251,7 @@ def _cleanup_expired() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _get_db():
+    """Return the primary DB (whatever db_manager exposes)."""
     try:
         for name in ("get_user_db", "get_system_db", "get_media_db"):
             fn = getattr(db_manager, name, None)
@@ -202,16 +268,19 @@ def _get_db():
 
 
 def _groups_coll():
+    """Return the groups collection."""
     db = _get_db()
     return db["groups"] if db is not None else None
 
 
 def _requests_coll():
+    """Return the search_requests collection."""
     db = _get_db()
     return db["search_requests"] if db is not None else None
 
 
 def _media_collections() -> List[Tuple[int, Any]]:
+    """List every (shard_index, media_files_collection)."""
     out: List[Tuple[int, Any]] = []
     try:
         if hasattr(db_manager, "get_media_db_list"):
@@ -227,50 +296,47 @@ def _media_collections() -> List[Tuple[int, Any]]:
             if db is not None:
                 out.append((1, db["media_files"]))
     except Exception as e:
-        logger.warning(f"[DB] media colls failed: {e}")
+        logger.warning(f"[DB] media collections failed: {e}")
     return out
 
 
 async def _load_group_settings(chat_id: int) -> Dict[str, Any]:
-    defaults = {
-        "auto_ffilter": True,
-        "auto_delete": True,
-        "delete_time": DEFAULT_DELETE_TIME,
-        "result_buttons": [],
-        "fsub": [],
-        "is_verify": False,
-        "send_suggestions": True,
-        "request_enabled": True,
-    }
+    """Load per-group settings from DB. Falls back to defaults."""
     if not chat_id:
-        return defaults
+        return dict(DEFAULT_SETTINGS)
 
     coll = _groups_coll()
     if coll is None:
-        return defaults
+        return dict(DEFAULT_SETTINGS)
 
     try:
         doc = await coll.find_one({"chat_id": int(chat_id)})
     except Exception as e:
         logger.warning(f"[DB] settings load failed {chat_id}: {e}")
-        return defaults
+        return dict(DEFAULT_SETTINGS)
 
     if not doc:
-        return defaults
+        return dict(DEFAULT_SETTINGS)
 
-    merged = dict(defaults)
+    merged = dict(DEFAULT_SETTINGS)
+
+    # Old-style: inside settings sub-doc
     sub = doc.get("settings") or {}
     if isinstance(sub, dict):
         for k, v in sub.items():
             if v is not None:
                 merged[k] = v
-    for k in defaults.keys():
+
+    # New-style: top-level fields
+    for k in DEFAULT_SETTINGS.keys():
         if k in doc and doc[k] is not None:
             merged[k] = doc[k]
+
     return merged
 
 
 async def _save_group_field(chat_id: int, field: str, value: Any) -> bool:
+    """Atomically update one field in the group's settings."""
     coll = _groups_coll()
     if coll is None:
         return False
@@ -296,8 +362,17 @@ async def _save_group_field(chat_id: int, field: str, value: Any) -> bool:
         return False
 
 
-async def _add_request_record(user_id: int, query: str,
-                               movie_name: str, source: str = "search") -> Optional[str]:
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 — REQUEST RECORD HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _add_request_record(
+    user_id: int,
+    query: str,
+    movie_name: str,
+    source: str = "search",
+    imdb_id: Optional[str] = None,
+) -> Optional[str]:
     """Save a not-found request to DB. Returns token_id."""
     coll = _requests_coll()
     if coll is None:
@@ -310,19 +385,34 @@ async def _add_request_record(user_id: int, query: str,
             "user_id": int(user_id),
             "query": query,
             "movie_name": movie_name,
+            "imdb_id": imdb_id,
             "status": "not_found",
             "source": source,
             "created_at": now,
             "expires_at": now + (7 * 24 * 3600),
         })
-        logger.info(f"[REQ] request saved token={token_id} user={user_id} query={query!r}")
+        logger.info(
+            f"[REQ] token={token_id} user={user_id} query={query!r}"
+        )
         return token_id
     except Exception as e:
         logger.warning(f"[REQ] save failed: {e}")
         return None
 
 
+async def _get_request(token_id: str) -> Optional[Dict]:
+    """Retrieve a request by token."""
+    coll = _requests_coll()
+    if coll is None:
+        return None
+    try:
+        return await coll.find_one({"token_id": token_id})
+    except Exception:
+        return None
+
+
 async def _update_request_status(token_id: str, status: str) -> bool:
+    """Mark a request with a new status."""
     coll = _requests_coll()
     if coll is None:
         return False
@@ -336,38 +426,33 @@ async def _update_request_status(token_id: str, status: str) -> bool:
         return False
 
 
-async def _get_request(token_id: str) -> Optional[Dict]:
-    coll = _requests_coll()
-    if coll is None:
-        return None
-    try:
-        return await coll.find_one({"token_id": token_id})
-    except Exception:
-        return None
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4 — QUERY NORMALIZATION
+# SECTION 5 — QUERY NORMALIZATION
 # ═══════════════════════════════════════════════════════════════════════════
 
 _STOP_WORDS = {
     "movie", "movies", "film", "films", "download", "watch",
     "online", "free", "hd", "full", "the", "and",
 }
+
 _YEAR_RE = re.compile(r"\b(19[3-9]\d|20[0-4]\d)\b")
+
 _SERIES_RE = re.compile(
     r"\b(s\d{1,2}(?:e\d{1,3})?|season\s*\d+|episode\s*\d+|ep\s*\d+|\d+x\d+)\b",
     re.IGNORECASE,
 )
+
 _QUALITY_RE = re.compile(
     r"\b(2160p|4k|uhd|1440p|1080p|1080i|720p|576p|480p|360p|fhd|sd)\b",
     re.IGNORECASE,
 )
+
 _CODEC_RE = re.compile(
     r"\b(hevc|h\.?265|x265|h\.?264|x264|avc|av1|vp9|web-?dl|webrip|bluray|"
     r"blu-?ray|brrip|bdrip|hdrip|dvdrip|hdtv|hdcam|cam|pre-?dvd)\b",
     re.IGNORECASE,
 )
+
 _LANG_RE = re.compile(
     r"\b(eng|en|english|hin|hi|hindi|mal|ml|malayalam|tam|ta|tamil|"
     r"tel|te|telugu|kan|kn|kannada|multi)\b",
@@ -376,12 +461,15 @@ _LANG_RE = re.compile(
 
 
 def _normalize(text: str) -> str:
+    """Normalize query: lowercase, collapse separators, join single letters."""
     if not text:
         return ""
+
     t = text.strip().lower()
     t = re.sub(r"[.\-_/,;:\\]+", " ", t)
     t = re.sub(r"\s+", " ", t)
 
+    # K G F → KGF
     tokens = t.split()
     out, buf = [], []
     for tok in tokens:
@@ -406,6 +494,7 @@ def _normalize(text: str) -> str:
 
 
 def _parse_query(raw: str) -> Tuple[str, Optional[int], bool]:
+    """Return (normalized_title, year, is_series)."""
     year = None
     m = _YEAR_RE.search(raw or "")
     if m:
@@ -425,15 +514,22 @@ def _parse_query(raw: str) -> Tuple[str, Optional[int], bool]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5 — SEARCH ENGINE
+# SECTION 6 — SEARCH ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _search_all_shards(norm: str, year: Optional[int],
-                              is_series: bool, limit: int = 100) -> List[Dict]:
+async def _search_all_shards(
+    norm: str,
+    year: Optional[int],
+    is_series: bool,
+    limit: int = 100,
+) -> List[Dict]:
+    """Search every media shard in parallel. Returns deduped list."""
     if not norm:
         return []
+
     collections = _media_collections()
     if not collections:
+        logger.warning("[SEARCH] no media shards available")
         return []
 
     escaped = re.escape(norm)
@@ -457,8 +553,11 @@ async def _search_all_shards(norm: str, year: Optional[int],
                 {"normalized_series_title": {"$regex": prefix_re}},
             ]
         }
+
     if year:
         mongo_q["year"] = year
+
+    logger.debug(f"[SEARCH] query={mongo_q}")
 
     async def _q_one(coll):
         try:
@@ -477,6 +576,7 @@ async def _search_all_shards(norm: str, year: Optional[int],
     for chunk in results:
         all_docs.extend(chunk)
 
+    # Dedupe by file_unique_id / file_id / _id
     seen = set()
     uniq = []
     for d in all_docs:
@@ -486,21 +586,22 @@ async def _search_all_shards(norm: str, year: Optional[int],
         seen.add(key)
         uniq.append(d)
 
+    # Sort by file_size ascending (small → big)
     uniq.sort(key=lambda x: (x.get("file_size") is None, x.get("file_size") or 0))
     logger.info(f"[SEARCH] {len(uniq)} unique files for {norm!r} year={year}")
     return uniq
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6 — IMDb SUGGESTIONS
+# SECTION 7 — IMDb SUGGESTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def _imdb_suggestions(query: str) -> List[Dict[str, Any]]:
-    """Get IMDb suggestions with years."""
-    if not _HAS_IMDB:
+    """Fetch suggestions from IMDb (with years)."""
+    if not _HAS_IMDB or not query:
         return []
     try:
-        result = await asyncio.to_thread(_IMDB.search_movie, query)
+        result = await asyncio.to_thread(_IMDB_INSTANCE.search_movie, query)
         titles = getattr(result, "titles", None) if result else None
         if not titles:
             logger.info(f"[IMDB] no suggestions for {query!r}")
@@ -528,10 +629,11 @@ async def _imdb_suggestions(query: str) -> List[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7 — FORMATTING
+# SECTION 8 — FORMATTING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _human_size(size) -> str:
+    """Human-readable file size."""
     if not size:
         return "0 B"
     try:
@@ -547,6 +649,7 @@ def _human_size(size) -> str:
 
 
 def _human_size_short(size) -> str:
+    """Short form: 2.5GB instead of 2.50 GB."""
     if not size:
         return "0B"
     try:
@@ -564,6 +667,7 @@ def _human_size_short(size) -> str:
 
 
 def _clean_filename(name: Optional[str], max_len: int = 70) -> str:
+    """Clean a raw filename for display."""
     if not name:
         return ""
     n = str(name)
@@ -581,52 +685,134 @@ def _clean_filename(name: Optional[str], max_len: int = 70) -> str:
     return n or "file"
 
 
+def _escape_html(text: str) -> str:
+    """Escape HTML special characters."""
+    if not text:
+        return ""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 — CUSTOM BUTTON BUILDER (the critical fix)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# This is the function that decides whether a custom button appears on
+# the delivered file. It is ULTRA-PERMISSIVE and FULLY LOGGED.
+#
+# Reads any dict that has a name-like key and a url-like key.
+# Never silently rejects unless absolutely necessary.
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButton]]:
-    """Ultra-permissive custom button builder."""
-    if not raw_buttons or not isinstance(raw_buttons, list):
+    """Convert stored button dicts to InlineKeyboardButton rows."""
+    logger.info("[CUSTOM-BTNS] ══════════════════════════════════")
+    logger.info(f"[CUSTOM-BTNS] input type={type(raw_buttons).__name__}")
+    logger.info(f"[CUSTOM-BTNS] input value={raw_buttons!r}")
+
+    if not raw_buttons:
+        logger.info("[CUSTOM-BTNS] EMPTY — returning []")
         return []
+
+    if not isinstance(raw_buttons, list):
+        logger.info("[CUSTOM-BTNS] not a list — returning []")
+        return []
+
+    # Sort by position
     try:
         raw_buttons = sorted(raw_buttons, key=lambda b: b.get("position", 999))
     except Exception:
         pass
 
     rows: List[List[InlineKeyboardButton]] = []
-    for b in raw_buttons:
+
+    for i, b in enumerate(raw_buttons):
+        logger.info(f"[CUSTOM-BTNS] item #{i}: {b!r}")
+
         if not isinstance(b, dict):
+            logger.info(f"[CUSTOM-BTNS] #{i} REJECT: not a dict")
             continue
+
         if b.get("enabled") is False:
+            logger.info(f"[CUSTOM-BTNS] #{i} REJECT: enabled=False")
             continue
-        name = (b.get("name") or b.get("text") or b.get("title")
-                or b.get("label") or "").strip()
-        url = (b.get("url") or b.get("link") or b.get("href") or "").strip()
-        if not name or not url:
+
+        # Try every possible name key
+        name = ""
+        for key in ("name", "text", "title", "label", "button_text", "button_name"):
+            if b.get(key):
+                val = str(b.get(key)).strip()
+                if val:
+                    name = val
+                    logger.info(f"[CUSTOM-BTNS] #{i} name found in '{key}': {name!r}")
+                    break
+
+        # Try every possible URL key
+        url = ""
+        for key in ("url", "link", "href", "button_url", "button_link"):
+            if b.get(key):
+                val = str(b.get(key)).strip()
+                if val:
+                    url = val
+                    logger.info(f"[CUSTOM-BTNS] #{i} url found in '{key}': {url!r}")
+                    break
+
+        if not name:
+            logger.info(f"[CUSTOM-BTNS] #{i} REJECT: no name. Keys: {list(b.keys())}")
             continue
+
+        if not url:
+            logger.info(f"[CUSTOM-BTNS] #{i} REJECT: no url. Keys: {list(b.keys())}")
+            continue
+
+        # Normalize URL
+        original_url = url
         if url.startswith("@"):
             url = f"https://t.me/{url[1:]}"
-        elif url.startswith("t.me/") or url.startswith("telegram.me/"):
+        elif url.startswith("t.me/"):
             url = f"https://{url}"
-        elif not (url.startswith("http://") or url.startswith("https://")
+        elif url.startswith("telegram.me/"):
+            url = f"https://{url}"
+        elif not (url.startswith("http://")
+                  or url.startswith("https://")
                   or url.startswith("tg://")):
             if "." in url and " " not in url:
                 url = f"https://{url}"
             else:
+                logger.info(f"[CUSTOM-BTNS] #{i} REJECT: unparseable url {url!r}")
                 continue
+
+        logger.info(
+            f"[CUSTOM-BTNS] #{i} ✅ ACCEPT: {name!r} → {url!r} (was {original_url!r})"
+        )
         rows.append([InlineKeyboardButton(name[:60], url=url)])
+
+    logger.info(
+        f"[CUSTOM-BTNS] ═══ built {len(rows)} rows from {len(raw_buttons)} items ═══"
+    )
     return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8 — PERMISSIONS
+# SECTION 10 — PERMISSION CHECKS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_bot_owner(user_id: int) -> bool:
+    """Is this user a bot owner (from ADMINS env)?"""
     try:
-        return int(user_id) in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]
+        return int(user_id) in [
+            int(a) for a in ADMINS if str(a).lstrip("-").isdigit()
+        ]
     except Exception:
         return False
 
 
 async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    """Is this user an admin of the group?"""
     if _is_bot_owner(user_id):
         return True
     try:
@@ -634,45 +820,56 @@ async def _is_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
         st = getattr(m, "status", None)
         st = st.name.lower() if hasattr(st, "name") else str(st).lower()
         return st in ("administrator", "creator", "owner")
-    except Exception:
+    except Exception as e:
+        logger.debug(f"[PERM] admin check failed: {e}")
         return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9 — REQUEST CHANNEL POSTING
+# SECTION 11 — REQUEST CHANNEL POSTING
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _post_request_to_channel(client: Client, user_id: int,
-                                    user_mention: str, movie_name: str,
-                                    year: Optional[int] = None,
-                                    imdb_id: Optional[str] = None,
-                                    source: str = "search") -> Optional[str]:
+async def _post_request_to_channel(
+    client: Client,
+    user_id: int,
+    user_mention: str,
+    movie_name: str,
+    year: Optional[int] = None,
+    imdb_id: Optional[str] = None,
+    source: str = "search",
+) -> Optional[str]:
     """Post a request to REQST_CHANNEL with admin action buttons."""
     if not REQST_CHANNEL:
-        logger.info("[REQ] no REQST_CHANNEL configured")
+        logger.info("[REQ] REQST_CHANNEL not configured")
         return None
 
-    token_id = await _add_request_record(user_id, movie_name, movie_name, source)
+    token_id = await _add_request_record(
+        user_id, movie_name, movie_name, source, imdb_id
+    )
     if not token_id:
         return None
 
     title_display = movie_name + (f" ({year})" if year else "")
-    text = (
-        f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
-        f"📝 <b>ɴᴇᴡ ᴍᴏᴠɪᴇ ʀᴇǫᴜᴇꜱᴛ</b>\n"
-        f"{DIV}\n\n"
-        f"🎬 ᴍᴏᴠɪᴇ · <b>{title_display}</b>\n"
-    )
+
+    text_lines = [
+        f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>",
+        f"📝 <b>ɴᴇᴡ ᴍᴏᴠɪᴇ ʀᴇǫᴜᴇꜱᴛ</b>",
+        DIV,
+        "",
+        f"🎬 ᴍᴏᴠɪᴇ · <b>{_escape_html(title_display)}</b>",
+    ]
     if imdb_id:
-        text += f"🆔 ɪᴍᴅʙ · <code>{imdb_id}</code>\n"
-    text += (
-        f"\n"
-        f"👤 ᴜꜱᴇʀ · {user_mention}\n"
-        f"🆔 ᴜꜱᴇʀ ɪᴅ · <code>{user_id}</code>\n\n"
-        f"🔑 ᴛᴏᴋᴇɴ · <code>{token_id}</code>\n"
-        f"{DIV}\n\n"
-        f"<i>ᴀᴅᴍɪɴ · ᴄʜᴏᴏꜱᴇ ᴀɴ ᴀᴄᴛɪᴏɴ ʙᴇʟᴏᴡ</i>"
-    )
+        text_lines.append(f"🆔 ɪᴍᴅʙ · <code>{_escape_html(imdb_id)}</code>")
+    text_lines += [
+        "",
+        f"👤 ᴜꜱᴇʀ · {user_mention}",
+        f"🆔 ᴜꜱᴇʀ ɪᴅ · <code>{user_id}</code>",
+        "",
+        f"🔑 ᴛᴏᴋᴇɴ · <code>{token_id}</code>",
+        DIV,
+        "",
+        "<i>ᴀᴅᴍɪɴ · ᴄʜᴏᴏꜱᴇ ᴀɴ ᴀᴄᴛɪᴏɴ ʙᴇʟᴏᴡ</i>",
+    ]
 
     buttons = [
         [InlineKeyboardButton(
@@ -696,22 +893,22 @@ async def _post_request_to_channel(client: Client, user_id: int,
     ]
 
     try:
-        sent = await client.send_message(
+        await client.send_message(
             chat_id=REQST_CHANNEL,
-            text=text,
+            text="\n".join(text_lines),
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        logger.info(f"[REQ] posted to channel token={token_id}")
+        logger.info(f"[REQ] posted token={token_id} movie={movie_name!r}")
         return token_id
     except Exception as e:
-        logger.warning(f"[REQ] post failed: {e}")
+        logger.warning(f"[REQ] post failed: {type(e).__name__}: {e}")
         return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 10 — GROUP MESSAGE HANDLER
+# SECTION 12 — GROUP MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_message(
@@ -719,12 +916,18 @@ async def _post_request_to_channel(client: Client, user_id: int,
     group=-999,
 )
 async def group_search_handler(client: Client, message: Message):
+    """
+    Main entry for group messages.
+    Search media shards, show file list, or show IMDb suggestions.
+    """
     try:
         chat_id = message.chat.id
         user_id = message.from_user.id if message.from_user else 0
-        user_mention = (message.from_user.mention
-                        if message.from_user and hasattr(message.from_user, "mention")
-                        else "user")
+        user_mention = (
+            message.from_user.mention
+            if message.from_user and hasattr(message.from_user, "mention")
+            else "user"
+        )
         raw = (message.text or "").strip()
 
         logger.info(
@@ -732,19 +935,22 @@ async def group_search_handler(client: Client, message: Message):
         )
 
         if len(raw) < 2 or len(raw) > 100:
+            logger.debug("[GROUP-SEARCH] text too short/long, skip")
             return
 
         settings = await _load_group_settings(chat_id)
         if not settings.get("auto_ffilter", True):
-            logger.info("[GROUP-SEARCH] auto_ffilter OFF")
+            logger.info("[GROUP-SEARCH] auto_ffilter OFF — skip")
             return
 
+        # Show searching status
         try:
             status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
         except Exception as e:
             logger.warning(f"[GROUP-SEARCH] reply failed: {e}")
             return
 
+        # Parse query
         norm, year, is_series = _parse_query(raw)
         if not norm:
             try:
@@ -753,22 +959,24 @@ async def group_search_handler(client: Client, message: Message):
                 pass
             return
 
+        # Search
         docs = await _search_all_shards(norm, year, is_series)
 
         # Retry without year
         if not docs and year:
+            logger.info("[GROUP-SEARCH] retry without year")
             docs = await _search_all_shards(norm, None, is_series)
 
-        # ── NO RESULTS → IMDb SUGGESTIONS ──
+        # No results
         if not docs:
-            logger.info(f"[GROUP-SEARCH] no files — fetching IMDb suggestions")
+            logger.info("[GROUP-SEARCH] no files — fetching IMDb suggestions")
             await _handle_no_results(
                 client, message, status, raw, norm, year, is_series,
                 settings, user_id, user_mention,
             )
             return
 
-        # ── RESULTS FOUND → show file list ──
+        # Results found
         raw_buttons = settings.get("result_buttons") or []
         sid = _new_search_session(
             hits=docs,
@@ -777,7 +985,7 @@ async def group_search_handler(client: Client, message: Message):
             custom_buttons=raw_buttons,
             query=raw,
         )
-        await _show_file_list(status, raw, docs, sid, user_mention)
+        await _show_file_list(status, raw, docs, sid)
 
     except StopPropagation:
         raise
@@ -785,40 +993,38 @@ async def group_search_handler(client: Client, message: Message):
         logger.exception(f"[GROUP-SEARCH] crashed: {e}")
 
 
-async def _handle_no_results(client, message, status, raw, norm, year,
-                              is_series, settings, user_id, user_mention):
-    """Handle no results: IMDb suggestions or request channel."""
-    # Check if suggestions are enabled
+async def _handle_no_results(
+    client, message, status, raw, norm, year,
+    is_series, settings, user_id, user_mention,
+):
+    """Handle no-results: IMDb suggestions or request channel."""
     if not settings.get("send_suggestions", True):
         try:
             await status.edit_text(
                 f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
                 f"{DIV}\n\n"
-                f"❌ ɴᴏ ᴍᴀᴛᴄʜ ꜰᴏʀ <code>{raw}</code>",
+                f"❌ ɴᴏ ᴍᴀᴛᴄʜ ꜰᴏʀ <code>{_escape_html(raw)}</code>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
         return
 
-    # Try IMDb
     suggestions = await _imdb_suggestions(raw)
 
     if not suggestions:
-        # No IMDb suggestions either
-        logger.info("[GROUP-SEARCH] no IMDb suggestions")
+        logger.info("[GROUP-SEARCH] no IMDb suggestions either")
         try:
             await status.edit_text(
                 f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
                 f"{DIV}\n\n"
-                f"❌ ɴᴏ ᴍᴀᴛᴄʜ ꜰᴏʀ <code>{raw}</code>\n\n"
+                f"❌ ɴᴏ ᴍᴀᴛᴄʜ ꜰᴏʀ <code>{_escape_html(raw)}</code>\n\n"
                 f"ᴘʟᴇᴀꜱᴇ ᴄʜᴇᴄᴋ ꜱᴘᴇʟʟɪɴɢ ᴀɴᴅ ᴛʀʏ ᴀɢᴀɪɴ.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
 
-        # Send to request channel
         if settings.get("request_enabled", True):
             await _post_request_to_channel(
                 client, user_id, user_mention, raw,
@@ -826,9 +1032,8 @@ async def _handle_no_results(client, message, status, raw, norm, year,
             )
         return
 
-    # Build suggestion session
     raw_buttons = settings.get("result_buttons") or []
-    ssid = _new_suggestion_session(
+    ssid = _new_suggest_session(
         suggestions=suggestions,
         user_id=user_id,
         chat_id=message.chat.id,
@@ -836,7 +1041,6 @@ async def _handle_no_results(client, message, status, raw, norm, year,
         custom_buttons=raw_buttons,
     )
 
-    # Build suggestion buttons
     rows = []
     for i, s in enumerate(suggestions[:10]):
         title = s.get("title") or "?"
@@ -863,7 +1067,7 @@ async def _handle_no_results(client, message, status, raw, norm, year,
         f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
         f"🤔 <b>ᴅɪᴅ ʏᴏᴜ ᴍᴇᴀɴ?</b>\n"
         f"{DIV}\n\n"
-        f"🔍 ʏᴏᴜ ꜱᴇᴀʀᴄʜᴇᴅ: <code>{raw}</code>\n\n"
+        f"🔍 ʏᴏᴜ ꜱᴇᴀʀᴄʜᴇᴅ: <code>{_escape_html(raw)}</code>\n\n"
         f"📝 <b>{len(suggestions)}</b> ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ:\n\n"
         f"ᴘɪᴄᴋ ᴛʜᴇ ᴏɴᴇ ʏᴏᴜ ᴍᴇᴀɴᴛ:"
     )
@@ -875,13 +1079,13 @@ async def _handle_no_results(client, message, status, raw, norm, year,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        logger.info(f"[SUGGEST] shown {len(suggestions)} suggestions ssid={ssid}")
+        logger.info(f"[SUGGEST] shown {len(suggestions)} ssid={ssid}")
     except Exception as e:
         logger.warning(f"[SUGGEST] edit failed: {e}")
 
 
-async def _show_file_list(target, raw, docs, sid, user_mention):
-    """Show file list with buttons."""
+async def _show_file_list(target, raw, docs, sid):
+    """Render the file list with buttons."""
     rows = []
     for i, d in enumerate(docs[:FILES_PER_PAGE]):
         size = _human_size_short(d.get("file_size"))
@@ -906,7 +1110,7 @@ async def _show_file_list(target, raw, docs, sid, user_mention):
     text = (
         f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
         f"{DIV}\n\n"
-        f"🎬 <b>{title_display}</b>\n"
+        f"🎬 <b>{_escape_html(title_display)}</b>\n"
         f"📦 <b>{len(docs)}</b> ꜰɪʟᴇꜱ · ꜱᴍᴀʟʟ → ʙɪɢ\n\n"
         f"ᴛᴀᴘ ᴀ ꜰɪʟᴇ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪᴛ ɪɴ ᴘᴍ:"
     )
@@ -924,7 +1128,7 @@ async def _show_file_list(target, raw, docs, sid, user_mention):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 11 — SUGGESTION CLICK HANDLER
+# SECTION 13 — SUGGESTION CLICK HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_callback_query(filters.regex(r"^gsug:"), group=-999)
@@ -938,14 +1142,16 @@ async def gsug_callback(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
-    session = _get_suggestion_session(ssid)
+    session = _get_suggest_session(ssid)
     if not session:
         return await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
 
     # Manual request button
     if idx == "request":
         await q.answer("📝 ꜱᴇɴᴅɪɴɢ ʀᴇǫᴜᴇꜱᴛ...")
-        user_mention = q.from_user.mention if hasattr(q.from_user, "mention") else "user"
+        user_mention = (
+            q.from_user.mention if hasattr(q.from_user, "mention") else "user"
+        )
         await _post_request_to_channel(
             client, q.from_user.id, user_mention,
             session["query"], source="manual_request",
@@ -955,7 +1161,7 @@ async def gsug_callback(client: Client, q: CallbackQuery):
                 f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
                 f"{DIV}\n\n"
                 f"✅ ʀᴇǫᴜᴇꜱᴛ ꜱᴇɴᴛ ᴛᴏ ᴀᴅᴍɪɴ!\n\n"
-                f"🎬 <b>{session['query']}</b>\n\n"
+                f"🎬 <b>{_escape_html(session['query'])}</b>\n\n"
                 f"ᴡᴇ ᴡɪʟʟ ɴᴏᴛɪꜰʏ ʏᴏᴜ ᴡʜᴇɴ ɪᴛ'ꜱ ᴀᴠᴀɪʟᴀʙʟᴇ.",
                 parse_mode=ParseMode.HTML,
             )
@@ -981,16 +1187,16 @@ async def gsug_callback(client: Client, q: CallbackQuery):
 
     await q.answer(f"🔎 ꜱᴇᴀʀᴄʜɪɴɢ: {title[:30]}")
 
-    # Retry search with corrected title
     norm = _normalize(title)
     docs = await _search_all_shards(norm, year, False)
     if not docs and year:
         docs = await _search_all_shards(norm, None, False)
 
     if not docs:
-        # Still no files → send to request channel
-        user_mention = q.from_user.mention if hasattr(q.from_user, "mention") else "user"
-
+        # Still no files → request channel
+        user_mention = (
+            q.from_user.mention if hasattr(q.from_user, "mention") else "user"
+        )
         await _post_request_to_channel(
             client, q.from_user.id, user_mention,
             title, year=year, imdb_id=imdb_id,
@@ -998,25 +1204,25 @@ async def gsug_callback(client: Client, q: CallbackQuery):
         )
 
         try:
+            year_txt = f" ({year})" if year else ""
             await q.message.edit_text(
                 f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
                 f"{DIV}\n\n"
-                f"😌 <b>{title}</b>" + (f" ({year})" if year else "") + "\n\n"
+                f"😌 <b>{_escape_html(title)}</b>{year_txt}\n\n"
                 f"ɪꜱ ɴᴏᴛ ᴀᴠᴀɪʟᴀʙʟᴇ ʀɪɢʜᴛ ɴᴏᴡ.\n\n"
                 f"📝 ʀᴇǫᴜᴇꜱᴛ ꜱᴇɴᴛ ᴛᴏ ᴀᴅᴍɪɴ.\n"
                 f"ᴡᴇ'ʟʟ ɴᴏᴛɪꜰʏ ʏᴏᴜ ᴡʜᴇɴ ɪᴛ'ꜱ ᴀᴠᴀɪʟᴀʙʟᴇ.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📢 UPDATES", url=UPDATE_CHNL_LNK),
-                ], [
-                    InlineKeyboardButton("❌ CLOSE", callback_data="gclose"),
-                ]]),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 UPDATES", url=UPDATE_CHNL_LNK)],
+                    [InlineKeyboardButton("❌ CLOSE", callback_data="gclose")],
+                ]),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             logger.warning(f"[SUGGEST] edit failed: {e}")
         return
 
-    # Files found → show file list
+    # Found files
     raw_buttons = session.get("custom_buttons") or []
     sid = _new_search_session(
         hits=docs,
@@ -1025,17 +1231,16 @@ async def gsug_callback(client: Client, q: CallbackQuery):
         custom_buttons=raw_buttons,
         query=title,
     )
-
-    user_mention = q.from_user.mention if hasattr(q.from_user, "mention") else "user"
-    await _show_file_list(q.message, title, docs, sid, user_mention)
+    await _show_file_list(q.message, title, docs, sid)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 12 — FILE CLICK CALLBACK
+# SECTION 14 — FILE CLICK CALLBACK
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_callback_query(filters.regex(r"^gfile:"), group=-999)
 async def gfile_callback(client: Client, q: CallbackQuery):
+    """User clicked a file button. Redirect to PM if in group."""
     try:
         parts = q.data.split(":", 2)
         if len(parts) < 3:
@@ -1059,7 +1264,7 @@ async def gfile_callback(client: Client, q: CallbackQuery):
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
     if i < 0 or i >= len(session["hits"]):
-        return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        return await q.answer("❌ ɪɴᴠᴀʟɪᴅ ɪɴᴅᴇx", show_alert=True)
 
     try:
         is_group = q.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
@@ -1067,6 +1272,7 @@ async def gfile_callback(client: Client, q: CallbackQuery):
         is_group = False
 
     if is_group:
+        # Redirect to PM
         try:
             me = await client.get_me()
             deep_link = f"https://t.me/{me.username}?start=file_{sid}_{i}"
@@ -1093,11 +1299,12 @@ async def gfile_callback(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 13 — PM /start HANDLER
+# SECTION 15 — PM /start HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_message(filters.command("start") & filters.private, group=-999)
 async def pm_start_handler(client: Client, message: Message):
+    """Handle /start in PM. Delivers file if payload present."""
     logger.info(
         f"[START-PM] ⚡ user={message.from_user.id} text={message.text!r}"
     )
@@ -1138,6 +1345,7 @@ async def pm_start_handler(client: Client, message: Message):
 
 
 async def _send_welcome(client: Client, message: Message):
+    """Send a simple welcome message."""
     try:
         await message.reply_text(
             f"🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
@@ -1151,11 +1359,16 @@ async def _send_welcome(client: Client, message: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 14 — FILE DELIVERY
+# SECTION 16 — FILE DELIVERY
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _deliver_file(client: Client, chat_id: int,
-                        session: Dict[str, Any], idx: int):
+async def _deliver_file(
+    client: Client,
+    chat_id: int,
+    session: Dict[str, Any],
+    idx: int,
+):
+    """Deliver file with custom buttons + auto-delete."""
     try:
         doc = session["hits"][idx]
     except Exception:
@@ -1166,6 +1379,7 @@ async def _deliver_file(client: Client, chat_id: int,
         logger.warning("[DELIVERY] no file_id")
         return
 
+    # Extract metadata
     title = doc.get("title") or doc.get("series_title") or "file"
     file_name = doc.get("file_name") or title
     quality = (doc.get("quality") or "").upper()
@@ -1175,7 +1389,8 @@ async def _deliver_file(client: Client, chat_id: int,
     size = _human_size(doc.get("file_size"))
     year = doc.get("year")
 
-    lines = [f"🎬 <b>{_clean_filename(file_name, max_len=80)}</b>"]
+    # Caption
+    lines = [f"🎬 <b>{_escape_html(_clean_filename(file_name, max_len=80))}</b>"]
     if year:
         lines.append(f"📅 {year}")
     lines.append("")
@@ -1190,9 +1405,10 @@ async def _deliver_file(client: Client, chat_id: int,
     lines.append("⚡ <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>")
     caption = "\n".join(lines)
 
+    # Custom buttons + SHARE + UPDATES
     kb_rows: List[List[InlineKeyboardButton]] = []
     custom_rows = _build_custom_button_rows(session.get("custom_buttons") or [])
-    logger.info(f"[DELIVERY] custom rows: {len(custom_rows)}")
+    logger.info(f"[DELIVERY] custom rows built: {len(custom_rows)}")
     if custom_rows:
         kb_rows.extend(custom_rows)
 
@@ -1214,6 +1430,7 @@ async def _deliver_file(client: Client, chat_id: int,
 
     kb = InlineKeyboardMarkup(kb_rows)
 
+    # Send file
     sent = None
     try:
         sent = await client.send_cached_media(
@@ -1234,6 +1451,7 @@ async def _deliver_file(client: Client, chat_id: int,
                 caption=caption,
                 reply_markup=kb,
             )
+            logger.info(f"[DELIVERY] ✅ sent after FloodWait")
         except Exception as e2:
             logger.warning(f"[DELIVERY] retry failed: {e2}")
             return
@@ -1248,14 +1466,15 @@ async def _deliver_file(client: Client, chat_id: int,
             pass
         return
 
+    # Auto-delete
     group_id = session.get("chat_id") or 0
     settings = await _load_group_settings(group_id)
     if not settings.get("auto_delete", True):
         return
 
     delete_time = int(settings.get("delete_time", DEFAULT_DELETE_TIME))
-    if delete_time < 30:
-        delete_time = 30
+    if delete_time < MIN_DELETE_TIME:
+        delete_time = MIN_DELETE_TIME
     minutes = max(1, delete_time // 60)
 
     if sent:
@@ -1279,8 +1498,14 @@ async def _deliver_file(client: Client, chat_id: int,
         )
 
 
-async def _auto_delete(client: Client, chat_id: int, msg_id: int,
-                       warn_id: Optional[int], seconds: int):
+async def _auto_delete(
+    client: Client,
+    chat_id: int,
+    msg_id: int,
+    warn_id: Optional[int],
+    seconds: int,
+):
+    """Delete the file (and warning) after `seconds`."""
     try:
         await asyncio.sleep(seconds)
         if warn_id:
@@ -1300,7 +1525,7 @@ async def _auto_delete(client: Client, chat_id: int, msg_id: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 15 — REQUEST ACTION CALLBACK (admin → user)
+# SECTION 17 — REQUEST ACTION CALLBACK (admin → user)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_callback_query(filters.regex(r"^greq:"), group=-999)
@@ -1311,9 +1536,12 @@ async def greq_callback(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
+    # Admin check
     if not _is_bot_owner(q.from_user.id):
         try:
-            member = await client.get_chat_member(q.message.chat.id, q.from_user.id)
+            member = await client.get_chat_member(
+                q.message.chat.id, q.from_user.id
+            )
             st = getattr(member, "status", None)
             st = st.name.lower() if hasattr(st, "name") else str(st).lower()
             if st not in ("administrator", "creator", "owner"):
@@ -1328,26 +1556,28 @@ async def greq_callback(client: Client, q: CallbackQuery):
     user_id = req.get("user_id")
     movie_name = req.get("movie_name") or ""
 
-    # Determine user-facing message
     messages = {
         "updated": (
             f"🎬 <b>ɢᴏᴏᴅ ɴᴇᴡꜱ!</b>\n\n"
-            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{movie_name}</b> ʜᴀꜱ ʙᴇᴇɴ ᴜᴘʟᴏᴀᴅᴇᴅ ✅\n\n"
+            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{_escape_html(movie_name)}</b> "
+            f"ʜᴀꜱ ʙᴇᴇɴ ᴜᴘʟᴏᴀᴅᴇᴅ ✅\n\n"
             f"ᴋɪɴᴅʟʏ ꜱᴇᴀʀᴄʜ ɪɴ ᴛʜᴇ ɢʀᴏᴜᴘ."
         ),
         "notreleased": (
             f"📅 <b>ɴᴏᴛ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ</b>\n\n"
-            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{movie_name}</b> ʜᴀꜱ ɴᴏᴛ ʙᴇᴇɴ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ.\n"
+            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{_escape_html(movie_name)}</b> "
+            f"ʜᴀꜱ ɴᴏᴛ ʙᴇᴇɴ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ.\n"
             f"ᴡᴇ'ʟʟ ɴᴏᴛɪꜰʏ ʏᴏᴜ ᴡʜᴇɴ ɪᴛ'ꜱ ᴀᴠᴀɪʟᴀʙʟᴇ."
         ),
         "notfound": (
             f"🔎 <b>ɴᴏᴛ ꜰᴏᴜɴᴅ</b>\n\n"
-            f"ᴡᴇ ᴄᴏᴜʟᴅɴ'ᴛ ꜰɪɴᴅ <b>{movie_name}</b>.\n"
+            f"ᴡᴇ ᴄᴏᴜʟᴅɴ'ᴛ ꜰɪɴᴅ <b>{_escape_html(movie_name)}</b>.\n"
             f"ᴘʟᴇᴀꜱᴇ ᴄʜᴇᴄᴋ ᴛʜᴇ ꜱᴘᴇʟʟɪɴɢ ᴀɴᴅ ᴛʀʏ ᴀɢᴀɪɴ."
         ),
         "cancel": (
             f"❌ <b>ʀᴇǫᴜᴇꜱᴛ ᴄᴀɴᴄᴇʟʟᴇᴅ</b>\n\n"
-            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{movie_name}</b> ʜᴀꜱ ʙᴇᴇɴ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴀᴅᴍɪɴ."
+            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{_escape_html(movie_name)}</b> "
+            f"ʜᴀꜱ ʙᴇᴇɴ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴀᴅᴍɪɴ."
         ),
     }
 
@@ -1369,9 +1599,9 @@ async def greq_callback(client: Client, q: CallbackQuery):
                 ]),
                 parse_mode=ParseMode.HTML,
             )
-            logger.info(f"[REQ] notified user {user_id} about token {token_id}")
+            logger.info(f"[REQ] notified user {user_id} about {token_id}")
         except UserIsBlocked:
-            logger.info(f"[REQ] user {user_id} blocked the bot")
+            logger.info(f"[REQ] user {user_id} blocked bot")
         except Exception as e:
             logger.warning(f"[REQ] DM failed: {e}")
 
@@ -1389,15 +1619,16 @@ async def greq_callback(client: Client, q: CallbackQuery):
     except Exception as e:
         logger.debug(f"[REQ] edit failed: {e}")
 
-    await q.answer(f"✅ ᴜꜱᴇʀ ɴᴏᴛɪꜰɪᴇᴅ: {action}")
+    await q.answer(f"✅ {action}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 16 — CLOSE
+# SECTION 18 — CLOSE CALLBACK
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_callback_query(filters.regex(r"^gclose$"), group=-999)
 async def gclose_callback(client: Client, q: CallbackQuery):
+    """Delete the search message."""
     try:
         await q.message.delete()
     except Exception:
@@ -1409,11 +1640,12 @@ async def gclose_callback(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 17 — ADMIN COMMANDS
+# SECTION 19 — ADMIN COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════
 
 @Client.on_message(filters.command("add_button") & filters.group, group=-999)
 async def cmd_add_button(client: Client, message: Message):
+    """Add a custom button that appears on delivered files."""
     try:
         if not message.from_user:
             return
@@ -1430,10 +1662,15 @@ async def cmd_add_button(client: Client, message: Message):
             )
 
         name, url = [p.strip() for p in args[1].split("|", 1)]
-        if not (url.startswith("http://") or url.startswith("https://")
-                or url.startswith("tg://")
-                or url.startswith("t.me/")
-                or url.startswith("@")):
+        logger.info(f"[ADD-BUTTON] chat={message.chat.id} name={name!r} url={url!r}")
+
+        if not (
+            url.startswith("http://")
+            or url.startswith("https://")
+            or url.startswith("tg://")
+            or url.startswith("t.me/")
+            or url.startswith("@")
+        ):
             return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ᴜʀʟ.")
 
         coll = _groups_coll()
@@ -1446,18 +1683,21 @@ async def cmd_add_button(client: Client, message: Message):
             or (doc.get("settings") or {}).get("result_buttons")
             or []
         )
+        logger.info(f"[ADD-BUTTON] existing btns={btns!r}")
 
         if len(btns) >= DEFAULT_MAX_BUTTONS:
             return await message.reply_text(
                 f"⚠️ ᴍᴀx {DEFAULT_MAX_BUTTONS} ʙᴜᴛᴛᴏɴꜱ ᴀʟʟᴏᴡᴇᴅ."
             )
 
-        btns.append({
+        new_btn = {
             "name": name[:60],
             "url": url,
             "position": len(btns) + 1,
             "enabled": True,
-        })
+        }
+        btns.append(new_btn)
+        logger.info(f"[ADD-BUTTON] saving btns={btns!r}")
 
         await coll.update_one(
             {"chat_id": message.chat.id},
@@ -1465,20 +1705,28 @@ async def cmd_add_button(client: Client, message: Message):
             upsert=True,
         )
 
+        # Verify
+        verify = await coll.find_one({"chat_id": message.chat.id}) or {}
+        logger.info(
+            f"[ADD-BUTTON] verified: {verify.get('result_buttons')!r}"
+        )
+
         await message.reply_text(
             f"✅ ʙᴜᴛᴛᴏɴ ᴀᴅᴅᴇᴅ\n\n"
-            f"ɴᴀᴍᴇ: <b>{name}</b>\n"
-            f"ᴜʀʟ: <code>{url}</code>",
+            f"ɴᴀᴍᴇ: <b>{_escape_html(name)}</b>\n"
+            f"ᴜʀʟ: <code>{_escape_html(url)}</code>\n"
+            f"ᴛᴏᴛᴀʟ ʙᴜᴛᴛᴏɴꜱ: <b>{len(btns)}</b>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.exception(f"[ADMIN] add_button crashed: {e}")
+        logger.exception(f"[ADD-BUTTON] crashed: {e}")
         await message.reply_text(f"❌ {e}")
 
 
 @Client.on_message(filters.command("list_buttons") & filters.group, group=-999)
 async def cmd_list_buttons(client: Client, message: Message):
+    """List all custom buttons for this group."""
     try:
         coll = _groups_coll()
         if coll is None:
@@ -1502,8 +1750,8 @@ async def cmd_list_buttons(client: Client, message: Message):
         for i, b in enumerate(btns, 1):
             enabled = "🟢" if b.get("enabled", True) else "🔴"
             lines.append(
-                f"{i}. {enabled} <b>{b.get('name')}</b>\n"
-                f"   <code>{b.get('url')}</code>"
+                f"{i}. {enabled} <b>{_escape_html(b.get('name'))}</b>\n"
+                f"   <code>{_escape_html(b.get('url'))}</code>"
             )
         await message.reply_text(
             "\n".join(lines),
@@ -1516,6 +1764,7 @@ async def cmd_list_buttons(client: Client, message: Message):
 
 @Client.on_message(filters.command("remove_button") & filters.group, group=-999)
 async def cmd_remove_button(client: Client, message: Message):
+    """Remove a custom button by its list number."""
     try:
         if not message.from_user:
             return
@@ -1556,7 +1805,7 @@ async def cmd_remove_button(client: Client, message: Message):
             {"$set": {"result_buttons": btns}},
         )
         await message.reply_text(
-            f"✅ ʀᴇᴍᴏᴠᴇᴅ: <b>{removed.get('name')}</b>",
+            f"✅ ʀᴇᴍᴏᴠᴇᴅ: <b>{_escape_html(removed.get('name'))}</b>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -1565,6 +1814,7 @@ async def cmd_remove_button(client: Client, message: Message):
 
 @Client.on_message(filters.command("clear_buttons") & filters.group, group=-999)
 async def cmd_clear_buttons(client: Client, message: Message):
+    """Remove all custom buttons for this group."""
     try:
         if not message.from_user:
             return
@@ -1586,6 +1836,7 @@ async def cmd_clear_buttons(client: Client, message: Message):
 
 @Client.on_message(filters.command("set_delete_time") & filters.group, group=-999)
 async def cmd_set_delete_time(client: Client, message: Message):
+    """Set auto-delete time in seconds for this group."""
     try:
         if not message.from_user:
             return
@@ -1596,7 +1847,10 @@ async def cmd_set_delete_time(client: Client, message: Message):
         if len(args) < 2:
             return await message.reply_text(
                 "ᴜꜱᴀɢᴇ: <code>/set_delete_time 600</code> (seconds)\n"
-                "ᴇxᴀᴍᴘʟᴇꜱ: 60=1min, 600=10min, 1800=30min",
+                "ᴇxᴀᴍᴘʟᴇꜱ:\n"
+                "• 60 = 1 min\n"
+                "• 600 = 10 min\n"
+                "• 1800 = 30 min",
                 parse_mode=ParseMode.HTML,
             )
         try:
@@ -1604,23 +1858,26 @@ async def cmd_set_delete_time(client: Client, message: Message):
         except ValueError:
             return await message.reply_text("❌ ɪɴᴠᴀʟɪᴅ ꜱᴇᴄᴏɴᴅꜱ.")
 
-        if secs < 30:
-            return await message.reply_text("⚠️ ᴍɪɴɪᴍᴜᴍ 30 ꜱᴇᴄᴏɴᴅꜱ.")
+        if secs < MIN_DELETE_TIME:
+            return await message.reply_text(
+                f"⚠️ ᴍɪɴɪᴍᴜᴍ {MIN_DELETE_TIME} ꜱᴇᴄᴏɴᴅꜱ."
+            )
 
         ok = await _save_group_field(message.chat.id, "delete_time", secs)
         if ok:
             await message.reply_text(
-                f"✅ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <b>{secs}ꜱ</b>.",
+                f"✅ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ꜱᴇᴛ ᴛᴏ <b>{secs}ꜱ</b>.",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await message.reply_text("❌ ꜰᴀɪʟᴇᴅ.")
+            await message.reply_text("❌ ꜰᴀɪʟᴇᴅ ᴛᴏ ꜱᴀᴠᴇ.")
     except Exception as e:
         await message.reply_text(f"❌ {e}")
 
 
 @Client.on_message(filters.command("debug_buttons") & filters.group, group=-999)
 async def cmd_debug_buttons(client: Client, message: Message):
+    """Show raw button data from DB for debugging."""
     try:
         if not message.from_user:
             return
@@ -1636,10 +1893,13 @@ async def cmd_debug_buttons(client: Client, message: Message):
         sub = (doc.get("settings") or {}).get("result_buttons")
 
         await message.reply_text(
-            f"<b>🔍 DEBUG</b>\n\n"
-            f"<b>Top-level keys:</b>\n<code>{list(doc.keys())}</code>\n\n"
-            f"<b>doc.result_buttons:</b>\n<code>{top!r}</code>\n\n"
-            f"<b>doc.settings.result_buttons:</b>\n<code>{sub!r}</code>",
+            f"<b>🔍 DEBUG — Raw DB Data</b>\n\n"
+            f"<b>Top-level keys:</b>\n"
+            f"<code>{list(doc.keys())}</code>\n\n"
+            f"<b>doc.result_buttons:</b>\n"
+            f"<code>{top!r}</code>\n\n"
+            f"<b>doc.settings.result_buttons:</b>\n"
+            f"<code>{sub!r}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -1647,14 +1907,15 @@ async def cmd_debug_buttons(client: Client, message: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 18 — BACKGROUND CLEANUP + STARTUP CHECK
+# SECTION 20 — BACKGROUND TASKS
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _cleanup_loop():
+async def _session_cleanup_loop():
+    """Periodically clean expired sessions."""
     while True:
         try:
             await asyncio.sleep(300)
-            _cleanup_expired()
+            _cleanup_expired_sessions()
         except asyncio.CancelledError:
             break
         except Exception:
@@ -1662,11 +1923,14 @@ async def _cleanup_loop():
 
 
 async def _startup_check():
+    """Verify DB + media shards at startup."""
     try:
         await asyncio.sleep(3)
         db = _get_db()
         if db is not None:
             logger.info("[GROUP-SEARCH] ✅ primary DB ready")
+        else:
+            logger.error("[GROUP-SEARCH] ⚠️ primary DB unavailable")
         shards = _media_collections()
         logger.info(f"[GROUP-SEARCH] ✅ {len(shards)} media shards")
         for idx, coll in shards[:5]:
@@ -1681,15 +1945,24 @@ async def _startup_check():
 
 try:
     loop = asyncio.get_event_loop()
-    loop.create_task(_cleanup_loop())
+    loop.create_task(_session_cleanup_loop())
     loop.create_task(_startup_check())
-except Exception:
-    pass
+except Exception as e:
+    logger.warning(f"[GROUP-SEARCH] task creation failed: {e}")
 
 
-logger.info("[GROUP-SEARCH] ═══════════════════════════════════════════")
-logger.info("[GROUP-SEARCH] ALL HANDLERS REGISTERED ✅")
-logger.info("[GROUP-SEARCH] Admin cmds: /add_button /list_buttons")
-logger.info("[GROUP-SEARCH]            /remove_button /clear_buttons")
-logger.info("[GROUP-SEARCH]            /set_delete_time /debug_buttons")
-logger.info("[GROUP-SEARCH] ═══════════════════════════════════════════")
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 21 — FINAL LOG
+# ═══════════════════════════════════════════════════════════════════════════
+
+logger.info("")
+logger.info("╔════════════════════════════════════════════════════════════════╗")
+logger.info("║  [GROUP-SEARCH] ALL HANDLERS REGISTERED ✅                     ║")
+logger.info("║                                                                ║")
+logger.info("║  Search commands:   (automatic on group messages)              ║")
+logger.info("║  Admin commands:    /add_button  /list_buttons                 ║")
+logger.info("║                     /remove_button  /clear_buttons             ║")
+logger.info("║                     /set_delete_time  /debug_buttons           ║")
+logger.info("║                                                                ║")
+logger.info("║  Status: READY                                                 ║")
+logger.info("╚════════════════════════════════════════════════════════════════╝")
