@@ -941,21 +941,23 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
             pop = m.get("popularity", 0)
             lang_code = (m.get("lang") or "").upper()
 
-            # COPY-FRIENDLY FORMAT: "Movie Name Year" (no parens)
+            # COPY-FRIENDLY: entire "Movie Name Year" in <code> = tap to copy
             if yr:
                 display_name = f"{title} {yr}"
             else:
                 display_name = title
 
-            lines.append(f"<b>{num}.</b> {_esc(display_name)}")
+            # Only the number is bold, name is a tap-to-copy code block
+            lines.append(f"<b>{num}.</b>")
+            lines.append(f"<code>{_esc(display_name)}</code>")
+
             meta = []
             if rating: meta.append(f"⭐ {rating}")
             if pop:    meta.append(f"🎯 {pop}")
             if lang_code: meta.append(lang_code)
             if meta:
-                lines.append(f"   <code>{' · '.join(meta)}</code>")
+                lines.append(f"{' · '.join(meta)}")
             lines.append("")
-
         if part_idx == total_parts - 1:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
