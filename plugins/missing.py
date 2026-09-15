@@ -2,7 +2,7 @@
 """
 🔍 DOWNTOWN VILLA — MISSING FILES FINDER
 
-Compares TMDB with your local DB. No storage, no cache.
+Compares TMDB with your local DB. No filters, no storage, no cache.
 Results sent as plain messages (chunked if needed).
 """
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,25 +45,9 @@ SESSION_TTL = 900
 DIV = "━" * 26
 DIV2 = "─" * 26
 
-# Default filters (used for Hollywood + others)
-MIN_POPULARITY = 5
-MIN_VOTES = 20
-MIN_RATING = 4.0
-SKIP_ADULT = True
-
-# Per-language filter overrides
-REGIONAL_LANGS = {"ml", "ta", "te", "kn", "bn", "pa", "mr", "hi"}
-
-def _filters_for(lang: str) -> Tuple[float, int, float]:
-    """Return (min_pop, min_votes, min_rating) for a language."""
-    if lang in REGIONAL_LANGS:
-        return (1.0, 3, 3.0)
-    if lang == "all":
-        return (2.0, 10, 4.0)
-    return (MIN_POPULARITY, MIN_VOTES, MIN_RATING)
-
 # Output
 MOVIES_PER_PART = 25
+MAX_PAGES = 15   # safety cap to prevent infinite loops
 
 # Month names
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -242,7 +226,7 @@ def _date_range(year: int, month: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TMDB FETCHER
+# TMDB FETCHER — NO FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def _tmdb_request(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not TMDB_API_KEY:
@@ -268,9 +252,10 @@ async def _tmdb_request(path: str, params: Dict[str, Any]) -> Optional[Dict[str,
 
 
 async def _fetch_movies_range(gte: str, lte: str, lang: str,
-                               max_pages: int = 6) -> List[Dict[str, Any]]:
-    min_pop, min_votes, min_rating = _filters_for(lang)
+                               max_pages: int = MAX_PAGES) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetch ALL movies in date range — no filters applied."""
     out: List[Dict[str, Any]] = []
+    raw = 0
     page = 1
     while page <= max_pages:
         params: Dict[str, Any] = {
@@ -278,23 +263,23 @@ async def _fetch_movies_range(gte: str, lte: str, lang: str,
             "primary_release_date.lte": lte,
             "sort_by": "popularity.desc",
             "page": page,
-            "include_adult": "false" if SKIP_ADULT else "true",
         }
         if lang != "all":
             params["with_original_language"] = lang
+            if lang in {"hi", "ml", "ta", "te", "kn", "bn", "pa", "mr"}:
+                params["region"] = "IN"
 
         data = await _tmdb_request("/discover/movie", params)
         if not data: break
         results = data.get("results") or []
         if not results: break
 
+        raw += len(results)
+
         for r in results:
-            pop = r.get("popularity", 0) or 0
             rating = r.get("vote_average", 0) or 0
             votes = r.get("vote_count", 0) or 0
-            if pop < min_pop: continue
-            if rating and rating < min_rating: continue
-            if votes < min_votes: continue
+            pop = r.get("popularity", 0) or 0
 
             out.append({
                 "tmdb_id": r.get("id"),
@@ -313,13 +298,14 @@ async def _fetch_movies_range(gte: str, lte: str, lang: str,
         page += 1
         await asyncio.sleep(0.15)
 
-    return out
+    return out, raw
 
 
 async def _fetch_series_range(gte: str, lte: str, lang: str,
-                               max_pages: int = 6) -> List[Dict[str, Any]]:
-    min_pop, min_votes, min_rating = _filters_for(lang)
+                               max_pages: int = MAX_PAGES) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetch ALL series in date range — no filters applied."""
     out: List[Dict[str, Any]] = []
+    raw = 0
     page = 1
     while page <= max_pages:
         params: Dict[str, Any] = {
@@ -327,7 +313,6 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
             "first_air_date.lte": lte,
             "sort_by": "popularity.desc",
             "page": page,
-            "include_adult": "false" if SKIP_ADULT else "true",
         }
         if lang != "all":
             params["with_original_language"] = lang
@@ -337,13 +322,12 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
         results = data.get("results") or []
         if not results: break
 
+        raw += len(results)
+
         for r in results:
-            pop = r.get("popularity", 0) or 0
             rating = r.get("vote_average", 0) or 0
             votes = r.get("vote_count", 0) or 0
-            if pop < min_pop: continue
-            if rating and rating < min_rating: continue
-            if votes < min_votes: continue
+            pop = r.get("popularity", 0) or 0
 
             out.append({
                 "tmdb_id": r.get("id"),
@@ -362,10 +346,11 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
         page += 1
         await asyncio.sleep(0.15)
 
-    return out
+    return out, raw
 
 
 async def _find_missing(items: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
+    """Return (missing, in_db)."""
     missing: List[Dict] = []
     present: List[Dict] = []
     for item in items:
@@ -459,14 +444,6 @@ def kb_back(target: str = "miss:back_type"):
     ])
 
 
-def kb_back_months(kind: str, ind: str, year: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ BACK",
-                              callback_data=f"miss:back_ind:{kind}")],
-        [InlineKeyboardButton("❌ CLOSE", callback_data="miss:close")],
-    ])
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # VIEW BUILDERS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -477,7 +454,7 @@ def _view_start() -> str:
         DIV, "",
         f"📌 {sc('find what is missing from your bot')}",
         f"📌 {sc('compare tmdb with your local db')}",
-        f"📌 {sc('no storage · results as plain messages')}",
+        f"📌 {sc('no storage · no cache · no filters')}",
         "",
         DIV2, "",
         f"🎯 {sc('how it works')}:",
@@ -486,12 +463,11 @@ def _view_start() -> str:
         f"3️⃣ ᴛʏᴘᴇ ʏᴇᴀʀ",
         f"4️⃣ ᴘɪᴄᴋ ᴍᴏɴᴛʜ",
         f"5️⃣ ᴘɪᴄᴋ ᴡᴇᴇᴋ",
-        f"6️⃣ ɢᴇᴛ ᴛʜᴇ ʟɪꜱᴛ",
+        f"6️⃣ ɢᴇᴛ ᴛʜᴇ ꜰᴜʟʟ ʟɪꜱᴛ",
         "",
         DIV2, "",
-        f"⚙️ {sc('filters')} · ᴘᴏᴘ ≥ {MIN_POPULARITY} · "
-        f"ᴠᴏᴛᴇꜱ ≥ {MIN_VOTES} · ʀᴀᴛɪɴɢ ≥ {MIN_RATING}",
-        f"📌 {sc('regional languages use relaxed filters')}",
+        f"⚙️ {sc('filters')} · ɴᴏɴᴇ — ꜱʜᴏᴡꜱ ᴇᴠᴇʀʏᴛʜɪɴɢ",
+        f"📌 {sc('names shown as')} · <code>Movie Name 2000</code>",
     ])
 
 
@@ -502,7 +478,7 @@ def _view_industry(kind: str) -> str:
         f"🔍 <b>{fb('MISSING ' + label)}</b>",
         DIV, "",
         f"📌 {sc('pick an industry')}",
-        f"📌 {sc('all = every language (slower)')}",
+        f"📌 {sc('all = every language')}",
     ])
 
 
@@ -546,8 +522,7 @@ def _view_weeks(kind: str, ind_label: str, year: int, month: int) -> str:
         "",
         DIV2, "",
         f"📌 {sc('pick a week to scan')}",
-        f"📌 {sc('full month = slower (30-45s)')}",
-        f"📌 {sc('week = fast (5-8s)')}",
+        f"📌 {sc('week = fast · full month = more movies')}",
     ])
 
 
@@ -834,32 +809,14 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
     # Fetch
     try:
         if kind == "movie":
-            items = await _fetch_movies_range(gte, lte, lang)
+            items, raw = await _fetch_movies_range(gte, lte, lang)
         else:
-            items = await _fetch_series_range(gte, lte, lang)
+            items, raw = await _fetch_series_range(gte, lte, lang)
     except Exception as e:
         logger.exception(f"[MISS] fetch failed: {e}")
-        items = []
+        items, raw = [], 0
 
     fetched = len(items)
-
-    # Progress 2
-    try:
-        await client.edit_message_text(
-            chat_id=chat_id, message_id=progress_id,
-            text="\n".join([
-                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"🔍 <b>{fb('SCANNING')}</b>",
-                DIV, "",
-                f"📅 {sc('period')} · <code>{_esc(period_short)}</code>",
-                f"🎬 {sc('type')} · <code>{kind.upper()}</code>",
-                f"🌍 {sc('industry')} · <b>{_esc(label)}</b>",
-                "", DIV2, "",
-                f"📥 {sc('fetched')} · <code>{_fmt_int(fetched)}</code>",
-                f"🔎 {sc('comparing with your db')}...",
-            ]),
-            parse_mode=ParseMode.HTML)
-    except Exception: pass
 
     # Empty
     if not items:
@@ -872,13 +829,14 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
                     DIV, "",
                     f"📅 <code>{_esc(period_short)}</code>",
                     f"🎬 <code>{kind.upper()}</code> · 🌍 <b>{_esc(label)}</b>",
+                    "",
+                    f"📥 {sc('tmdb raw')} · <code>{_fmt_int(raw)}</code>",
                     "", DIV2, "",
                     f"📌 {sc('no movies found on tmdb for this range')}",
                     "", f"💡 <b>{sc('try')}</b>:",
                     f"• ᴜꜱᴇ <b>FULL MONTH</b> ɪɴꜱᴛᴇᴀᴅ ᴏꜰ ᴀ ᴡᴇᴇᴋ",
-                    f"• ᴛʀʏ ᴀ <b>ʀᴇᴄᴇɴᴛ ʏᴇᴀʀ</b> (2023–2025)",
+                    f"• ᴛʀʏ ᴀ <b>ᴘᴀꜱᴛ ʏᴇᴀʀ</b> (ᴛᴍᴅʙ ɴᴇᴇᴅꜱ ᴛɪᴍᴇ ᴛᴏ ɪɴᴅᴇx)",
                     f"• ᴛʀʏ <b>🌍 ALL</b> ɪɴᴅᴜꜱᴛʀʏ",
-                    f"• ᴛᴍᴅʙ ᴍᴀʏ ɴᴏᴛ ᴄᴏᴠᴇʀ ᴛʜɪꜱ ᴘᴇʀɪᴏᴅ",
                 ]),
                 reply_markup=kb_after_results(kind, code, year, month),
                 parse_mode=ParseMode.HTML)
@@ -936,7 +894,7 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
         try:
             await client.send_message(
                 chat_id=chat_id, text="\n".join(header_lines),
-                reply_markup=kb_after_results(kind_code, kind_code, year, month),
+                reply_markup=kb_after_results(kind, kind_code, year, month),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True)
         except Exception as e:
@@ -947,7 +905,8 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
         "", DIV2, "",
         f"📌 {sc('list below')} · <code>{missing_count}</code> ᴛɪᴛʟᴇꜱ",
         f"📌 {sc('sorted by popularity')}",
-        f"📌 {sc('forward / save each message')}",
+        f"📌 {sc('format')} · <code>Movie Name Year</code>",
+        f"📌 {sc('copy and search anywhere')}",
     ]
 
     try:
@@ -982,7 +941,13 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
             pop = m.get("popularity", 0)
             lang_code = (m.get("lang") or "").upper()
 
-            lines.append(f"<b>{num}.</b> {_esc(title)} ({yr})")
+            # COPY-FRIENDLY FORMAT: "Movie Name Year" (no parens)
+            if yr:
+                display_name = f"{title} {yr}"
+            else:
+                display_name = title
+
+            lines.append(f"<b>{num}.</b> {_esc(display_name)}")
             meta = []
             if rating: meta.append(f"⭐ {rating}")
             if pop:    meta.append(f"🎯 {pop}")
@@ -1051,12 +1016,8 @@ logger.info("║    /missing    — find missing movies/series (admin)          
 logger.info("║    /lackfiles  — alias                                         ║")
 logger.info("║    /gapscan    — alias                                         ║")
 logger.info("║                                                                ║")
-logger.info("║  Flow:                                                         ║")
-logger.info("║    Type → Industry → Year → Month → Week → Results             ║")
-logger.info("║                                                                ║")
-logger.info("║  No storage · No cache · Plain text output                     ║")
-logger.info("║  Regional languages (Malayalam, Tamil, etc.) use relaxed       ║")
-logger.info("║  filters so you actually get results.                          ║")
+logger.info("║  Filters: NONE — shows every movie/series from TMDB            ║")
+logger.info("║  Format:  Movie Name Year  (copy-friendly, no parens)          ║")
 logger.info("║                                                                ║")
 logger.info("║  Env:                                                          ║")
 logger.info("║    TMDB_API_KEY=xxx                                            ║")
