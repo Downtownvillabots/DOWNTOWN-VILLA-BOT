@@ -9,6 +9,7 @@ Results sent as plain messages (chunked if needed).
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio
+import calendar
 import logging
 import os
 import re
@@ -44,15 +45,25 @@ SESSION_TTL = 900
 DIV = "━" * 26
 DIV2 = "─" * 26
 
-# Default filters (baked in)
+# Default filters (used for Hollywood + others)
 MIN_POPULARITY = 5
 MIN_VOTES = 20
 MIN_RATING = 4.0
 SKIP_ADULT = True
 
+# Per-language filter overrides
+REGIONAL_LANGS = {"ml", "ta", "te", "kn", "bn", "pa", "mr", "hi"}
+
+def _filters_for(lang: str) -> Tuple[float, int, float]:
+    """Return (min_pop, min_votes, min_rating) for a language."""
+    if lang in REGIONAL_LANGS:
+        return (1.0, 3, 3.0)
+    if lang == "all":
+        return (2.0, 10, 4.0)
+    return (MIN_POPULARITY, MIN_VOTES, MIN_RATING)
+
 # Output
 MOVIES_PER_PART = 25
-MAX_MSG_CHARS = 3500
 
 # Month names
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -60,33 +71,36 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 MONTHS_FULL = ["January", "February", "March", "April", "May", "June",
                "July", "August", "September", "October", "November", "December"]
 
-# Industries (language codes for TMDB)
+# Industries (TMDB language codes)
 INDUSTRIES = [
-    ("hollywood", "🇺🇸 Hollywood",  "en"),
-    ("hindi",     "🇮🇳 Hindi",      "hi"),
-    ("malayalam", "🇮🇳 Malayalam",  "ml"),
-    ("tamil",     "🇮🇳 Tamil",      "ta"),
-    ("telugu",    "🇮🇳 Telugu",     "te"),
-    ("kannada",   "🇮🇳 Kannada",    "kn"),
-    ("bengali",   "🇮🇳 Bengali",    "bn"),
-    ("punjabi",   "🇮🇳 Punjabi",    "pa"),
-    ("marathi",   "🇮🇳 Marathi",    "mr"),
-    ("korean",    "🇰🇷 Korean",     "ko"),
-    ("japanese",  "🇯🇵 Japanese",   "ja"),
-    ("chinese",   "🇨🇳 Chinese",    "zh"),
-    ("spanish",   "🇪🇸 Spanish",    "es"),
-    ("turkish",   "🇹🇷 Turkish",    "tr"),
-    ("arabic",    "🇸🇦 Arabic",     "ar"),
-    ("french",    "🇫🇷 French",     "fr"),
-    ("german",    "🇩🇪 German",     "de"),
-    ("russian",   "🇷🇺 Russian",    "ru"),
-    ("thai",      "🇹🇭 Thai",       "th"),
-    ("indonesian","🇮🇩 Indonesian", "id"),
-    ("all",       "🌍 ALL",         "all"),
+    ("hollywood", "🇺🇸 Hollywood",   "en"),
+    ("hindi",     "🇮🇳 Hindi",       "hi"),
+    ("malayalam", "🇮🇳 Malayalam",   "ml"),
+    ("tamil",     "🇮🇳 Tamil",       "ta"),
+    ("telugu",    "🇮🇳 Telugu",      "te"),
+    ("kannada",   "🇮🇳 Kannada",     "kn"),
+    ("bengali",   "🇮🇳 Bengali",     "bn"),
+    ("punjabi",   "🇮🇳 Punjabi",     "pa"),
+    ("marathi",   "🇮🇳 Marathi",     "mr"),
+    ("korean",    "🇰🇷 Korean",      "ko"),
+    ("japanese",  "🇯🇵 Japanese",    "ja"),
+    ("chinese",   "🇨🇳 Chinese",     "zh"),
+    ("spanish",   "🇪🇸 Spanish",     "es"),
+    ("turkish",   "🇹🇷 Turkish",     "tr"),
+    ("arabic",    "🇸🇦 Arabic",      "ar"),
+    ("french",    "🇫🇷 French",      "fr"),
+    ("german",    "🇩🇪 German",      "de"),
+    ("russian",   "🇷🇺 Russian",     "ru"),
+    ("thai",      "🇹🇭 Thai",        "th"),
+    ("indonesian","🇮🇩 Indonesian",  "id"),
+    ("all",       "🌍 ALL",          "all"),
 ]
 INDUSTRY_MAP = {code: (label, lang) for code, label, lang in INDUSTRIES}
 
-# Fancy fonts
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FANCY FONTS
+# ═══════════════════════════════════════════════════════════════════════════
 _M_BOLD = {
     **{chr(ord('A') + i): "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"[i] for i in range(26)},
     **{chr(ord('a') + i): "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"[i] for i in range(26)},
@@ -122,7 +136,7 @@ def _is_admin(uid) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DB HELPERS (read-only — no writes)
+# DB HELPERS (read-only)
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_db():
     try:
@@ -137,6 +151,7 @@ def _get_db():
 
 def _files_coll():
     d = _get_db()
+    if d is None: return None
     for name in ("media_files", "files", "media"):
         try:
             c = d[name]
@@ -205,10 +220,8 @@ def _cleanup_sessions() -> None:
 # WEEK MATH
 # ═══════════════════════════════════════════════════════════════════════════
 def _weeks_of_month(year: int, month: int) -> List[Tuple[int, int, int]]:
-    """Return [(week_num, start_day, end_day), ...] for a month."""
-    import calendar
     days_in_month = calendar.monthrange(year, month)[1]
-    weeks = []
+    weeks: List[Tuple[int, int, int]] = []
     start = 1
     wk = 1
     while start <= days_in_month:
@@ -219,10 +232,9 @@ def _weeks_of_month(year: int, month: int) -> List[Tuple[int, int, int]]:
     return weeks
 
 
-def _date_range(year: int, month: int, week: Optional[Tuple[int, int]]) -> Tuple[str, str]:
-    """Return (gte, lte) YYYY-MM-DD strings. week=None → whole month."""
+def _date_range(year: int, month: int,
+                week: Optional[Tuple[int, int, int]]) -> Tuple[str, str]:
     if week is None:
-        import calendar
         last = calendar.monthrange(year, month)[1]
         return f"{year:04d}-{month:02d}-01", f"{year:04d}-{month:02d}-{last:02d}"
     _, start, end = week
@@ -239,6 +251,7 @@ async def _tmdb_request(path: str, params: Dict[str, Any]) -> Optional[Dict[str,
     try:
         import aiohttp
     except ImportError:
+        logger.warning("[MISS] aiohttp not installed")
         return None
     base = "https://api.themoviedb.org/3"
     p = {"api_key": TMDB_API_KEY, "language": "en-US", **params}
@@ -256,7 +269,7 @@ async def _tmdb_request(path: str, params: Dict[str, Any]) -> Optional[Dict[str,
 
 async def _fetch_movies_range(gte: str, lte: str, lang: str,
                                max_pages: int = 6) -> List[Dict[str, Any]]:
-    """Fetch movies in date range. lang='all' → all languages."""
+    min_pop, min_votes, min_rating = _filters_for(lang)
     out: List[Dict[str, Any]] = []
     page = 1
     while page <= max_pages:
@@ -266,7 +279,6 @@ async def _fetch_movies_range(gte: str, lte: str, lang: str,
             "sort_by": "popularity.desc",
             "page": page,
             "include_adult": "false" if SKIP_ADULT else "true",
-            "vote_count.gte": MIN_VOTES,
         }
         if lang != "all":
             params["with_original_language"] = lang
@@ -280,9 +292,9 @@ async def _fetch_movies_range(gte: str, lte: str, lang: str,
             pop = r.get("popularity", 0) or 0
             rating = r.get("vote_average", 0) or 0
             votes = r.get("vote_count", 0) or 0
-            if pop < MIN_POPULARITY: continue
-            if rating and rating < MIN_RATING: continue
-            if votes < MIN_VOTES: continue
+            if pop < min_pop: continue
+            if rating and rating < min_rating: continue
+            if votes < min_votes: continue
 
             out.append({
                 "tmdb_id": r.get("id"),
@@ -299,14 +311,14 @@ async def _fetch_movies_range(gte: str, lte: str, lang: str,
         total_pages = data.get("total_pages", 1)
         if page >= total_pages: break
         page += 1
-        await asyncio.sleep(0.15)   # gentle rate limiting
+        await asyncio.sleep(0.15)
 
     return out
 
 
 async def _fetch_series_range(gte: str, lte: str, lang: str,
                                max_pages: int = 6) -> List[Dict[str, Any]]:
-    """Fetch TV series in date range."""
+    min_pop, min_votes, min_rating = _filters_for(lang)
     out: List[Dict[str, Any]] = []
     page = 1
     while page <= max_pages:
@@ -316,7 +328,6 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
             "sort_by": "popularity.desc",
             "page": page,
             "include_adult": "false" if SKIP_ADULT else "true",
-            "vote_count.gte": MIN_VOTES,
         }
         if lang != "all":
             params["with_original_language"] = lang
@@ -330,9 +341,9 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
             pop = r.get("popularity", 0) or 0
             rating = r.get("vote_average", 0) or 0
             votes = r.get("vote_count", 0) or 0
-            if pop < MIN_POPULARITY: continue
-            if rating and rating < MIN_RATING: continue
-            if votes < MIN_VOTES: continue
+            if pop < min_pop: continue
+            if rating and rating < min_rating: continue
+            if votes < min_votes: continue
 
             out.append({
                 "tmdb_id": r.get("id"),
@@ -355,7 +366,6 @@ async def _fetch_series_range(gte: str, lte: str, lang: str,
 
 
 async def _find_missing(items: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
-    """Return (missing, in_db) lists."""
     missing: List[Dict] = []
     present: List[Dict] = []
     for item in items:
@@ -379,7 +389,6 @@ def kb_type():
 
 
 def kb_industry(kind: str):
-    """Big industry list in a grid."""
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
     for code, label, _ in INDUSTRIES:
@@ -433,26 +442,29 @@ def kb_weeks(kind: str, ind: str, year: int, month: int,
 
 def kb_after_results(kind: str, ind: str, year: int, month: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 RESCAN",
-                              callback_data=f"miss:mo:{kind}:{ind}:{year}:{month}")],
-        [InlineKeyboardButton("📅 NEW WEEK",
-                              callback_data=f"miss:back_months:{kind}:{ind}:{year}")],
+        [InlineKeyboardButton(
+            "🔄 RESCAN",
+            callback_data=f"miss:mo:{kind}:{ind}:{year}:{month}")],
+        [InlineKeyboardButton(
+            "📅 NEW WEEK",
+            callback_data=f"miss:back_months:{kind}:{ind}:{year}")],
         [InlineKeyboardButton("❌ CLOSE", callback_data="miss:close")],
     ])
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SAFE EDIT
-# ═══════════════════════════════════════════════════════════════════════════
-async def _safe_edit(target, text: str, kb=None) -> bool:
-    try:
-        msg = getattr(target, "message", target)
-        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True)
-        return True
-    except MessageNotModified: return True
-    except Exception as e:
-        logger.debug(f"[MISS] edit: {type(e).__name__}: {e}")
-        return False
+
+def kb_back(target: str = "miss:back_type"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ BACK", callback_data=target)],
+        [InlineKeyboardButton("❌ CLOSE", callback_data="miss:close")],
+    ])
+
+
+def kb_back_months(kind: str, ind: str, year: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ BACK",
+                              callback_data=f"miss:back_ind:{kind}")],
+        [InlineKeyboardButton("❌ CLOSE", callback_data="miss:close")],
+    ])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -477,8 +489,9 @@ def _view_start() -> str:
         f"6️⃣ ɢᴇᴛ ᴛʜᴇ ʟɪꜱᴛ",
         "",
         DIV2, "",
-        f"⚙️ {sc('filters')}: ᴘᴏᴘ ≥ {MIN_POPULARITY} · ᴠᴏᴛᴇꜱ ≥ {MIN_VOTES} · "
-        f"ʀᴀᴛɪɴɢ ≥ {MIN_RATING}",
+        f"⚙️ {sc('filters')} · ᴘᴏᴘ ≥ {MIN_POPULARITY} · "
+        f"ᴠᴏᴛᴇꜱ ≥ {MIN_VOTES} · ʀᴀᴛɪɴɢ ≥ {MIN_RATING}",
+        f"📌 {sc('regional languages use relaxed filters')}",
     ])
 
 
@@ -494,18 +507,19 @@ def _view_industry(kind: str) -> str:
 
 
 def _view_year_input(kind: str, ind_label: str) -> str:
+    type_label = "MOVIES" if kind == "movie" else "SERIES"
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{fb('ENTER YEAR')}</b>",
         DIV, "",
-        f"🎬 {sc('type')} · <code>{kind}</code>",
+        f"🎬 {sc('type')} · <code>{type_label}</code>",
         f"🌍 {sc('industry')} · <b>{_esc(ind_label)}</b>",
         "",
         DIV2, "",
         f"📝 {sc('send the year as next message')}",
         "",
         f"📌 {sc('example')} · <code>2000</code>",
-        f"📌 {sc('range')} · <code>1950 – 2026</code>",
+        f"📌 {sc('range')} · <code>1950 – 2027</code>",
     ])
 
 
@@ -514,7 +528,7 @@ def _view_months(kind: str, ind_label: str, year: int) -> str:
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{fb('YEAR')}</b> · <code>{year}</code>",
         DIV, "",
-        f"🎬 {sc('type')} · <code>{kind}</code>",
+        f"🎬 {sc('type')} · <code>{kind.upper()}</code>",
         f"🌍 {sc('industry')} · <b>{_esc(ind_label)}</b>",
         "",
         DIV2, "",
@@ -527,7 +541,7 @@ def _view_weeks(kind: str, ind_label: str, year: int, month: int) -> str:
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{MONTHS_FULL[month-1].upper()} {year}</b>",
         DIV, "",
-        f"🎬 {sc('type')} · <code>{kind}</code>",
+        f"🎬 {sc('type')} · <code>{kind.upper()}</code>",
         f"🌍 {sc('industry')} · <b>{_esc(ind_label)}</b>",
         "",
         DIV2, "",
@@ -538,10 +552,28 @@ def _view_weeks(kind: str, ind_label: str, year: int, month: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SAFE EDIT
+# ═══════════════════════════════════════════════════════════════════════════
+async def _safe_edit(target, text: str, kb=None) -> bool:
+    try:
+        msg = getattr(target, "message", target)
+        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True)
+        return True
+    except MessageNotModified:
+        return True
+    except Exception as e:
+        logger.exception(f"[MISS] edit failed: {type(e).__name__}: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # /missing COMMAND
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(filters.command(["missing", "lackfiles", "gapscan"]) & filters.private,
-                   group=-460)
+@Client.on_message(
+    filters.command(["missing", "lackfiles", "gapscan"]) & filters.private,
+    group=-460,
+)
 async def cmd_missing(client: Client, message: Message):
     try:
         if not message.from_user or not _is_admin(message.from_user.id):
@@ -549,139 +581,181 @@ async def cmd_missing(client: Client, message: Message):
         if not TMDB_API_KEY:
             return await message.reply_text(
                 "⚠️ <b>TMDB_API_KEY ɴᴏᴛ ꜱᴇᴛ</b>\n\n"
-                "ꜱᴇᴛ ɪᴛ ɪɴ ʏᴏᴜʀ ᴇɴᴠɪʀᴏɴᴍᴇɴᴛ ᴠᴀʀɪᴀʙʟᴇꜱ ᴛᴏ ᴜꜱᴇ ᴛʜɪꜱ ꜰᴇᴀᴛᴜʀᴇ.",
+                "ꜱᴇᴛ ɪᴛ ɪɴ ʏᴏᴜʀ ᴇɴᴠɪʀᴏɴᴍᴇɴᴛ ᴠᴀʀɪᴀʙʟᴇꜱ.",
                 parse_mode=ParseMode.HTML)
-
         _clear_session(message.from_user.id)
         await message.reply_text(
-            _view_start(),
-            reply_markup=kb_type(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            _view_start(), reply_markup=kb_type(),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         logger.exception(f"[MISS] /missing crashed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALLBACKS — NAVIGATION
+# CALLBACKS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^miss:close$"), group=-460)
 async def cb_close(client: Client, q: CallbackQuery):
-    _clear_session(q.from_user.id)
-    try: await q.message.delete()
-    except Exception: pass
-    await q.answer("ᴄʟᴏꜱᴇᴅ")
+    try:
+        _clear_session(q.from_user.id)
+        try: await q.message.delete()
+        except Exception: pass
+        await q.answer("ᴄʟᴏꜱᴇᴅ")
+    except Exception:
+        try: await q.answer("ᴄʟᴏꜱᴇᴅ")
+        except Exception: pass
 
 
 @Client.on_callback_query(filters.regex(r"^miss:back_type$"), group=-460)
 async def cb_back_type(client: Client, q: CallbackQuery):
-    _clear_session(q.from_user.id)
-    await _safe_edit(q, _view_start(), kb_type())
-    await q.answer()
+    try:
+        _clear_session(q.from_user.id)
+        await _safe_edit(q, _view_start(), kb_type())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_back_type: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
 @Client.on_callback_query(filters.regex(r"^miss:type:(movie|series)$"), group=-460)
 async def cb_type(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    _new_session(q.from_user.id, "missing_kind", kind=kind)
-    await _safe_edit(q, _view_industry(kind), kb_industry(kind))
-    await q.answer()
+    try:
+        kind = q.matches[0].group(1)
+        _new_session(q.from_user.id, "missing_kind", kind=kind)
+        await _safe_edit(q, _view_industry(kind), kb_industry(kind))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_type: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
 @Client.on_callback_query(filters.regex(r"^miss:back_ind:(movie|series)$"), group=-460)
 async def cb_back_ind(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    _new_session(q.from_user.id, "missing_kind", kind=kind)
-    await _safe_edit(q, _view_industry(kind), kb_industry(kind))
-    await q.answer()
+    try:
+        kind = q.matches[0].group(1)
+        _new_session(q.from_user.id, "missing_kind", kind=kind)
+        await _safe_edit(q, _view_industry(kind), kb_industry(kind))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_back_ind: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
-@Client.on_callback_query(filters.regex(r"^miss:ind:(movie|series):(\w+)$"), group=-460)
+@Client.on_callback_query(
+    filters.regex(r"^miss:ind:(movie|series):(\w+)$"), group=-460)
 async def cb_industry(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    code = q.matches[0].group(2)
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
 
-    if code not in INDUSTRY_MAP:
-        return await q.answer("⚠️ ᴜɴᴋɴᴏᴡɴ ɪɴᴅᴜꜱᴛʀʏ", show_alert=True)
+        if code not in INDUSTRY_MAP:
+            return await q.answer("⚠️ ᴜɴᴋɴᴏᴡɴ ɪɴᴅᴜꜱᴛʀʏ", show_alert=True)
 
-    label, lang = INDUSTRY_MAP[code]
+        label, lang = INDUSTRY_MAP[code]
+        _new_session(q.from_user.id, "missing_year_input",
+                     kind=kind, ind=code, ind_label=label, ind_lang=lang)
 
-    _new_session(q.from_user.id, "missing_year_input",
-                 kind=kind, ind=code, ind_label=label, ind_lang=lang)
+        await _safe_edit(q, _view_year_input(kind, label),
+                         kb_back(f"miss:back_ind:{kind}"))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_industry: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
-    await _safe_edit(q, _view_year_input(kind, label), kb_back(f"miss:back_ind:{kind}"))
-    await q.answer()
 
-
-@Client.on_callback_query(filters.regex(r"^miss:back_months:(movie|series):(\w+):(\d{4})$"),
-                          group=-460)
+@Client.on_callback_query(
+    filters.regex(r"^miss:back_months:(movie|series):(\w+):(\d{4})$"),
+    group=-460)
 async def cb_back_months(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    code = q.matches[0].group(2)
-    year = int(q.matches[0].group(3))
-    label, _ = INDUSTRY_MAP.get(code, ("?", "en"))
-    _new_session(q.from_user.id, "missing_month_pick",
-                 kind=kind, ind=code, ind_label=label, year=year)
-    await _safe_edit(q, _view_months(kind, label, year),
-                     kb_months(kind, code, year))
-    await q.answer()
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        label, _ = INDUSTRY_MAP.get(code, ("?", "en"))
+        _new_session(q.from_user.id, "missing_month_pick",
+                     kind=kind, ind=code, ind_label=label, year=year)
+        await _safe_edit(q, _view_months(kind, label, year),
+                         kb_months(kind, code, year))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_back_months: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
-@Client.on_callback_query(filters.regex(r"^miss:mo:(movie|series):(\w+):(\d{4}):(\d{1,2})$"),
-                          group=-460)
+@Client.on_callback_query(
+    filters.regex(r"^miss:mo:(movie|series):(\w+):(\d{4}):(\d{1,2})$"),
+    group=-460)
 async def cb_month(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    code = q.matches[0].group(2)
-    year = int(q.matches[0].group(3))
-    month = int(q.matches[0].group(4))
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        month = int(q.matches[0].group(4))
 
-    if not (1 <= month <= 12):
-        return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴍᴏɴᴛʜ", show_alert=True)
+        if not (1 <= month <= 12):
+            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴍᴏɴᴛʜ", show_alert=True)
 
-    label, _ = INDUSTRY_MAP.get(code, ("?", "en"))
-    weeks = _weeks_of_month(year, month)
+        label, _ = INDUSTRY_MAP.get(code, ("?", "en"))
+        weeks = _weeks_of_month(year, month)
 
-    _new_session(q.from_user.id, "missing_week_pick",
-                 kind=kind, ind=code, ind_label=label,
-                 year=year, month=month)
+        _new_session(q.from_user.id, "missing_week_pick",
+                     kind=kind, ind=code, ind_label=label,
+                     year=year, month=month)
 
-    await _safe_edit(q, _view_weeks(kind, label, year, month),
-                     kb_weeks(kind, code, year, month, weeks))
-    await q.answer()
+        await _safe_edit(q, _view_weeks(kind, label, year, month),
+                         kb_weeks(kind, code, year, month, weeks))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] cb_month: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
 @Client.on_callback_query(
     filters.regex(r"^miss:wk:(movie|series):(\w+):(\d{4}):(\d{1,2}):(\d{1,2})$"),
     group=-460)
 async def cb_week(client: Client, q: CallbackQuery):
-    kind = q.matches[0].group(1)
-    code = q.matches[0].group(2)
-    year = int(q.matches[0].group(3))
-    month = int(q.matches[0].group(4))
-    week_num = int(q.matches[0].group(5))
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        month = int(q.matches[0].group(4))
+        week_num = int(q.matches[0].group(5))
 
-    label, lang = INDUSTRY_MAP.get(code, ("?", "en"))
-    weeks = _weeks_of_month(year, month)
+        label, lang = INDUSTRY_MAP.get(code, ("?", "en"))
+        weeks = _weeks_of_month(year, month)
 
-    week_tuple: Optional[Tuple[int, int, int]] = None
-    if week_num > 0:
-        for w in weeks:
-            if w[0] == week_num:
-                week_tuple = w
-                break
-        if week_tuple is None:
-            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴡᴇᴇᴋ", show_alert=True)
+        week_tuple: Optional[Tuple[int, int, int]] = None
+        if week_num > 0:
+            for w in weeks:
+                if w[0] == week_num:
+                    week_tuple = w
+                    break
+            if week_tuple is None:
+                return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴡᴇᴇᴋ", show_alert=True)
 
-    _clear_session(q.from_user.id)
-    await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ...")
-    await _run_scan(client, q, kind, code, label, lang, year, month, week_tuple)
+        _clear_session(q.from_user.id)
+        await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ...")
+        await _run_scan(client, q, kind, code, label, lang,
+                        year, month, week_tuple)
+    except Exception as e:
+        logger.exception(f"[MISS] cb_week: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # YEAR INPUT
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(filters.private & filters.text & ~filters.regex(r"^/"), group=-459)
+@Client.on_message(
+    filters.private & filters.text & ~filters.regex(r"^/"),
+    group=-459,
+)
 async def missing_year_input(client: Client, message: Message):
     if not message.from_user: return
     session = _get_session(message.from_user.id)
@@ -693,7 +767,6 @@ async def missing_year_input(client: Client, message: Message):
 
     text = (message.text or "").strip()
 
-    # Parse year
     try:
         year = int(text)
         if year < 1950 or year > 2027:
@@ -721,12 +794,11 @@ async def missing_year_input(client: Client, message: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# THE SCANNER + OUTPUT
+# THE SCANNER
 # ═══════════════════════════════════════════════════════════════════════════
 async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
                     label: str, lang: str, year: int, month: int,
                     week: Optional[Tuple[int, int, int]]) -> None:
-    """Do the scan and send results as plain messages."""
     gte, lte = _date_range(year, month, week)
 
     if week is None:
@@ -737,7 +809,7 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
         period = f"W{wk} · {start:02d}-{end:02d} {MONTHS_FULL[month-1]} {year}"
         period_short = f"{MONTHS[month-1]} {year} · W{wk}"
 
-    # Progress message
+    # Progress
     try:
         progress = await q.message.edit_text(
             "\n".join([
@@ -745,13 +817,12 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
                 f"🔍 <b>{fb('SCANNING')}</b>",
                 DIV, "",
                 f"📅 {sc('period')} · <code>{_esc(period_short)}</code>",
-                f"🎬 {sc('type')} · <code>{kind}</code>",
+                f"🎬 {sc('type')} · <code>{kind.upper()}</code>",
                 f"🌍 {sc('industry')} · <b>{_esc(label)}</b>",
                 "", DIV2, "",
                 f"⏳ {sc('fetching from tmdb')}...",
             ]),
-            parse_mode=ParseMode.HTML,
-        )
+            parse_mode=ParseMode.HTML)
     except MessageNotModified:
         progress = q.message
     except Exception:
@@ -760,7 +831,7 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
     chat_id = q.message.chat.id
     progress_id = progress.id
 
-    # Fetch from TMDB
+    # Fetch
     try:
         if kind == "movie":
             items = await _fetch_movies_range(gte, lte, lang)
@@ -772,7 +843,7 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
 
     fetched = len(items)
 
-    # Update progress
+    # Progress 2
     try:
         await client.edit_message_text(
             chat_id=chat_id, message_id=progress_id,
@@ -781,17 +852,16 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
                 f"🔍 <b>{fb('SCANNING')}</b>",
                 DIV, "",
                 f"📅 {sc('period')} · <code>{_esc(period_short)}</code>",
-                f"🎬 {sc('type')} · <code>{kind}</code>",
+                f"🎬 {sc('type')} · <code>{kind.upper()}</code>",
                 f"🌍 {sc('industry')} · <b>{_esc(label)}</b>",
                 "", DIV2, "",
                 f"📥 {sc('fetched')} · <code>{_fmt_int(fetched)}</code>",
                 f"🔎 {sc('comparing with your db')}...",
             ]),
-            parse_mode=ParseMode.HTML,
-        )
+            parse_mode=ParseMode.HTML)
     except Exception: pass
 
-    # Compare with DB
+    # Empty
     if not items:
         try:
             await client.edit_message_text(
@@ -801,14 +871,17 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
                     f"❌ <b>{fb('NO RESULTS')}</b>",
                     DIV, "",
                     f"📅 <code>{_esc(period_short)}</code>",
-                    f"🎬 <code>{kind}</code> · 🌍 <b>{_esc(label)}</b>",
+                    f"🎬 <code>{kind.upper()}</code> · 🌍 <b>{_esc(label)}</b>",
                     "", DIV2, "",
-                    f"⚪ {sc('nothing found on tmdb for this range')}",
-                    f"📌 {sc('try a wider range or different industry')}",
+                    f"📌 {sc('no movies found on tmdb for this range')}",
+                    "", f"💡 <b>{sc('try')}</b>:",
+                    f"• ᴜꜱᴇ <b>FULL MONTH</b> ɪɴꜱᴛᴇᴀᴅ ᴏꜰ ᴀ ᴡᴇᴇᴋ",
+                    f"• ᴛʀʏ ᴀ <b>ʀᴇᴄᴇɴᴛ ʏᴇᴀʀ</b> (2023–2025)",
+                    f"• ᴛʀʏ <b>🌍 ALL</b> ɪɴᴅᴜꜱᴛʀʏ",
+                    f"• ᴛᴍᴅʙ ᴍᴀʏ ɴᴏᴛ ᴄᴏᴠᴇʀ ᴛʜɪꜱ ᴘᴇʀɪᴏᴅ",
                 ]),
                 reply_markup=kb_after_results(kind, code, year, month),
-                parse_mode=ParseMode.HTML,
-            )
+                parse_mode=ParseMode.HTML)
         except Exception: pass
         return
 
@@ -816,32 +889,31 @@ async def _run_scan(client: Client, q: CallbackQuery, kind: str, code: str,
     in_db = len(present)
     missing_count = len(missing)
 
-    # Sort missing by popularity desc
     missing.sort(key=lambda x: x.get("popularity", 0), reverse=True)
 
-    # Delete progress message
+    # Delete progress
     try:
         await client.delete_messages(chat_id, progress_id)
     except Exception: pass
 
-    # Send header + results
+    # Send results
     await _send_results(
-        client, chat_id, kind, label, period_short, fetched,
-        in_db, missing_count, missing,
+        client, chat_id, kind, label, period_short,
+        fetched, in_db, missing_count, missing,
         kind_code=code, year=year, month=month,
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEND RESULTS
+# ═══════════════════════════════════════════════════════════════════════════
 async def _send_results(client: Client, chat_id: int, kind: str, label: str,
                         period: str, fetched: int, in_db: int, missing_count: int,
                         missing: List[Dict[str, Any]],
                         kind_code: str = "hollywood",
                         year: int = 2000, month: int = 1) -> None:
-    """Send results in chunks. Plain text so admin can forward/save."""
-
     type_label = "MOVIES" if kind == "movie" else "SERIES"
 
-    # ─── Header message ───
     header_lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🔍 <b>{fb('MISSING ' + type_label)}</b>",
@@ -854,6 +926,7 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
         f"❌ {sc('missing')} · <code>{_fmt_int(missing_count)}</code>",
     ]
 
+    # No missing → done
     if missing_count == 0:
         header_lines += [
             "", DIV2, "",
@@ -863,15 +936,9 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
         try:
             await client.send_message(
                 chat_id=chat_id, text="\n".join(header_lines),
-                reply_markup=kb_after_results(kind_code, kind_code, year, month)
-                if False else InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔄 RESCAN",
-                                          callback_data=f"miss:mo:{kind}:{kind_code}:{year}:{month}"),
-                    InlineKeyboardButton("❌ CLOSE", callback_data="miss:close"),
-                ]]),
+                reply_markup=kb_after_results(kind_code, kind_code, year, month),
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+                disable_web_page_preview=True)
         except Exception as e:
             logger.warning(f"[MISS] header: {e}")
         return
@@ -880,19 +947,18 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
         "", DIV2, "",
         f"📌 {sc('list below')} · <code>{missing_count}</code> ᴛɪᴛʟᴇꜱ",
         f"📌 {sc('sorted by popularity')}",
-        f"📌 {sc('forward/save each message')}",
+        f"📌 {sc('forward / save each message')}",
     ]
 
     try:
         await client.send_message(
             chat_id=chat_id, text="\n".join(header_lines),
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            disable_web_page_preview=True)
     except Exception as e:
         logger.warning(f"[MISS] header send: {e}")
 
-    # ─── Chunk missing list into parts ───
+    # Chunks
     total_parts = (len(missing) + MOVIES_PER_PART - 1) // MOVIES_PER_PART
 
     for part_idx in range(total_parts):
@@ -914,18 +980,17 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
             yr = m.get("year") or ""
             rating = m.get("rating", 0)
             pop = m.get("popularity", 0)
-            lang = (m.get("lang") or "").upper()
+            lang_code = (m.get("lang") or "").upper()
 
             lines.append(f"<b>{num}.</b> {_esc(title)} ({yr})")
             meta = []
             if rating: meta.append(f"⭐ {rating}")
             if pop:    meta.append(f"🎯 {pop}")
-            if lang:   meta.append(lang)
+            if lang_code: meta.append(lang_code)
             if meta:
                 lines.append(f"   <code>{' · '.join(meta)}</code>")
             lines.append("")
 
-        # Only the last part gets buttons
         if part_idx == total_parts - 1:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -943,15 +1008,15 @@ async def _send_results(client: Client, chat_id: int, kind: str, label: str,
             await client.send_message(
                 chat_id=chat_id, text="\n".join(lines),
                 reply_markup=kb, parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            await asyncio.sleep(0.4)   # flood-safe
+                disable_web_page_preview=True)
+            await asyncio.sleep(0.4)
         except FloodWait as e:
             await asyncio.sleep(e.value + 2)
         except Exception as e:
             logger.warning(f"[MISS] part {part_idx+1}: {e}")
 
-    logger.info(f"[MISS] scan done: {missing_count} missing ({kind} · {label} · {period})")
+    logger.info(f"[MISS] scan done: {missing_count} missing "
+                f"({kind} · {label} · {period})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -962,13 +1027,16 @@ async def _cleanup_loop():
         try:
             await asyncio.sleep(600)
             _cleanup_sessions()
-        except asyncio.CancelledError: break
-        except Exception: pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
 
 try:
     asyncio.get_event_loop().create_task(_cleanup_loop())
-except Exception: pass
+except Exception:
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -987,6 +1055,8 @@ logger.info("║  Flow:                                                         
 logger.info("║    Type → Industry → Year → Month → Week → Results             ║")
 logger.info("║                                                                ║")
 logger.info("║  No storage · No cache · Plain text output                     ║")
+logger.info("║  Regional languages (Malayalam, Tamil, etc.) use relaxed       ║")
+logger.info("║  filters so you actually get results.                          ║")
 logger.info("║                                                                ║")
 logger.info("║  Env:                                                          ║")
 logger.info("║    TMDB_API_KEY=xxx                                            ║")
