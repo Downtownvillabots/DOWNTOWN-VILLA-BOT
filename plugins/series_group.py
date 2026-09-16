@@ -1,6 +1,6 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (v6 — dedupe + no conflict)
+🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE)
 """
 import asyncio
 import logging
@@ -45,7 +45,7 @@ SERIES_GROUP_ENABLED = os.getenv("SERIES_GROUP_ENABLED", "false").lower() in \
                        ("1", "true", "yes", "on")
 
 SESSION_TTL = 900
-DELIVER_BATCH_DELAY = 0.6
+DELIVER_BATCH_DELAY = 0.5
 
 DIV = "━" * 26
 DIV2 = "─" * 26
@@ -235,50 +235,49 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #2 — DEDUPE ONE FILE PER (SEASON, EPISODE, QUALITY)
+# DEDUPE — one file per (season, episode, quality). Prefer LARGEST.
 # ═══════════════════════════════════════════════════════════════════════════
 def _dedupe_by_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep ONE file per (season, episode, quality) — prefer the largest file.
-    So if you have 200MB + 300MB + 5GB of S02E01 720P, only the 5GB one wins.
-    """
-    buckets: Dict[Tuple, Dict[str, Any]] = {}
-    for f in files:
-        key = (
-            f.get("season"),
-            f.get("episode"),
-            (f.get("quality") or "UNKNOWN").upper(),
-        )
-        existing = buckets.get(key)
-        if existing is None:
-            buckets[key] = f
-        else:
-            # Prefer the larger file (usually better bitrate/quality)
-            if (f.get("file_size") or 0) > (existing.get("file_size") or 0):
-                buckets[key] = f
-    out = list(buckets.values())
+    if not files:
+        return []
+
+    # 1. Sort all files by size descending (largest first)
+    sorted_files = sorted(
+        files,
+        key=lambda x: (x.get("file_size") or 0),
+        reverse=True,
+    )
+
+    # 2. Take the FIRST file for each unique key
+    seen: Set[Tuple] = set()
+    out: List[Dict[str, Any]] = []
+    for f in sorted_files:
+        s = f.get("season")
+        e = f.get("episode")
+        q = (f.get("quality") or "UNKNOWN").upper().strip()
+        key = (s, e, q)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+
+    # 3. Sort by (season, episode) for display
     out.sort(key=lambda x: (x.get("season") or 0, x.get("episode") or 0))
     return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ENGINE SEARCH — NO YEAR, LENIENT FILTERS, DEDUPED
+# ENGINE SEARCH — NO YEAR, LENIENT, DEDUPED
 # ═══════════════════════════════════════════════════════════════════════════
 async def _engine_search(title: str,
                          season: Optional[int] = None,
                          language: Optional[str] = None,
                          quality: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Search via media_search.engine.
-    NO YEAR passed to engine.
-    Lenient filters — empty language/quality = keep file.
-    ⭐ Dedupes: only ONE file per (season, episode, quality).
-    """
     try:
         from media_search.engine import engine
         from media_search.normalizer import normalize
     except Exception as e:
-        logger.warning(f"[SG] engine import failed: {e}")
+        logger.exception(f"[SG] engine import failed: {e}")
         return []
 
     all_files: List[Dict[str, Any]] = []
@@ -287,12 +286,11 @@ async def _engine_search(title: str,
         norm = normalize(title)
         logger.info(f"[SG] engine.search_series({norm!r}) — NO YEAR")
 
-        # ⭐ NO YEAR PASSED
         result = await engine.search_series(norm)
         hits = result.hits
 
         if not hits:
-            logger.info(f"[SG] engine.search_any({norm!r}) — NO YEAR")
+            logger.info(f"[SG] engine.search_any({norm!r})")
             result = await engine.search_any(norm)
             hits = result.hits
 
@@ -305,7 +303,6 @@ async def _engine_search(title: str,
             h_langs = list(getattr(h, "audio_languages", []) or [])
             file_name = getattr(h, "file_name", "") or ""
 
-            # Fallback: parse from filename
             if h_season is None or h_episode is None or not h_quality or not h_langs:
                 p = _parse_filename_light(file_name)
                 if h_season is None: h_season = p.get("season")
@@ -313,16 +310,14 @@ async def _engine_search(title: str,
                 if not h_quality: h_quality = p.get("quality")
                 if not h_langs: h_langs = p.get("languages") or []
 
-            # ── FILTERS (LENIENT) ──
             if season is not None and h_season != season:
                 continue
 
             if language:
                 lang_lower = language.lower()
                 h_lower = [l.lower() for l in h_langs]
-                if h_lower and not any(
-                        lang_lower in l or l in lang_lower
-                        for l in h_lower):
+                if h_lower and not any(lang_lower in l or l in lang_lower
+                                        for l in h_lower):
                     continue
 
             if quality and h_quality:
@@ -346,10 +341,9 @@ async def _engine_search(title: str,
                               getattr(h, "msg_id", None),
             })
 
-        # ⭐ FIX #2 — dedupe before returning
         before = len(all_files)
         all_files = _dedupe_by_episode(all_files)
-        logger.info(f"[SG] after filters: {before} → dedupe: {len(all_files)}")
+        logger.info(f"[SG] filter: {before} files → deduped: {len(all_files)}")
 
     except Exception as e:
         logger.exception(f"[SG] engine search failed: {e}")
@@ -370,13 +364,11 @@ _SEASON_ONLY = [
     re.compile(r"\b[sS](\d{1,2})\b(?![\s._-]?[eE])"),
     re.compile(r"[sS]eason[\s._-]?(\d{1,2})\b(?![\s._-]?[eE])"),
 ]
-
 _QUALITY_MARKERS = [
     ("4320p", "4320P"), ("2160p", "2160P"), ("4k", "4K"), ("uhd", "UHD"),
     ("1440p", "1440P"), ("1080p", "1080P"), ("fullhd", "1080P"), ("fhd", "1080P"),
     ("720p", "720P"), ("576p", "576P"), ("480p", "480P"), ("360p", "360P"),
 ]
-
 _LANG_ALIASES = {
     "English": ["english", "eng"], "Hindi": ["hindi", "hin"],
     "Tamil": ["tamil", "tam"], "Telugu": ["telugu", "tel"],
@@ -393,7 +385,6 @@ _LANG_ALIASES = {
 def _parse_filename_light(filename: str) -> Dict[str, Any]:
     out = {"season": None, "episode": None, "quality": None, "languages": []}
     if not filename: return out
-
     name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     name = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts)$", "",
                   name, flags=re.I)
@@ -669,12 +660,12 @@ async def _safe_edit(target, text: str, kb=None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #1 — GROUP SEARCH WITH stop_propagation
+# GROUP SEARCH — group=-9999 so we run FIRST
 # ═══════════════════════════════════════════════════════════════════════════
 if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
     @Client.on_message(
         filters.chat(SERIES_GROUP_ID) & filters.text & ~filters.regex(r"^/"),
-        group=-420,
+        group=-9999,
     )
     async def series_group_search(client: Client, message: Message):
         try:
@@ -683,12 +674,10 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if not message.from_user: return
             if "http" in txt.lower(): return
 
-            # ⭐ FIX #1 — Stop other plugins (auto_filter, group_search)
-            # from also responding to this same message.
+            # ⭐ Stop other plugins from also handling this message
             try:
                 message.stop_propagation()
-            except Exception:
-                pass
+            except Exception: pass
 
             logger.info(f"[SG] search: {txt!r}")
 
@@ -735,7 +724,7 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
 # ═══════════════════════════════════════════════════════════════════════════
 # PICK SUGGESTION
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^sg:pick:(\d+)$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:pick:(\d+)$"), group=-9999)
 async def cb_pick(client: Client, q: CallbackQuery):
     try:
         idx = int(q.matches[0].group(1))
@@ -761,12 +750,10 @@ async def cb_pick(client: Client, q: CallbackQuery):
         tmdb_langs = _tmdb_languages(details)
         tmdb_seasons = _tmdb_seasons(details)
 
-        # ⭐ NO YEAR
         local_files = await _engine_search(title)
         summary = _summarize(local_files)
 
-        logger.info(f"[SG] pick: {title!r} · local_files={len(local_files)} · "
-                    f"langs={summary['languages']}")
+        logger.info(f"[SG] pick: {title!r} · local_files={len(local_files)}")
 
         s["data"]["chosen"] = {
             "tmdb_id": tmdb_id, "title": title, "year": year,
@@ -818,7 +805,7 @@ async def _show_languages(client: Client, q: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════
 # PICK LANGUAGE
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^sg:lang:(\d+)$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:lang:(\d+)$"), group=-9999)
 async def cb_lang(client: Client, q: CallbackQuery):
     try:
         idx = int(q.matches[0].group(1))
@@ -834,7 +821,6 @@ async def cb_lang(client: Client, q: CallbackQuery):
         c["selected_language"] = lang
         await q.answer(f"🌍 {lang}")
 
-        # ⭐ NO YEAR
         files = await _engine_search(c.get("title") or "", language=lang)
         c["files_by_lang"] = files
 
@@ -857,7 +843,7 @@ async def cb_lang(client: Client, q: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════
 # PICK SEASON
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^sg:seas:(\d+)$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:seas:(\d+)$"), group=-9999)
 async def cb_seas(client: Client, q: CallbackQuery):
     try:
         idx = int(q.matches[0].group(1))
@@ -897,7 +883,6 @@ async def cb_seas(client: Client, q: CallbackQuery):
         c["available_qualities"] = final_quals
 
         if not final_quals:
-            # Show all qualities found in this season regardless
             fallback = sorted({f["quality"] for f in files
                                if f.get("quality")}, reverse=True)
             if fallback:
@@ -918,7 +903,7 @@ async def cb_seas(client: Client, q: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════
 # PICK QUALITY → DELIVER
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client: Client, q: CallbackQuery):
     try:
         idx = int(q.matches[0].group(1))
@@ -932,23 +917,27 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
         quality = quals[idx]
         c["selected_quality"] = quality
-        await q.answer(f"🎯 {quality}")
+        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {quality} ᴛᴏ ʏᴏᴜʀ ᴘᴍ...")
 
-        # Filter files for this quality (lenient if UNKNOWN)
+        # Filter for this quality
         files = [f for f in (c.get("files_by_season") or [])
                  if (f.get("quality") or "").upper() == quality.upper()
                  or (f.get("quality") == "UNKNOWN")]
 
-        # ⭐ FIX #2 safety — dedupe again right before sending
+        # ⭐ Dedupe again — 1 file per (season, episode, quality)
         files = _dedupe_by_episode(files)
         files.sort(key=lambda x: (x.get("episode") or 0))
 
-        if not files:
-            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
+        logger.info(f"[SG] qual {quality}: delivering {len(files)} files "
+                    f"to user {q.from_user.id}")
 
+        if not files:
+            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ", show_alert=True)
+
+        # Show "sending" in the group
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"📤 <b>{fb('SENDING EPISODES')}</b>",
+            f"📤 <b>{fb('SENDING TO YOUR PM')}</b>",
             DIV, "",
             f"🎬 <b>{_esc(c.get('title'))}</b>",
             f"📺 <b>Season {c.get('selected_season'):02d}</b>",
@@ -956,11 +945,12 @@ async def cb_qual(client: Client, q: CallbackQuery):
             "",
             f"📁 <code>{len(files)}</code> ᴇᴘɪꜱᴏᴅᴇꜱ",
             "",
-            f"📩 ꜱᴇɴᴅɪɴɢ ᴛᴏ ʏᴏᴜʀ ᴘᴍ...",
+            f"📌 {sc('check your bot pm')}",
         ])
         await _safe_edit(q, text, InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")]]))
 
+        # Deliver in background
         asyncio.create_task(_deliver_episodes(client, q.from_user.id, c, files))
     except Exception as e:
         logger.exception(f"[SG] qual: {e}")
@@ -969,19 +959,39 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELIVER
+# DELIVER — build proper FileHit for reliability
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client: Client, user_id: int,
                              chosen: Dict[str, Any],
                              files: List[Dict[str, Any]]):
     try:
+        logger.info(f"[SG-DELIVER] start: user={user_id} files={len(files)}")
+
+        # Load delivery helper
         delivery = None
         try:
             from media_search.delivery import delivery as _d
             delivery = _d
         except Exception as e:
-            logger.debug(f"[SG] delivery: {e}")
+            logger.exception(f"[SG-DELIVER] delivery import failed: {e}")
 
+        # Load FileHit class for rebuilding
+        FileHit = None
+        try:
+            from media_search.models import FileHit as _FH
+            FileHit = _FH
+        except Exception as e:
+            logger.debug(f"[SG-DELIVER] FileHit import: {e}")
+
+        # Load normalize
+        normalize = None
+        try:
+            from media_search.normalizer import normalize as _n
+            normalize = _n
+        except Exception:
+            pass
+
+        # Send intro to PM
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -997,9 +1007,13 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"📁 Sending <code>{len(files)}</code> episodes...",
                 ]),
                 parse_mode=ParseMode.HTML)
+            logger.info(f"[SG-DELIVER] intro sent")
         except UserIsBlocked:
+            logger.warning(f"[SG-DELIVER] user blocked bot")
             return
-        except Exception: pass
+        except Exception as e:
+            logger.exception(f"[SG-DELIVER] intro failed: {e}")
+            return
 
         template = await _get_caption()
         extra_buttons = await _get_buttons()
@@ -1027,19 +1041,57 @@ async def _deliver_episodes(client: Client, user_id: int,
 
                 file_hit = f.get("file_hit")
 
-                # Primary: media_search.delivery
+                # ── METHOD 1: delivery.send_file with original FileHit ──
                 if delivery is not None and file_hit is not None:
                     try:
                         ok_d, err = await delivery.send_file(
                             client, user_id, file_hit)
                         if ok_d:
                             sent += 1
+                            logger.info(f"[SG-DELIVER] OK (method1) ep={ep}")
                             await asyncio.sleep(DELIVER_BATCH_DELAY)
                             continue
+                        else:
+                            logger.warning(f"[SG-DELIVER] method1 failed: {err}")
                     except Exception as e:
-                        logger.debug(f"[SG] delivery: {e}")
+                        logger.exception(f"[SG-DELIVER] method1 exc: {e}")
 
-                # Fallback: copy_message
+                # ── METHOD 2: rebuild FileHit and use delivery ──
+                if delivery is not None and FileHit is not None:
+                    try:
+                        hit = FileHit(
+                            file_id=f.get("file_id", "") or "",
+                            file_unique_id=f.get("file_unique_id"),
+                            file_name=f.get("file_name"),
+                            file_size=f.get("file_size"),
+                            title=f.get("title", "") or "",
+                            normalized_title=(normalize(f.get("title") or "")
+                                              if normalize else
+                                              (f.get("title") or "").lower()),
+                            year=None,
+                            type="series",
+                            quality=f.get("quality"),
+                            codec=None,
+                            audio_languages=list(f.get("languages") or []),
+                            subtitle_languages=[],
+                            has_subtitle=False,
+                            series_title=f.get("series_title") or "",
+                            season=f.get("season"),
+                            episode=f.get("episode"),
+                            caption=None,
+                        )
+                        ok_d, err = await delivery.send_file(client, user_id, hit)
+                        if ok_d:
+                            sent += 1
+                            logger.info(f"[SG-DELIVER] OK (method2) ep={ep}")
+                            await asyncio.sleep(DELIVER_BATCH_DELAY)
+                            continue
+                        else:
+                            logger.warning(f"[SG-DELIVER] method2: {err}")
+                    except Exception as e:
+                        logger.debug(f"[SG-DELIVER] method2 exc: {e}")
+
+                # ── METHOD 3: copy_message by chat+msg ──
                 src_chat = f.get("chat_id")
                 src_msg = f.get("message_id")
                 if src_chat and src_msg:
@@ -1052,6 +1104,7 @@ async def _deliver_episodes(client: Client, user_id: int,
                             reply_markup=extra_kb,
                             parse_mode=ParseMode.HTML)
                         sent += 1
+                        logger.info(f"[SG-DELIVER] OK (method3 copy) ep={ep}")
                         await asyncio.sleep(DELIVER_BATCH_DELAY)
                         continue
                     except FloodWait as e:
@@ -1069,9 +1122,9 @@ async def _deliver_episodes(client: Client, user_id: int,
                             continue
                         except Exception: failed += 1
                     except Exception as e:
-                        logger.debug(f"[SG] copy: {e}")
+                        logger.debug(f"[SG-DELIVER] method3 exc: {e}")
 
-                # Fallback: file_id
+                # ── METHOD 4: send_cached_media by file_id ──
                 fid = f.get("file_id")
                 if fid:
                     try:
@@ -1080,17 +1133,20 @@ async def _deliver_episodes(client: Client, user_id: int,
                             caption=caption, reply_markup=extra_kb,
                             parse_mode=ParseMode.HTML)
                         sent += 1
+                        logger.info(f"[SG-DELIVER] OK (method4 cached) ep={ep}")
                         await asyncio.sleep(DELIVER_BATCH_DELAY)
                         continue
                     except Exception as e:
-                        logger.debug(f"[SG] cached: {e}")
+                        logger.debug(f"[SG-DELIVER] method4 exc: {e}")
 
                 failed += 1
+                logger.warning(f"[SG-DELIVER] FAIL ep={ep} - all methods failed")
+
             except Exception as e:
-                logger.debug(f"[SG] deliver one: {e}")
+                logger.exception(f"[SG-DELIVER] one file exc: {e}")
                 failed += 1
 
-        # ⭐ FIX #3 — Prettier final message with quality + language
+        # Final summary
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1109,11 +1165,12 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"🕒 <code>{_now_ist()}</code>",
                 ]),
                 parse_mode=ParseMode.HTML)
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"[SG-DELIVER] final: {e}")
 
-        logger.info(f"[SG] delivered {sent}/{len(files)} to {user_id}")
+        logger.info(f"[SG-DELIVER] done: {sent}/{len(files)} to {user_id}")
     except Exception as e:
-        logger.exception(f"[SG] deliver: {e}")
+        logger.exception(f"[SG-DELIVER] crashed: {e}")
 
 
 def _build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMarkup]:
@@ -1130,7 +1187,7 @@ def _build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMar
 # ═══════════════════════════════════════════════════════════════════════════
 # BACK / CLOSE
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^sg:back_sugg$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:back_sugg$"), group=-9999)
 async def cb_back_sugg(client: Client, q: CallbackQuery):
     s = _get_session(q.from_user.id)
     if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
@@ -1140,13 +1197,13 @@ async def cb_back_sugg(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:back_lang$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:back_lang$"), group=-9999)
 async def cb_back_lang(client: Client, q: CallbackQuery):
     await _show_languages(client, q)
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:back_seas$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:back_seas$"), group=-9999)
 async def cb_back_seas(client: Client, q: CallbackQuery):
     s = _get_session(q.from_user.id)
     if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
@@ -1158,7 +1215,7 @@ async def cb_back_seas(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:close$"), group=-420)
+@Client.on_callback_query(filters.regex(r"^sg:close$"), group=-9999)
 async def cb_close(client: Client, q: CallbackQuery):
     _clear_session(q.from_user.id)
     try: await q.message.delete()
@@ -1171,7 +1228,7 @@ async def cb_close(client: Client, q: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(
     filters.command(["sgroup", "series_group"]) & filters.private,
-    group=-419)
+    group=-9998)
 async def cmd_sgroup(client: Client, message: Message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
@@ -1218,14 +1275,14 @@ async def _view_admin_main():
     return text, kb
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_main$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_main$"), group=-9998)
 async def cb_a_main(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     text, kb = await _view_admin_main()
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_close$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_close$"), group=-9998)
 async def cb_a_close(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     _clear_session(q.from_user.id)
@@ -1234,7 +1291,7 @@ async def cb_a_close(client: Client, q: CallbackQuery):
     await q.answer("ᴄʟᴏꜱᴇᴅ")
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_caption$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_caption$"), group=-9998)
 async def cb_a_caption(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     current = await _get_caption()
@@ -1259,7 +1316,7 @@ async def cb_a_caption(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_cap_edit$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_cap_edit$"), group=-9998)
 async def cb_a_cap_edit(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     _new_session(q.from_user.id, edit_caption=True)
@@ -1274,7 +1331,7 @@ async def cb_a_cap_edit(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_cap_reset$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_cap_reset$"), group=-9998)
 async def cb_a_cap_reset(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     await _set_caption(DEFAULT_EPISODE_CAPTION)
@@ -1282,7 +1339,7 @@ async def cb_a_cap_reset(client: Client, q: CallbackQuery):
     await cb_a_caption(client, q)
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_cap_prev$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_cap_prev$"), group=-9998)
 async def cb_a_cap_prev(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     template = await _get_caption()
@@ -1299,7 +1356,7 @@ async def cb_a_cap_prev(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_buttons$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_buttons$"), group=-9998)
 async def cb_a_buttons(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     buttons = await _get_buttons()
@@ -1323,7 +1380,7 @@ async def cb_a_buttons(client: Client, q: CallbackQuery):
     await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_btn_add$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_btn_add$"), group=-9998)
 async def cb_a_btn_add(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     _new_session(q.from_user.id, add_button=True)
@@ -1338,7 +1395,7 @@ async def cb_a_btn_add(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_btn_rm:(\d+)$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_btn_rm:(\d+)$"), group=-9998)
 async def cb_a_btn_rm(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     idx = int(q.matches[0].group(1))
@@ -1350,7 +1407,7 @@ async def cb_a_btn_rm(client: Client, q: CallbackQuery):
     await cb_a_buttons(client, q)
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_prefs$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_prefs$"), group=-9998)
 async def cb_a_prefs(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     prefs = await _list_series_prefs()
@@ -1372,7 +1429,7 @@ async def cb_a_prefs(client: Client, q: CallbackQuery):
     await _safe_edit(q, "\n".join(lines), kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_pref_add$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_pref_add$"), group=-9998)
 async def cb_a_pref_add(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     _new_session(q.from_user.id, pref_add_name=True)
@@ -1388,7 +1445,7 @@ async def cb_a_pref_add(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_stats$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_stats$"), group=-9998)
 async def cb_a_stats(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     prefs = await _list_series_prefs()
@@ -1410,7 +1467,7 @@ async def cb_a_stats(client: Client, q: CallbackQuery):
     await _safe_edit(q, text, kb); await q.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_test$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_test$"), group=-9998)
 async def cb_a_test(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     if not SERIES_GROUP_ID:
@@ -1434,7 +1491,7 @@ async def cb_a_test(client: Client, q: CallbackQuery):
 # ADMIN TEXT INPUT
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(filters.private & filters.text & ~filters.regex(r"^/"),
-                    group=-418)
+                    group=-9997)
 async def sg_admin_input(client: Client, message: Message):
     if not message.from_user: return
     if not _is_admin(message.from_user.id): return
@@ -1486,7 +1543,6 @@ async def sg_admin_input(client: Client, message: Message):
 
     if action == "pref_add_name":
         loading = await message.reply_text("🔍 ꜱᴄᴀɴɴɪɴɢ ᴅʙ...")
-        # ⭐ NO YEAR
         files = await _engine_search(text)
         if not files:
             _clear_session(message.from_user.id)
@@ -1564,7 +1620,7 @@ async def _show_pref_picker(client: Client, chat_id: int, msg_id: int):
         logger.debug(f"[SG] pref picker: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_pref_tog:(\w+)$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_pref_tog:(\w+)$"), group=-9998)
 async def cb_a_pref_tog(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     qual = q.matches[0].group(1)
@@ -1579,7 +1635,7 @@ async def cb_a_pref_tog(client: Client, q: CallbackQuery):
     await _show_pref_picker(client, q.message.chat.id, q.message.id)
 
 
-@Client.on_callback_query(filters.regex(r"^sg:a_pref_save$"), group=-419)
+@Client.on_callback_query(filters.regex(r"^sg:a_pref_save$"), group=-9998)
 async def cb_a_pref_save(client: Client, q: CallbackQuery):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     s = _get_session(q.from_user.id)
@@ -1611,8 +1667,13 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP v6 — DEDUPE + NO CONFLICT — LOADED ✅         ║")
+logger.info("║  🎬 SERIES GROUP ULTIMATE — LOADED ✅                          ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
-logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO — set SERIES_GROUP_ENABLED=true':<50}║")
+logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO':<50}║")
+logger.info("║                                                                ║")
+logger.info("║  ⚠️  IF YOU SEE 2 REPLIES IN THE GROUP:                        ║")
+logger.info("║      Another plugin (group_search) is also responding.         ║")
+logger.info("║      Solution: Use a DIFFERENT group ID for this plugin,       ║")
+logger.info("║      or delete plugins/group_search.py                         ║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
