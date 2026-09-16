@@ -2,7 +2,7 @@
 # 🏨 DOWNTOWN VILLA — ULTIMATE GROUP SEARCH SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# VERSION: 3.0 (Complete)
+# VERSION: 3.1 (Series-group skip patch)
 #
 # This file is COMPLETELY STANDALONE. No media_search imports.
 #
@@ -22,12 +22,14 @@
 #                     /clear_buttons, /set_delete_time, /debug_buttons
 #   ✔ All handlers at group=-999 (highest priority)
 #   ✔ Complete error handling + logging
+#   ✔ SKIP series group (handled by series_group.py)
 #
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ─── STANDARD LIBRARY ───────────────────────────────────────────────────────
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
@@ -95,6 +97,13 @@ try:
 except Exception:
     AUTH_CHANNELS = []
 
+# ⭐ Skip this group — handled by series_group.py
+SERIES_GROUP_ID_SKIP = os.getenv("SERIES_GROUP_ID", "0").strip()
+try:
+    SERIES_GROUP_ID_SKIP = int(SERIES_GROUP_ID_SKIP) or None
+except (TypeError, ValueError):
+    SERIES_GROUP_ID_SKIP = None
+
 # Optional IMDb
 try:
     from imdbkit import IMDBKit
@@ -108,12 +117,13 @@ except Exception as _imdb_err:
 logger = logging.getLogger(__name__)
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  [GROUP-SEARCH] ULTIMATE v3.0 — LOADING...                    ║")
+logger.info("║  [GROUP-SEARCH] ULTIMATE v3.1 — LOADING...                    ║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
 logger.info(f"[GROUP-SEARCH] IMDb available: {_HAS_IMDB}")
 logger.info(f"[GROUP-SEARCH] Request channel: {REQST_CHANNEL}")
 logger.info(f"[GROUP-SEARCH] Admins loaded: {len(ADMINS)}")
 logger.info(f"[GROUP-SEARCH] Force-sub channels: {len(AUTH_CHANNELS)}")
+logger.info(f"[GROUP-SEARCH] Skipping series group: {SERIES_GROUP_ID_SKIP}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -148,11 +158,6 @@ DEFAULT_SETTINGS = {
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 2 — SESSION STORE (in-memory)
 # ═══════════════════════════════════════════════════════════════════════════
-# Two separate stores:
-#   _SEARCH_SESSIONS: file lists from successful searches
-#   _SUGGEST_SESSIONS: IMDb suggestions from failed searches
-# Both use token-based IDs and TTL.
-# ═══════════════════════════════════════════════════════════════════════════
 
 _SEARCH_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _SUGGEST_SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -168,7 +173,7 @@ def _new_search_session(
     """Create a search session and return its token."""
     sid = secrets.token_hex(8)
     _SEARCH_SESSIONS[sid] = {
-        "hits": hits[:60],   # cap at 60 to bound memory
+        "hits": hits[:60],
         "user_id": int(user_id or 0),
         "chat_id": int(chat_id or 0),
         "custom_buttons": list(custom_buttons or []),
@@ -320,14 +325,12 @@ async def _load_group_settings(chat_id: int) -> Dict[str, Any]:
 
     merged = dict(DEFAULT_SETTINGS)
 
-    # Old-style: inside settings sub-doc
     sub = doc.get("settings") or {}
     if isinstance(sub, dict):
         for k, v in sub.items():
             if v is not None:
                 merged[k] = v
 
-    # New-style: top-level fields
     for k in DEFAULT_SETTINGS.keys():
         if k in doc and doc[k] is not None:
             merged[k] = doc[k]
@@ -469,7 +472,6 @@ def _normalize(text: str) -> str:
     t = re.sub(r"[.\-_/,;:\\]+", " ", t)
     t = re.sub(r"\s+", " ", t)
 
-    # K G F → KGF
     tokens = t.split()
     out, buf = [], []
     for tok in tokens:
@@ -576,7 +578,6 @@ async def _search_all_shards(
     for chunk in results:
         all_docs.extend(chunk)
 
-    # Dedupe by file_unique_id / file_id / _id
     seen = set()
     uniq = []
     for d in all_docs:
@@ -586,7 +587,6 @@ async def _search_all_shards(
         seen.add(key)
         uniq.append(d)
 
-    # Sort by file_size ascending (small → big)
     uniq.sort(key=lambda x: (x.get("file_size") is None, x.get("file_size") or 0))
     logger.info(f"[SEARCH] {len(uniq)} unique files for {norm!r} year={year}")
     return uniq
@@ -698,14 +698,7 @@ def _escape_html(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9 — CUSTOM BUTTON BUILDER (the critical fix)
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# This is the function that decides whether a custom button appears on
-# the delivered file. It is ULTRA-PERMISSIVE and FULLY LOGGED.
-#
-# Reads any dict that has a name-like key and a url-like key.
-# Never silently rejects unless absolutely necessary.
+# SECTION 9 — CUSTOM BUTTON BUILDER
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButton]]:
@@ -722,7 +715,6 @@ def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButto
         logger.info("[CUSTOM-BTNS] not a list — returning []")
         return []
 
-    # Sort by position
     try:
         raw_buttons = sorted(raw_buttons, key=lambda b: b.get("position", 999))
     except Exception:
@@ -741,7 +733,6 @@ def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButto
             logger.info(f"[CUSTOM-BTNS] #{i} REJECT: enabled=False")
             continue
 
-        # Try every possible name key
         name = ""
         for key in ("name", "text", "title", "label", "button_text", "button_name"):
             if b.get(key):
@@ -751,7 +742,6 @@ def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButto
                     logger.info(f"[CUSTOM-BTNS] #{i} name found in '{key}': {name!r}")
                     break
 
-        # Try every possible URL key
         url = ""
         for key in ("url", "link", "href", "button_url", "button_link"):
             if b.get(key):
@@ -769,7 +759,6 @@ def _build_custom_button_rows(raw_buttons: Any) -> List[List[InlineKeyboardButto
             logger.info(f"[CUSTOM-BTNS] #{i} REJECT: no url. Keys: {list(b.keys())}")
             continue
 
-        # Normalize URL
         original_url = url
         if url.startswith("@"):
             url = f"https://t.me/{url[1:]}"
@@ -922,6 +911,12 @@ async def group_search_handler(client: Client, message: Message):
     """
     try:
         chat_id = message.chat.id
+
+        # ⭐ Skip the series group — series_group.py handles it
+        if SERIES_GROUP_ID_SKIP and chat_id == SERIES_GROUP_ID_SKIP:
+            logger.debug(f"[GROUP-SEARCH] skipping series group {chat_id}")
+            return
+
         user_id = message.from_user.id if message.from_user else 0
         user_mention = (
             message.from_user.mention
@@ -943,14 +938,12 @@ async def group_search_handler(client: Client, message: Message):
             logger.info("[GROUP-SEARCH] auto_ffilter OFF — skip")
             return
 
-        # Show searching status
         try:
             status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
         except Exception as e:
             logger.warning(f"[GROUP-SEARCH] reply failed: {e}")
             return
 
-        # Parse query
         norm, year, is_series = _parse_query(raw)
         if not norm:
             try:
@@ -959,15 +952,12 @@ async def group_search_handler(client: Client, message: Message):
                 pass
             return
 
-        # Search
         docs = await _search_all_shards(norm, year, is_series)
 
-        # Retry without year
         if not docs and year:
             logger.info("[GROUP-SEARCH] retry without year")
             docs = await _search_all_shards(norm, None, is_series)
 
-        # No results
         if not docs:
             logger.info("[GROUP-SEARCH] no files — fetching IMDb suggestions")
             await _handle_no_results(
@@ -976,7 +966,6 @@ async def group_search_handler(client: Client, message: Message):
             )
             return
 
-        # Results found
         raw_buttons = settings.get("result_buttons") or []
         sid = _new_search_session(
             hits=docs,
@@ -1146,7 +1135,6 @@ async def gsug_callback(client: Client, q: CallbackQuery):
     if not session:
         return await q.answer("⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
 
-    # Manual request button
     if idx == "request":
         await q.answer("📝 ꜱᴇɴᴅɪɴɢ ʀᴇǫᴜᴇꜱᴛ...")
         user_mention = (
@@ -1169,7 +1157,6 @@ async def gsug_callback(client: Client, q: CallbackQuery):
             pass
         return
 
-    # Suggestion click
     try:
         i = int(idx)
     except ValueError:
@@ -1193,7 +1180,6 @@ async def gsug_callback(client: Client, q: CallbackQuery):
         docs = await _search_all_shards(norm, None, False)
 
     if not docs:
-        # Still no files → request channel
         user_mention = (
             q.from_user.mention if hasattr(q.from_user, "mention") else "user"
         )
@@ -1222,7 +1208,6 @@ async def gsug_callback(client: Client, q: CallbackQuery):
             logger.warning(f"[SUGGEST] edit failed: {e}")
         return
 
-    # Found files
     raw_buttons = session.get("custom_buttons") or []
     sid = _new_search_session(
         hits=docs,
@@ -1272,7 +1257,6 @@ async def gfile_callback(client: Client, q: CallbackQuery):
         is_group = False
 
     if is_group:
-        # Redirect to PM
         try:
             me = await client.get_me()
             deep_link = f"https://t.me/{me.username}?start=file_{sid}_{i}"
@@ -1290,7 +1274,6 @@ async def gfile_callback(client: Client, q: CallbackQuery):
                 pass
         return
 
-    # PM delivery
     try:
         await _deliver_file(client, q.from_user.id, session, i)
         await q.answer("✅ ꜱᴇɴᴛ")
@@ -1379,7 +1362,6 @@ async def _deliver_file(
         logger.warning("[DELIVERY] no file_id")
         return
 
-    # Extract metadata
     title = doc.get("title") or doc.get("series_title") or "file"
     file_name = doc.get("file_name") or title
     quality = (doc.get("quality") or "").upper()
@@ -1389,7 +1371,6 @@ async def _deliver_file(
     size = _human_size(doc.get("file_size"))
     year = doc.get("year")
 
-    # Caption
     lines = [f"🎬 <b>{_escape_html(_clean_filename(file_name, max_len=80))}</b>"]
     if year:
         lines.append(f"📅 {year}")
@@ -1405,7 +1386,6 @@ async def _deliver_file(
     lines.append("⚡ <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>")
     caption = "\n".join(lines)
 
-    # Custom buttons + SHARE + UPDATES
     kb_rows: List[List[InlineKeyboardButton]] = []
     custom_rows = _build_custom_button_rows(session.get("custom_buttons") or [])
     logger.info(f"[DELIVERY] custom rows built: {len(custom_rows)}")
@@ -1430,7 +1410,6 @@ async def _deliver_file(
 
     kb = InlineKeyboardMarkup(kb_rows)
 
-    # Send file
     sent = None
     try:
         sent = await client.send_cached_media(
@@ -1466,7 +1445,6 @@ async def _deliver_file(
             pass
         return
 
-    # Auto-delete
     group_id = session.get("chat_id") or 0
     settings = await _load_group_settings(group_id)
     if not settings.get("auto_delete", True):
@@ -1536,7 +1514,6 @@ async def greq_callback(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
-    # Admin check
     if not _is_bot_owner(q.from_user.id):
         try:
             member = await client.get_chat_member(
@@ -1588,7 +1565,6 @@ async def greq_callback(client: Client, q: CallbackQuery):
         "cancel": "❌ CANCELLED",
     }
 
-    # Notify user
     if user_id:
         try:
             await client.send_message(
@@ -1605,10 +1581,8 @@ async def greq_callback(client: Client, q: CallbackQuery):
         except Exception as e:
             logger.warning(f"[REQ] DM failed: {e}")
 
-    # Update DB
     await _update_request_status(token_id, action)
 
-    # Update channel message
     try:
         original = q.message.text or q.message.caption or ""
         await q.message.edit_text(
@@ -1705,7 +1679,6 @@ async def cmd_add_button(client: Client, message: Message):
             upsert=True,
         )
 
-        # Verify
         verify = await coll.find_one({"chat_id": message.chat.id}) or {}
         logger.info(
             f"[ADD-BUTTON] verified: {verify.get('result_buttons')!r}"
@@ -1964,5 +1937,6 @@ logger.info("║  Admin commands:    /add_button  /list_buttons                 
 logger.info("║                     /remove_button  /clear_buttons             ║")
 logger.info("║                     /set_delete_time  /debug_buttons           ║")
 logger.info("║                                                                ║")
+logger.info(f"║  Series group skip: {SERIES_GROUP_ID_SKIP or 'NOT SET':<40}║")
 logger.info("║  Status: READY                                                 ║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
