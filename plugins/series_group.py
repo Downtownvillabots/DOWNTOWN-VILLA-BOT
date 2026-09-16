@@ -1,6 +1,6 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE)
+🎬 DOWNTOWN VILLA — SERIES GROUP (v7 — PM fix + strong dedupe)
 """
 import asyncio
 import logging
@@ -203,6 +203,24 @@ async def _list_series_prefs() -> List[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ⭐ FIX #1 — TASK REGISTRY (prevents GC from killing delivery)
+# ═══════════════════════════════════════════════════════════════════════════
+_DELIVERY_TASKS: Dict[str, asyncio.Task] = {}
+
+
+def _spawn_task(coro, key: str):
+    """Spawn a background task and keep a strong reference so it doesn't get GC'd."""
+    task = asyncio.create_task(coro)
+    _DELIVERY_TASKS[key] = task
+
+    def _cleanup(t):
+        _DELIVERY_TASKS.pop(key, None)
+
+    task.add_done_callback(_cleanup)
+    return task
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SESSIONS
 # ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
@@ -235,39 +253,58 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DEDUPE — one file per (season, episode, quality). Prefer LARGEST.
+# ⭐ FIX #2 — STRONG DEDUPE (file_id + season/episode/quality)
 # ═══════════════════════════════════════════════════════════════════════════
 def _dedupe_by_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Dedupe: 1) by file_id, 2) by (season, episode, quality) — keep largest."""
     if not files:
         return []
 
-    # 1. Sort all files by size descending (largest first)
-    sorted_files = sorted(
-        files,
-        key=lambda x: (x.get("file_size") or 0),
-        reverse=True,
-    )
+    # Step 1: dedupe by file_id / file_unique_id
+    seen_ids: Set[str] = set()
+    by_id: List[Dict[str, Any]] = []
+    for f in files:
+        fid = f.get("file_id") or f.get("file_unique_id") or ""
+        if fid and fid in seen_ids:
+            continue
+        if fid:
+            seen_ids.add(fid)
+        by_id.append(f)
 
-    # 2. Take the FIRST file for each unique key
-    seen: Set[Tuple] = set()
+    # Step 2: sort by size descending
+    by_id.sort(key=lambda x: (x.get("file_size") or 0), reverse=True)
+
+    # Step 3: keep first for each (season, episode, quality)
+    seen_keys: Set[Tuple] = set()
     out: List[Dict[str, Any]] = []
-    for f in sorted_files:
+    for f in by_id:
         s = f.get("season")
         e = f.get("episode")
+        # If episode missing, try to parse from filename
+        if e is None:
+            p = _parse_filename_light(f.get("file_name") or "")
+            if p.get("episode") is not None:
+                e = p.get("episode")
+                f["episode"] = e
+            if p.get("season") is not None and s is None:
+                s = p.get("season")
+                f["season"] = s
         q = (f.get("quality") or "UNKNOWN").upper().strip()
         key = (s, e, q)
-        if key in seen:
+        if key in seen_keys:
             continue
-        seen.add(key)
+        seen_keys.add(key)
         out.append(f)
 
-    # 3. Sort by (season, episode) for display
-    out.sort(key=lambda x: (x.get("season") or 0, x.get("episode") or 0))
+    out.sort(key=lambda x: (
+        x.get("season") or 0,
+        x.get("episode") if x.get("episode") is not None else 9999,
+    ))
     return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ENGINE SEARCH — NO YEAR, LENIENT, DEDUPED
+# ENGINE SEARCH
 # ═══════════════════════════════════════════════════════════════════════════
 async def _engine_search(title: str,
                          season: Optional[int] = None,
@@ -660,7 +697,7 @@ async def _safe_edit(target, text: str, kb=None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GROUP SEARCH — group=-9999 so we run FIRST
+# GROUP SEARCH
 # ═══════════════════════════════════════════════════════════════════════════
 if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
     @Client.on_message(
@@ -674,7 +711,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if not message.from_user: return
             if "http" in txt.lower(): return
 
-            # ⭐ Stop other plugins from also handling this message
             try:
                 message.stop_propagation()
             except Exception: pass
@@ -901,7 +937,7 @@ async def cb_seas(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PICK QUALITY → DELIVER
+# ⭐ FIX #1 — PICK QUALITY → DELIVER (with _spawn_task)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client: Client, q: CallbackQuery):
@@ -917,14 +953,11 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
         quality = quals[idx]
         c["selected_quality"] = quality
-        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {quality} ᴛᴏ ʏᴏᴜʀ ᴘᴍ...")
 
-        # Filter for this quality
         files = [f for f in (c.get("files_by_season") or [])
                  if (f.get("quality") or "").upper() == quality.upper()
                  or (f.get("quality") == "UNKNOWN")]
 
-        # ⭐ Dedupe again — 1 file per (season, episode, quality)
         files = _dedupe_by_episode(files)
         files.sort(key=lambda x: (x.get("episode") or 0))
 
@@ -934,7 +967,8 @@ async def cb_qual(client: Client, q: CallbackQuery):
         if not files:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ", show_alert=True)
 
-        # Show "sending" in the group
+        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {len(files)} ᴇᴘɪꜱᴏᴅᴇꜱ ᴛᴏ ʏᴏᴜʀ ᴘᴍ...")
+
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"📤 <b>{fb('SENDING TO YOUR PM')}</b>",
@@ -950,8 +984,12 @@ async def cb_qual(client: Client, q: CallbackQuery):
         await _safe_edit(q, text, InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")]]))
 
-        # Deliver in background
-        asyncio.create_task(_deliver_episodes(client, q.from_user.id, c, files))
+        # ⭐ FIX #1 — Use _spawn_task so the task survives
+        task_key = f"deliver_{q.from_user.id}_{int(time.time() * 1000)}"
+        _spawn_task(
+            _deliver_episodes(client, q.from_user.id, c, files),
+            task_key,
+        )
     except Exception as e:
         logger.exception(f"[SG] qual: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -959,23 +997,24 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELIVER — build proper FileHit for reliability
+# ⭐ FIX #1 — DELIVER (loud logging + robust)
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client: Client, user_id: int,
                              chosen: Dict[str, Any],
                              files: List[Dict[str, Any]]):
     try:
-        logger.info(f"[SG-DELIVER] start: user={user_id} files={len(files)}")
+        logger.info(f"[SG-DELIVER] START user={user_id} files={len(files)}")
 
         # Load delivery helper
         delivery = None
         try:
             from media_search.delivery import delivery as _d
             delivery = _d
+            logger.info(f"[SG-DELIVER] delivery module loaded")
         except Exception as e:
             logger.exception(f"[SG-DELIVER] delivery import failed: {e}")
 
-        # Load FileHit class for rebuilding
+        # Load FileHit class
         FileHit = None
         try:
             from media_search.models import FileHit as _FH
@@ -991,7 +1030,7 @@ async def _deliver_episodes(client: Client, user_id: int,
         except Exception:
             pass
 
-        # Send intro to PM
+        # Send intro to PM — CRITICAL test of PM access
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1007,12 +1046,12 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"📁 Sending <code>{len(files)}</code> episodes...",
                 ]),
                 parse_mode=ParseMode.HTML)
-            logger.info(f"[SG-DELIVER] intro sent")
+            logger.info(f"[SG-DELIVER] intro sent to {user_id}")
         except UserIsBlocked:
-            logger.warning(f"[SG-DELIVER] user blocked bot")
+            logger.warning(f"[SG-DELIVER] USER {user_id} BLOCKED BOT — cannot send PM")
             return
         except Exception as e:
-            logger.exception(f"[SG-DELIVER] intro failed: {e}")
+            logger.exception(f"[SG-DELIVER] intro FAILED: {e}")
             return
 
         template = await _get_caption()
@@ -1022,7 +1061,7 @@ async def _deliver_episodes(client: Client, user_id: int,
         sent = 0
         failed = 0
 
-        for f in files:
+        for idx, f in enumerate(files):
             try:
                 ep = f.get("episode")
                 size = _fmt_size(f.get("file_size", 0))
@@ -1041,22 +1080,22 @@ async def _deliver_episodes(client: Client, user_id: int,
 
                 file_hit = f.get("file_hit")
 
-                # ── METHOD 1: delivery.send_file with original FileHit ──
+                # METHOD 1: original FileHit via delivery
                 if delivery is not None and file_hit is not None:
                     try:
                         ok_d, err = await delivery.send_file(
                             client, user_id, file_hit)
                         if ok_d:
                             sent += 1
-                            logger.info(f"[SG-DELIVER] OK (method1) ep={ep}")
+                            logger.info(f"[SG-DELIVER] M1 OK ep={ep}")
                             await asyncio.sleep(DELIVER_BATCH_DELAY)
                             continue
                         else:
-                            logger.warning(f"[SG-DELIVER] method1 failed: {err}")
+                            logger.warning(f"[SG-DELIVER] M1 fail ep={ep}: {err}")
                     except Exception as e:
-                        logger.exception(f"[SG-DELIVER] method1 exc: {e}")
+                        logger.exception(f"[SG-DELIVER] M1 exc ep={ep}: {e}")
 
-                # ── METHOD 2: rebuild FileHit and use delivery ──
+                # METHOD 2: rebuild FileHit
                 if delivery is not None and FileHit is not None:
                     try:
                         hit = FileHit(
@@ -1083,15 +1122,13 @@ async def _deliver_episodes(client: Client, user_id: int,
                         ok_d, err = await delivery.send_file(client, user_id, hit)
                         if ok_d:
                             sent += 1
-                            logger.info(f"[SG-DELIVER] OK (method2) ep={ep}")
+                            logger.info(f"[SG-DELIVER] M2 OK ep={ep}")
                             await asyncio.sleep(DELIVER_BATCH_DELAY)
                             continue
-                        else:
-                            logger.warning(f"[SG-DELIVER] method2: {err}")
                     except Exception as e:
-                        logger.debug(f"[SG-DELIVER] method2 exc: {e}")
+                        logger.debug(f"[SG-DELIVER] M2 exc ep={ep}: {e}")
 
-                # ── METHOD 3: copy_message by chat+msg ──
+                # METHOD 3: copy_message
                 src_chat = f.get("chat_id")
                 src_msg = f.get("message_id")
                 if src_chat and src_msg:
@@ -1104,7 +1141,7 @@ async def _deliver_episodes(client: Client, user_id: int,
                             reply_markup=extra_kb,
                             parse_mode=ParseMode.HTML)
                         sent += 1
-                        logger.info(f"[SG-DELIVER] OK (method3 copy) ep={ep}")
+                        logger.info(f"[SG-DELIVER] M3 OK ep={ep}")
                         await asyncio.sleep(DELIVER_BATCH_DELAY)
                         continue
                     except FloodWait as e:
@@ -1122,9 +1159,9 @@ async def _deliver_episodes(client: Client, user_id: int,
                             continue
                         except Exception: failed += 1
                     except Exception as e:
-                        logger.debug(f"[SG-DELIVER] method3 exc: {e}")
+                        logger.debug(f"[SG-DELIVER] M3 exc ep={ep}: {e}")
 
-                # ── METHOD 4: send_cached_media by file_id ──
+                # METHOD 4: send_cached_media
                 fid = f.get("file_id")
                 if fid:
                     try:
@@ -1133,17 +1170,17 @@ async def _deliver_episodes(client: Client, user_id: int,
                             caption=caption, reply_markup=extra_kb,
                             parse_mode=ParseMode.HTML)
                         sent += 1
-                        logger.info(f"[SG-DELIVER] OK (method4 cached) ep={ep}")
+                        logger.info(f"[SG-DELIVER] M4 OK ep={ep}")
                         await asyncio.sleep(DELIVER_BATCH_DELAY)
                         continue
                     except Exception as e:
-                        logger.debug(f"[SG-DELIVER] method4 exc: {e}")
+                        logger.debug(f"[SG-DELIVER] M4 exc ep={ep}: {e}")
 
                 failed += 1
                 logger.warning(f"[SG-DELIVER] FAIL ep={ep} - all methods failed")
 
             except Exception as e:
-                logger.exception(f"[SG-DELIVER] one file exc: {e}")
+                logger.exception(f"[SG-DELIVER] exc one file: {e}")
                 failed += 1
 
         # Final summary
@@ -1166,11 +1203,11 @@ async def _deliver_episodes(client: Client, user_id: int,
                 ]),
                 parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.debug(f"[SG-DELIVER] final: {e}")
+            logger.debug(f"[SG-DELIVER] final msg: {e}")
 
-        logger.info(f"[SG-DELIVER] done: {sent}/{len(files)} to {user_id}")
+        logger.info(f"[SG-DELIVER] DONE: {sent}/{len(files)} to {user_id}")
     except Exception as e:
-        logger.exception(f"[SG-DELIVER] crashed: {e}")
+        logger.exception(f"[SG-DELIVER] CRASHED: {e}")
 
 
 def _build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMarkup]:
@@ -1667,13 +1704,8 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP ULTIMATE — LOADED ✅                          ║")
+logger.info("║  🎬 SERIES GROUP v7 — PM FIX + DEDUPE — LOADED ✅              ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
 logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO':<50}║")
-logger.info("║                                                                ║")
-logger.info("║  ⚠️  IF YOU SEE 2 REPLIES IN THE GROUP:                        ║")
-logger.info("║      Another plugin (group_search) is also responding.         ║")
-logger.info("║      Solution: Use a DIFFERENT group ID for this plugin,       ║")
-logger.info("║      or delete plugins/group_search.py                         ║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
