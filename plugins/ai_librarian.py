@@ -1,5 +1,5 @@
 # plugins/ai_librarian.py
-"""🎛️ AI LIBRARIAN — v2 (sharded + TMDB suggest)"""
+"""🎛️ AI LIBRARIAN v3 — uses media_search engine + shard scan + TMDB suggest"""
 import asyncio
 import logging
 import os
@@ -104,23 +104,18 @@ def _get_db():
     try: return db_manager._db
     except Exception: return None
 
-
 def _get_client():
-    try:
-        return db_manager._client or db_manager.client
-    except Exception:
-        return None
+    try: return db_manager._client or db_manager.client
+    except Exception: return None
 
 
 def _completed_coll():
     d = _get_db()
     return d["ai_completed"] if d is not None else None
 
-
 def _settings_coll():
     d = _get_db()
     return d["ai_settings"] if d is not None else None
-
 
 def _prefs_coll():
     d = _get_db()
@@ -134,7 +129,6 @@ async def _get_setting(key, default=None):
         doc = await c.find_one({"_id": "settings"}) or {}
         return doc.get(key, default)
     except Exception: return default
-
 
 async def _set_setting(key, value):
     c = _settings_coll()
@@ -150,10 +144,8 @@ async def _set_setting(key, value):
 async def _is_completed(slug):
     c = _completed_coll()
     if c is None: return False
-    try:
-        return (await c.find_one({"title_slug": slug})) is not None
+    try: return (await c.find_one({"title_slug": slug})) is not None
     except Exception: return False
-
 
 async def _mark_completed(title, slug, count):
     c = _completed_coll()
@@ -166,22 +158,17 @@ async def _mark_completed(title, slug, count):
         return True
     except Exception: return False
 
-
 async def _unmark_completed(slug):
     c = _completed_coll()
     if c is None: return False
-    try:
-        return (await c.delete_one({"title_slug": slug})).deleted_count > 0
+    try: return (await c.delete_one({"title_slug": slug})).deleted_count > 0
     except Exception: return False
-
 
 async def _list_completed(limit=100):
     c = _completed_coll()
     if c is None: return []
-    try:
-        return await c.find({}).sort("completed_at", -1).limit(limit).to_list(limit)
+    try: return await c.find({}).sort("completed_at", -1).limit(limit).to_list(limit)
     except Exception: return []
-
 
 async def _count_completed():
     c = _completed_coll()
@@ -191,19 +178,17 @@ async def _count_completed():
 
 
 async def _delete_file_record(file_id):
-    """Delete from ALL file collections."""
+    """Delete by file_id or file_unique_id across shards."""
     if not file_id: return False
     colls = await _all_file_collections()
     deleted = False
     for _, coll in colls:
         try:
             r = await coll.delete_one({"file_id": file_id})
-            if r.deleted_count > 0:
-                deleted = True; continue
+            if r.deleted_count > 0: deleted = True; continue
             r = await coll.delete_one({"file_unique_id": file_id})
             if r.deleted_count > 0: deleted = True
-        except Exception:
-            continue
+        except Exception: continue
     return deleted
 
 
@@ -214,7 +199,6 @@ async def _get_prefs(slug):
         doc = await c.find_one({"title_slug": slug})
         return list(doc.get("keep_qualities") or []) if doc else []
     except Exception: return []
-
 
 async def _set_prefs(slug, title, quals):
     c = _prefs_coll()
@@ -228,65 +212,100 @@ async def _set_prefs(slug, title, quals):
         return True
     except Exception: return False
 
-
 async def _list_prefs():
     c = _prefs_coll()
     if c is None: return []
-    try:
-        return await c.find({}).sort("updated_at", -1).to_list(200)
+    try: return await c.find({}).sort("updated_at", -1).to_list(200)
     except Exception: return []
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ALL FILE COLLECTIONS — tries media_files_repo + shards + raw
+# ═══════════════════════════════════════════════════════════════════════════
 async def _all_file_collections():
-    """Return [(name, collection), ...] of ALL file-like collections in ALL DBs."""
     results = []
-    client = _get_client()
+    seen_ids = set()
 
-    if client is None:
-        d = _get_db()
-        if d is not None:
-            for n in ("media_files", "files", "media"):
-                try:
-                    results.append((n, d[n]))
-                except Exception: pass
-        return results
-
-    try:
-        dbs = await client.list_database_names()
-    except Exception:
-        dbs = []
-
-    patterns = ("media", "file", "shard", "index", "content", "db_", "movie", "series")
-
-    for db_name in dbs:
-        if db_name in ("admin", "local", "config"): continue
-        try:
-            db = client[db_name]
-            colls = await db.list_collection_names()
-        except Exception:
-            continue
-        for cname in colls:
-            cl = cname.lower()
-            if any(p in cl for p in patterns):
-                # skip our own collections
-                if cname.startswith("ai_"): continue
-                try:
-                    results.append((f"{db_name}.{cname}", db[cname]))
-                except Exception:
-                    continue
-
-    # dedupe by collection id
-    seen = set()
-    unique = []
-    for n, c in results:
+    def _add(name, c):
         try:
             key = str(id(c))
         except Exception:
-            key = n
-        if key in seen: continue
-        seen.add(key)
-        unique.append((n, c))
-    return unique
+            key = name
+        if key in seen_ids: return
+        if not hasattr(c, "find"): return
+        seen_ids.add(key)
+        results.append((name, c))
+
+    # 1. Try media_files_repo
+    try:
+        from database.media.files import media_files_repo
+        for attr in ("collection", "_coll", "_collection", "coll", "col"):
+            c = getattr(media_files_repo, attr, None)
+            if c is not None and hasattr(c, "find"):
+                _add(f"media_files_repo.{attr}", c)
+                break
+    except Exception as e:
+        logger.debug(f"[AI] media_files_repo: {e}")
+
+    # 2. Try media_router shards
+    try:
+        from database.media.routing import media_router
+        for attr in ("_dbs", "_shards", "shards", "_collections"):
+            val = getattr(media_router, attr, None)
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    if hasattr(v, "find"):
+                        _add(f"router.{k}", v)
+                    elif hasattr(v, "list_collection_names"):
+                        for cn in ("media_files", "files", "media"):
+                            try:
+                                _add(f"router.{k}.{cn}", v[cn])
+                            except Exception: pass
+            elif isinstance(val, (list, tuple)):
+                for i, v in enumerate(val):
+                    if hasattr(v, "find"):
+                        _add(f"router.shard_{i}", v)
+    except Exception as e:
+        logger.debug(f"[AI] media_router: {e}")
+
+    # 3. Raw client scan — ALL databases, file-like collections
+    client = _get_client()
+    if client is not None:
+        try:
+            dbs = await client.list_database_names()
+        except Exception:
+            dbs = []
+        patterns = ("media", "file", "shard", "movie", "series", "content")
+        for db_name in dbs:
+            if db_name in ("admin", "local", "config"): continue
+            try:
+                db = client[db_name]
+                colls = await db.list_collection_names()
+            except Exception: continue
+            for cname in colls:
+                cl = cname.lower()
+                if cname.startswith("ai_"): continue
+                if any(p in cl for p in patterns):
+                    try: _add(f"{db_name}.{cname}", db[cname])
+                    except Exception: pass
+
+    # 4. Fallback: default media DB collections
+    if not results:
+        d = _get_db()
+        if d is not None:
+            try:
+                colls = await d.list_collection_names()
+                for cname in colls:
+                    cl = cname.lower()
+                    if cname.startswith("ai_"): continue
+                    if any(p in cl for p in ("media", "file", "shard",
+                                              "movie", "series")):
+                        try: _add(f"db.{cname}", d[cname])
+                        except Exception: pass
+            except Exception: pass
+
+    logger.info(f"[AI] found {len(results)} file collections")
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -314,7 +333,7 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PARSER
+# PARSER (unchanged, works)
 # ═══════════════════════════════════════════════════════════════════════════
 SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -406,7 +425,6 @@ def _smart_title_case(s):
         out.append(w.lower() if w.lower() in small else w.capitalize())
     return " ".join(out)
 
-
 def _parse_size(name):
     m = SIZE_REGEX.search(name)
     if not m: return 0
@@ -416,7 +434,6 @@ def _parse_size(name):
         if u in ("MB", "MIB"): return int(v * 1024**2)
     except Exception: pass
     return 0
-
 
 def _detect(name, patterns):
     for pat, label in patterns:
@@ -446,7 +463,6 @@ def parse_filename(filename):
             try:
                 season = int(m.group(1)); episode = int(m.group(2)); break
             except Exception: continue
-
     if season is None:
         for pat in SEASON_ONLY:
             m = pat.search(work)
@@ -498,7 +514,6 @@ def parse_filename(filename):
     for noise in NOISE_WORDS:
         tw = re.sub(r"\b" + re.escape(noise) + r"\b", " ", tw, flags=re.I)
 
-    # Strip uploader / release group tags
     tw = re.sub(r"[-_.\s]*@\w+\b", " ", tw)
     tw = re.sub(r"[-_.\s]*\[[^\]]{1,40}\]", " ", tw)
     tw = re.sub(r"[-_.\s]*\([^\)]{1,20}\)\s*$", " ", tw)
@@ -535,7 +550,6 @@ def _score(f):
     aud = (f.get("audio_codec") or "").upper() or None
     langs = f.get("languages") or []
     size = f.get("size") or f.get("size_from_name") or 0
-
     r = QUALITY_RANK.get(res, 25)
     c = CODEC_BONUS.get(codec, 2)
     s = SOURCE_BONUS.get(src, 2)
@@ -608,69 +622,200 @@ class SeriesCatalog:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DOC → CATALOG (handles many field names, including FileHit dict)
+# ═══════════════════════════════════════════════════════════════════════════
+def _extract_filename(doc: Dict[str, Any]) -> str:
+    """Pull filename from any likely field."""
+    for key in ("file_name", "filename", "title", "name", "file_title",
+                "caption", "file_caption", "media_title", "text"):
+        v = doc.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    # Fallback: any string with video ext
+    for k, v in doc.items():
+        if k in ("_id", "chat_id", "message_id", "msg_id",
+                 "file_id", "file_unique_id", "file_size", "size"):
+            continue
+        if isinstance(v, str) and len(v) > 5:
+            if any(x in v.lower() for x in
+                   (".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v")):
+                return v
+    return ""
+
+
+def _process_doc(doc: Dict[str, Any], cat: SeriesCatalog,
+                 filter_slug: Optional[str] = None) -> bool:
+    fname = _extract_filename(doc)
+    if not fname: return False
+    p = parse_filename(str(fname))
+    if filter_slug is not None:
+        sm = p.get("title_slug", "")
+        if filter_slug not in sm and sm not in filter_slug:
+            return False
+    cat.add(p, doc)
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCAN — uses engine for manual, raw collections for auto
+# ═══════════════════════════════════════════════════════════════════════════
+async def _scan_via_engine(query: str) -> Optional[SeriesCatalog]:
+    """Use media_search engine — same as working search."""
+    try:
+        from media_search.engine import engine
+        from media_search.normalizer import normalize, parse_query
+    except Exception as e:
+        logger.warning(f"[AI] engine import: {e}")
+        return None
+
+    norm, year, is_series = parse_query(query)
+    if not norm: return None
+
+    # Search as series first
+    cat = SeriesCatalog()
+    try:
+        result = await engine.search_series(norm, year=year)
+        hits = result.hits
+    except Exception as e:
+        logger.warning(f"[AI] engine.search_series: {e}")
+        hits = []
+
+    # If no series hits, try movie (in case parse_query mislabeled)
+    if not hits:
+        try:
+            result = await engine.search_any(norm, year=year)
+            hits = result.hits
+        except Exception as e:
+            logger.warning(f"[AI] engine.search_any: {e}")
+            hits = []
+
+    logger.info(f"[AI] engine returned {len(hits)} hits for {query!r}")
+
+    for h in hits:
+        # Convert FileHit → dict for parsing
+        doc = {
+            "file_id": getattr(h, "file_id", "") or "",
+            "file_unique_id": getattr(h, "file_unique_id", None),
+            "file_name": getattr(h, "file_name", "") or "",
+            "file_size": getattr(h, "file_size", 0) or 0,
+            "chat_id": None,
+            "message_id": None,
+        }
+        # If FileHit has explicit series/season/episode, use directly
+        s = getattr(h, "season", None)
+        e = getattr(h, "episode", None)
+        if s is not None or e is not None:
+            p = parse_filename(doc["file_name"])
+            if not p.get("is_series"):
+                p["is_series"] = True
+                p["season"] = s
+                p["episode"] = e
+                if not p.get("title"):
+                    p["title"] = getattr(h, "series_title", None) or p["title"]
+                    p["title_slug"] = re.sub(r"[^a-z0-9]+", "_",
+                                              p["title"].lower()).strip("_")
+            cat.add(p, doc)
+        else:
+            _process_doc(doc, cat)
+
+    return cat if cat.data else None
+
+
+async def _scan_library(client, chat_id, status_msg_id, filter_slug=None):
+    """Raw scan of ALL file collections."""
+    colls = await _all_file_collections()
+    if not colls:
+        logger.warning("[AI] no file collections")
+        return SeriesCatalog()
+
+    cat = SeriesCatalog()
+    processed = 0
+    total = 0
+    last_edit = 0.0
+
+    for cname, coll in colls:
+        try:
+            n = await coll.estimated_document_count()
+            total += n
+        except Exception: pass
+
+    logger.info(f"[AI] scanning {len(colls)} colls, {total} docs")
+
+    for cname, coll in colls:
+        try:
+            async for doc in coll.find({}):
+                processed += 1
+                ok = _process_doc(doc, cat, filter_slug)
+                now = time.time()
+                if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
+                    last_edit = now
+                    try:
+                        await client.edit_message_text(
+                            chat_id=chat_id, message_id=status_msg_id,
+                            text=_view_scanning(processed, total or processed, cname),
+                            parse_mode=ParseMode.HTML)
+                    except Exception: pass
+        except Exception as e:
+            logger.warning(f"[AI] scan {cname}: {e}")
+            continue
+
+    logger.info(f"[AI] done: {processed} files, {len(cat.data)} series")
+
+    try:
+        await client.edit_message_text(
+            chat_id=chat_id, message_id=status_msg_id,
+            text=_view_scanning(processed, total or processed),
+            parse_mode=ParseMode.HTML)
+    except Exception: pass
+    return cat
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TMDB SUGGEST
 # ═══════════════════════════════════════════════════════════════════════════
-async def _tmdb_suggest(query: str, kind: str = "tv") -> List[Dict[str, Any]]:
-    """Search TMDB for TV shows (or movies) matching query."""
+async def _tmdb_suggest(query: str) -> List[Dict[str, Any]]:
     if not TMDB_API_KEY: return []
     try:
         import aiohttp
-    except ImportError:
-        return []
+    except ImportError: return []
 
-    endpoint = "/search/tv" if kind == "tv" else "/search/movie"
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "en-US"}
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"https://api.themoviedb.org/3{endpoint}",
+            async with sess.get("https://api.themoviedb.org/3/search/tv",
                                 params=params, timeout=12) as r:
                 if r.status != 200: return []
                 data = await r.json()
     except Exception as e:
-        logger.debug(f"[AI] tmdb suggest: {e}")
-        return []
+        logger.debug(f"[AI] tmdb: {e}"); return []
 
     out = []
     for it in (data.get("results") or [])[:8]:
-        if kind == "tv":
-            title = it.get("name") or it.get("original_name") or ""
-            date = it.get("first_air_date") or ""
-        else:
-            title = it.get("title") or it.get("original_title") or ""
-            date = it.get("release_date") or ""
+        title = it.get("name") or it.get("original_name") or ""
         if not title: continue
+        date = it.get("first_air_date") or ""
         out.append({
             "title": title,
             "year": (date or "")[:4],
             "tmdb_id": it.get("id"),
-            "overview": (it.get("overview") or "")[:150],
             "rating": it.get("vote_average", 0),
-            "poster": it.get("poster_path"),
-            "type": kind,
         })
     return out
 
 
-def _tmdb_poster(path):
-    return f"https://image.tmdb.org/t/p/w200{path}" if path else None
-
-
-def kb_tmdb_suggest(items: List[Dict[str, Any]]):
-    rows = []
-    for i, it in enumerate(items):
-        title = (it.get("title") or "?")[:38]
-        year = it.get("year") or ""
-        label = f"🎬 {title}"
-        if year: label += f" ({year})"
-        rows.append([InlineKeyboardButton(
-            label, callback_data=f"ai:pick_tmdb:{i}")])
+def kb_tmdb_suggest(items):
+    rows = [[InlineKeyboardButton(
+        f"🎬 {(it.get('title') or '?')[:38]}"
+        + (f" ({it['year']})" if it.get("year") else ""),
+        callback_data=f"ai:pick_tmdb:{i}")]
+        for i, it in enumerate(items)]
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# KEYBOARDS
+# KEYBOARDS / VIEWS
 # ═══════════════════════════════════════════════════════════════════════════
 def kb_main(auto_on, completed, total):
     return InlineKeyboardMarkup([
@@ -702,9 +847,9 @@ def kb_scan_result(slug, i, t):
 
 
 def kb_series_list(lst):
-    rows = [[InlineKeyboardButton(f"🎬 {(s.get('title') or '?')[:32]} · {s.get('file_count', 0)}",
-                                   callback_data=f"ai:view:{s['title_slug']}")]
-            for s in lst[:25]]
+    rows = [[InlineKeyboardButton(
+        f"🎬 {(s.get('title') or '?')[:32]} · {s.get('file_count', 0)}",
+        callback_data=f"ai:view:{s['title_slug']}")] for s in lst[:25]]
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
@@ -728,8 +873,7 @@ def kb_confirm_delete(slug, season, episode, idx):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ YES, DELETE",
             callback_data=f"ai:del_go:{slug}:{season}:{ep_i}:{idx}")],
-        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:view:{slug}")],
-    ])
+        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:view:{slug}")]])
 
 
 def kb_quality_picker(slug, avail, cur):
@@ -752,9 +896,6 @@ def kb_back(t="ai:main"):
         InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]])
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# VIEWS
-# ═══════════════════════════════════════════════════════════════════════════
 async def _view_main():
     auto_on = await _get_setting("auto_mode", True)
     comp = await _count_completed()
@@ -768,7 +909,7 @@ async def _view_main():
         f"📚 {sc('total series')} · <code>{_fmt_int(total)}</code>",
         "", DIV2, "",
         f"🚀 {sc('auto')} · 3 ꜱᴇʀɪᴇꜱ ꜰʀᴏᴍ ᴅʙ",
-        f"✍️ {sc('manual')} · ꜱᴇᴀʀᴄʜ ᴏɴᴇ (ᴛᴍᴅʙ ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ)",
+        f"✍️ {sc('manual')} · ᴛᴍᴅʙ ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ",
         "", DIV2,
         f"🕒 <code>{_now_ist()}</code>",
     ]), kb_main(auto_on, comp, total)
@@ -783,14 +924,10 @@ def _progress_bar(p, w=16):
 
 def _view_scanning(cur, total, coll=""):
     p = (cur / total * 100) if total else 0
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🔍 <b>{fb('SCANNING')}</b>",
-        DIV, "",
-        f"<code>{_progress_bar(p)}</code>",
-        "",
-        f"📁 <code>{_fmt_int(cur)}</code> / <code>{_fmt_int(total)}</code>",
-    ]
+    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+             f"🔍 <b>{fb('SCANNING')}</b>", DIV, "",
+             f"<code>{_progress_bar(p)}</code>", "",
+             f"📁 <code>{_fmt_int(cur)}</code> / <code>{_fmt_int(total)}</code>"]
     if coll: lines.append(f"📚 <code>{_esc(coll[:40])}</code>")
     return "\n".join(lines)
 
@@ -832,9 +969,7 @@ def _view_episode_files(title, season, episode, files, prefs):
     best, _ = _pick_best(files)
     lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
              f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
-             DIV, "",
-             f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ",
-             ""]
+             DIV, "", f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ", ""]
     for i, f in enumerate(files[:10]):
         q = f.get("quality", "?")
         langs = "+".join(f.get("languages", [])) or "?"
@@ -855,27 +990,20 @@ def _view_confirm_delete(title, season, episode, f):
     ep = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
     q = f.get("quality", "?"); langs = "+".join(f.get("languages", [])) or "?"
     size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
-    return "\n".join([
-        f"⚠️ <b>{fb('CONFIRM DELETE')}</b>",
-        DIV, "",
-        f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
-        f"🎯 {sc('quality')} · <code>{q}</code>",
-        f"🌍 {sc('languages')} · <code>{langs}</code>",
-        f"📦 {sc('size')} · <code>{size}</code>",
-        "", DIV2, f"❗ <b>{sc('this cannot be undone')}</b>",
-    ])
+    return "\n".join([f"⚠️ <b>{fb('CONFIRM DELETE')}</b>", DIV, "",
+                      f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
+                      f"🎯 {sc('quality')} · <code>{q}</code>",
+                      f"🌍 {sc('languages')} · <code>{langs}</code>",
+                      f"📦 {sc('size')} · <code>{size}</code>",
+                      "", DIV2, f"❗ <b>{sc('cannot be undone')}</b>"])
 
 
 def _view_quality_picker(title, avail, cur):
-    return "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
-        DIV, "",
-        f"🎬 <b>{_esc(title)}</b>",
-        "",
-        f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
-        f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>",
-    ])
+    return "\n".join([f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                      f"🎯 <b>{fb('QUALITY PREFS')}</b>", DIV, "",
+                      f"🎬 <b>{_esc(title)}</b>", "",
+                      f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
+                      f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>"])
 
 
 async def _safe_edit(t, text, kb=None):
@@ -890,78 +1018,6 @@ async def _safe_edit(t, text, kb=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN LIBRARY — ALL COLLECTIONS
-# ═══════════════════════════════════════════════════════════════════════════
-async def _scan_library(client, chat_id, status_msg_id, filter_slug=None):
-    colls = await _all_file_collections()
-    if not colls:
-        logger.warning("[AI] no file collections")
-        return SeriesCatalog()
-
-    total = 0; counts = {}
-    for name, c in colls:
-        try:
-            n = await c.estimated_document_count()
-            counts[name] = n; total += n
-        except Exception: counts[name] = 0
-
-    logger.info(f"[AI] scanning {len(colls)} colls, {total} docs")
-
-    cat = SeriesCatalog()
-    processed = 0
-    last_edit = 0.0
-
-    for cname, coll in colls:
-        try:
-            async for doc in coll.find({}):
-                processed += 1
-                fname = (doc.get("file_name") or doc.get("filename")
-                         or doc.get("title") or doc.get("name")
-                         or doc.get("file_title") or doc.get("caption")
-                         or doc.get("file_caption") or doc.get("media_title")
-                         or doc.get("text") or "")
-                if not fname:
-                    for k, v in doc.items():
-                        if k in ("_id","chat_id","message_id","msg_id",
-                                 "file_id","file_unique_id","file_size","size"):
-                            continue
-                        if isinstance(v, str) and len(v) > 5:
-                            if any(x in v.lower() for x in
-                                   (".mkv",".mp4",".avi",".mov",".webm",".ts",".m4v")):
-                                fname = v; break
-                if not fname: continue
-
-                p = parse_filename(str(fname))
-                if filter_slug is not None:
-                    sm = p.get("title_slug", "")
-                    if filter_slug not in sm and sm not in filter_slug:
-                        continue
-
-                cat.add(p, doc)
-
-                now = time.time()
-                if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
-                    last_edit = now
-                    try:
-                        await client.edit_message_text(
-                            chat_id=chat_id, message_id=status_msg_id,
-                            text=_view_scanning(processed, total, cname),
-                            parse_mode=ParseMode.HTML)
-                    except Exception: pass
-        except Exception as e:
-            logger.warning(f"[AI] scan {cname}: {e}"); continue
-
-    logger.info(f"[AI] done: {processed} files, {len(cat.data)} series")
-    try:
-        await client.edit_message_text(
-            chat_id=chat_id, message_id=status_msg_id,
-            text=_view_scanning(processed, total),
-            parse_mode=ParseMode.HTML)
-    except Exception: pass
-    return cat
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(filters.command(["ai", "librarian", "ailib"]) & filters.private, group=-430)
@@ -971,8 +1027,7 @@ async def cmd_ai(client, message):
     try:
         _clear_session(message.from_user.id)
         text, kb = await _view_main()
-        await message.reply_text(text, reply_markup=kb,
-                                  parse_mode=ParseMode.HTML,
+        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception as e:
         logger.exception(f"[AI] /ai: {e}")
@@ -984,14 +1039,13 @@ async def cmd_aidb(client, message):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
     try:
         colls = await _all_file_collections()
-        lines = ["🗄️ <b>ᴍᴏɴɢᴏ ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
+        lines = ["🗄️ <b>AI ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
                  "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                 f"📁 <b>{len(colls)} ꜰɪʟᴇ ᴄᴏʟʟᴇᴄᴛɪᴏɴꜱ ꜰᴏᴜɴᴅ</b>", ""]
+                 f"📁 <b>{len(colls)} ꜰɪʟᴇ ᴄᴏʟʟᴇᴄᴛɪᴏɴꜱ</b>", ""]
         for name, c in colls:
             try: n = await c.estimated_document_count()
             except Exception: n = -1
             lines.append(f"• <code>{_esc(name[:60])}</code> · {_fmt_int(n)}")
-        # sample
         if colls:
             try:
                 sample = await colls[0][1].find_one({})
@@ -1004,7 +1058,7 @@ async def cmd_aidb(client, message):
             except Exception: pass
         await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.exception(f"[AI] /aidb: {e}")
+        logger.exception(f"[AI] aidb: {e}")
         await message.reply_text(f"❌ {_esc(e)}")
 
 
@@ -1032,7 +1086,7 @@ async def cb_close(client, q):
 
 
 @Client.on_callback_query(filters.regex(r"^ai:toggle_auto$"), group=-430)
-async def cb_toggle_auto(client, q):
+async def cb_toggle(client, q):
     cur = await _get_setting("auto_mode", True)
     await _set_setting("auto_mode", not cur)
     await q.answer("🟢 ᴀᴜᴛᴏ ᴏɴ" if not cur else "🔴 ᴀᴜᴛᴏ ᴏꜰꜰ")
@@ -1053,8 +1107,7 @@ async def cb_auto(client, q):
         try:
             status = await q.message.edit_text(_view_scanning(0, 0),
                                                 parse_mode=ParseMode.HTML)
-        except Exception:
-            status = q.message
+        except Exception: status = q.message
 
         cat = await _scan_library(client, q.message.chat.id, status.id)
         if cat is None:
@@ -1065,8 +1118,7 @@ async def cb_auto(client, q):
         all_s = cat.list_series()
         await _set_setting("total_series", len(all_s))
 
-        pending = [s for s in all_s
-                   if not await _is_completed(s["title_slug"])]
+        pending = [s for s in all_s if not await _is_completed(s["title_slug"])]
 
         if not pending:
             try:
@@ -1078,10 +1130,9 @@ async def cb_auto(client, q):
                         DIV, "",
                         f"🎉 {sc('every series is completed')}",
                         f"📊 {sc('total')} · <code>{len(all_s)}</code>",
+                        f"📌 {sc('scan found')} <code>{len(all_s)}</code> ꜱᴇʀɪᴇꜱ",
                     ]),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
-                        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]]),
+                    reply_markup=kb_back("ai:main"),
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
@@ -1098,13 +1149,13 @@ async def cb_auto(client, q):
         await _show_series(client, q.message.chat.id, status.id,
                             picked[0]["title_slug"], 1, len(picked))
     except Exception as e:
-        logger.exception(f"[AI] cb_auto: {e}")
+        logger.exception(f"[AI] auto: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
         except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MANUAL SCAN — with TMDB SUGGESTIONS
+# MANUAL SCAN — TMDB suggest
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:manual$"), group=-430)
 async def cb_manual(client, q):
@@ -1114,16 +1165,10 @@ async def cb_manual(client, q):
     _new_session(q.from_user.id, "manual_name")
     await _safe_edit(q, "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"✍️ <b>{fb('MANUAL SCAN')}</b>",
-        DIV, "",
-        f"📝 {sc('send a name or short form')}",
-        "",
-        f"📌 {sc('examples')}:",
-        f"• <code>got</code>",
-        f"• <code>game of thrones</code>",
-        f"• <code>breaking bad</code>",
-        "",
-        f"💡 {sc('bot will suggest from tmdb')}",
+        f"✍️ <b>{fb('MANUAL SCAN')}</b>", DIV, "",
+        f"📝 {sc('send a name or short form')}", "",
+        f"📌 {sc('examples')}: <code>got</code> · <code>breaking bad</code>",
+        "", f"💡 {sc('bot suggests from tmdb')}",
     ]), InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
     await q.answer()
@@ -1133,7 +1178,7 @@ async def cb_manual(client, q):
 async def ai_manual_input(client, message):
     if not message.from_user: return
     s = _get_session(message.from_user.id)
-    if not s or s["action"] not in ("manual_name", "manual_tmdb"):
+    if not s or s["action"] != "manual_name":
         return
     try: message.stop_propagation()
     except Exception: pass
@@ -1144,34 +1189,36 @@ async def ai_manual_input(client, message):
 
     _clear_session(message.from_user.id)
 
-    # Ask TMDB
     try:
         loading = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ ᴛᴍᴅʙ...")
-    except Exception:
-        return
+    except Exception: return
 
-    suggestions = await _tmdb_suggest(text, kind="tv")
+    suggestions = await _tmdb_suggest(text)
 
     if not suggestions:
-        # No TMDB → try local scan directly
+        # No TMDB → direct scan
         try:
             await client.edit_message_text(
                 chat_id=message.chat.id, message_id=loading.id,
-                text="🔍 ᴛᴍᴅʙ ɴᴏ ʀᴇꜱᴜʟᴛꜱ · ꜱᴄᴀɴɴɪɴɢ ᴅʙ ʟᴏᴄᴀʟʟʏ...",
+                text="🔍 ᴛᴍᴅʙ ɴᴏ ʀᴇꜱᴜʟᴛ · ꜱᴄᴀɴɴɪɴɢ ᴅʙ...",
                 parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-        cat = await _scan_library(client, message.chat.id, loading.id,
-                                    filter_slug=slug)
+        # Use ENGINE for direct search
+        cat = await _scan_via_engine(text)
+        if cat is None or not cat.data:
+            # fallback to raw
+            slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+            cat = await _scan_library(client, message.chat.id, loading.id,
+                                        filter_slug=slug)
+
         if cat is None or not cat.data:
             try:
                 await client.edit_message_text(
                     chat_id=message.chat.id, message_id=loading.id,
                     text="\n".join([
                         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                        f"❌ <b>{fb('NOT FOUND')}</b>",
-                        DIV, "",
+                        f"❌ <b>{fb('NOT FOUND')}</b>", DIV, "",
                         f"🔍 <code>{_esc(text)}</code>",
                         f"📌 {sc('not in your db')}",
                     ]),
@@ -1187,38 +1234,25 @@ async def ai_manual_input(client, message):
         await _show_series(client, message.chat.id, loading.id, slug0, 1, 1)
         return
 
-    # Cache suggestions in session
-    _new_session(message.from_user.id, "manual_tmdb_pick",
-                 suggestions=suggestions, query=text)
+    _new_session(message.from_user.id, "manual_tmdb_pick", suggestions=suggestions)
 
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🔎 <b>{fb('TMDB SUGGESTIONS')}</b>",
-        DIV, "",
-        f"📝 {sc('you searched')} · <code>{_esc(text)}</code>",
-        "",
-        f"📌 {sc('tap a title to scan your db')}",
-        "",
-        DIV2, "",
-    ]
+    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+             f"🔎 <b>{fb('TMDB SUGGESTIONS')}</b>", DIV, "",
+             f"📝 <code>{_esc(text)}</code>", "",
+             f"📌 {sc('tap a title to scan')}", "", DIV2, ""]
     for i, it in enumerate(suggestions, 1):
-        title = it.get("title") or "?"
+        t = it.get("title") or "?"
         yr = it.get("year") or ""
-        rating = it.get("rating", 0)
-        lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> ({yr})")
-        if rating:
-            lines.append(f"   ⭐ <code>{rating:.1f}</code>")
-        lines.append("")
+        r = it.get("rating", 0)
+        lines.append(f"<b>{i}.</b> <b>{_esc(t)}</b> ({yr}) · ⭐ {r:.1f}")
 
     try:
         await client.edit_message_text(
             chat_id=message.chat.id, message_id=loading.id,
             text="\n".join(lines),
             reply_markup=kb_tmdb_suggest(suggestions),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning(f"[AI] tmdb suggest: {e}")
+            parse_mode=ParseMode.HTML)
+    except Exception as e: logger.warning(f"[AI] suggest: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:pick_tmdb:(\d+)$"), group=-430)
@@ -1230,7 +1264,6 @@ async def cb_pick_tmdb(client, q):
         s = _get_session(q.from_user.id)
         if not s or s["action"] != "manual_tmdb_pick":
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         sugg = (s.get("data") or {}).get("suggestions") or []
         if idx < 0 or idx >= len(sugg):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
@@ -1239,15 +1272,19 @@ async def cb_pick_tmdb(client, q):
         title = chosen.get("title") or ""
         _clear_session(q.from_user.id)
 
-        await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ ᴅʙ...")
+        await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ...")
         try:
             await q.message.edit_text(_view_scanning(0, 0),
                                        parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-        cat = await _scan_library(client, q.message.chat.id, q.message.id,
-                                    filter_slug=slug)
+        # ⭐ USE ENGINE (same as working search)
+        cat = await _scan_via_engine(title)
+        if cat is None or not cat.data:
+            # Fallback to raw scan
+            slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+            cat = await _scan_library(client, q.message.chat.id,
+                                        q.message.id, filter_slug=slug)
 
         if cat is None or not cat.data:
             try:
@@ -1255,13 +1292,11 @@ async def cb_pick_tmdb(client, q):
                     chat_id=q.message.chat.id, message_id=q.message.id,
                     text="\n".join([
                         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                        f"❌ <b>{fb('NOT IN YOUR DB')}</b>",
-                        DIV, "",
+                        f"❌ <b>{fb('NOT IN YOUR DB')}</b>", DIV, "",
                         f"🎬 <b>{_esc(title)}</b>",
                         f"📅 <code>{chosen.get('year') or '?'}</code>",
-                        "",
-                        DIV2, "",
-                        f"📌 {sc('this series is not in your library')}",
+                        "", DIV2, "",
+                        f"📌 {sc('not in your library')}",
                     ]),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("✍️ SEARCH AGAIN",
@@ -1277,7 +1312,7 @@ async def cb_pick_tmdb(client, q):
         sess = _SESSIONS[q.from_user.id]
         sess["catalog_data"] = cat.data
 
-        # Find best slug match
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
         best_slug = None
         for k in cat.data.keys():
             if slug in k or k in slug:
@@ -1329,8 +1364,8 @@ async def _show_series(client, chat_id, msg_id, slug, i, t):
     try:
         await client.edit_message_text(
             chat_id=chat_id, message_id=msg_id,
-            text=text, reply_markup=kb,
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
     except MessageNotModified: pass
     except Exception as e: logger.debug(f"[AI] show_series: {e}")
 
@@ -1352,7 +1387,7 @@ async def cb_next(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW FILES / QUALITY PREFS / COMPLETE
+# VIEW / PREFS / COMPLETE / DELETE
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
 async def cb_view(client, q):
@@ -1377,8 +1412,7 @@ async def cb_view(client, q):
             _view_episode_files(series.get("title"), fs, fe, files, prefs),
             kb_episode_files(slug, fs, fe, files))
         await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] view: {e}")
+    except Exception as e: logger.exception(f"[AI] view: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
@@ -1412,7 +1446,8 @@ async def cb_pref_tog(client, q):
         s = _get_session(q.from_user.id)
         if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         w = s.get("pref_working") or []
-        w.remove(qual) if qual in w else w.append(qual)
+        if qual in w: w.remove(qual)
+        else: w.append(qual)
         s["pref_working"] = w
         series = (s.get("catalog_data") or {}).get(slug) or {}
         avail = set()
@@ -1441,8 +1476,10 @@ async def cb_pref_save(client, q):
         if not ok: return
         await _safe_edit(q,
             _view_series_result({"title": title, "seasons": series.get("seasons")},
-                                w, s.get("current_index", 1), s.get("current_total", 1)),
-            kb_scan_result(slug, s.get("current_index", 1), s.get("current_total", 1)))
+                                w, s.get("current_index", 1),
+                                s.get("current_total", 1)),
+            kb_scan_result(slug, s.get("current_index", 1),
+                            s.get("current_total", 1)))
     except Exception as e: logger.exception(f"[AI] pref_save: {e}")
 
 
@@ -1479,8 +1516,7 @@ async def cb_complete(client, q):
         await q.answer("✅ ᴍᴀʀᴋᴇᴅ")
         await _safe_edit(q, "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"✅ <b>{fb('MARKED COMPLETE')}</b>",
-            DIV, "",
+            f"✅ <b>{fb('MARKED COMPLETE')}</b>", DIV, "",
             f"🎬 <b>{_esc(series.get('title'))}</b>",
             f"📁 <code>{_fmt_int(series.get('file_count', 0))}</code> ꜰɪʟᴇꜱ",
             f"📅 <code>{_now_ist()}</code>",
@@ -1517,8 +1553,7 @@ async def cb_all(client, q):
         sess["catalog_data"] = cat.data
         comp = {s.get("title_slug") for s in await _list_completed()}
         lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                 f"📚 <b>{fb('ALL SERIES')}</b>",
-                 DIV, "",
+                 f"📚 <b>{fb('ALL SERIES')}</b>", DIV, "",
                  f"📊 <code>{len(all_s)}</code> · ✅ <code>{len(comp)}</code>",
                  "", DIV2, ""]
         for s in all_s[:25]:
@@ -1568,9 +1603,6 @@ async def cb_unmark(client, q):
     except Exception as e: logger.exception(f"[AI] unmark: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DELETE
-# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\d+)$"), group=-430)
 async def cb_del_pick(client, q):
     try:
@@ -1587,8 +1619,9 @@ async def cb_del_pick(client, q):
         files = ((series.get("seasons") or {}).get(sn) or {}).get(ep, [])
         if idx < 0 or idx >= len(files):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        await _safe_edit(q, _view_confirm_delete(series.get("title"), sn, ep, files[idx]),
-                          kb_confirm_delete(slug, sn, ep, idx))
+        await _safe_edit(q,
+            _view_confirm_delete(series.get("title"), sn, ep, files[idx]),
+            kb_confirm_delete(slug, sn, ep, idx))
         await q.answer()
     except Exception as e: logger.exception(f"[AI] del_pick: {e}")
 
@@ -1653,8 +1686,7 @@ async def _send_report(client):
         total = await _get_setting("total_series", 0)
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"🎛️ <b>{fb('DAILY AI REPORT')}</b>",
-            DIV, "",
+            f"🎛️ <b>{fb('DAILY AI REPORT')}</b>", DIV, "",
             f"📅 <code>{_now_ist()}</code>", "",
             f"📚 {sc('total')} · <code>{_fmt_int(total)}</code>",
             f"✅ {sc('completed')} · <code>{_fmt_int(comp)}</code>",
@@ -1689,7 +1721,7 @@ async def cb_last(client, q):
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"📊 <b>{fb('STATUS')}</b>", DIV, "",
             f"📚 <code>{_fmt_int(total)}</code> · ✅ <code>{_fmt_int(comp)}</code>",
-            f"", f"🕒 <code>{_now_ist()}</code>"]), kb_back("ai:main"))
+            "", f"🕒 <code>{_now_ist()}</code>"]), kb_back("ai:main"))
         await q.answer()
     except Exception as e: logger.exception(f"[AI] last: {e}")
 
@@ -1717,4 +1749,4 @@ async def _boot(client, message):
     except Exception as e: logger.warning(f"[AI] boot: {e}")
 
 
-logger.info("🎛️ AI LIBRARIAN v2 LOADED — sharded scan + TMDB suggest")
+logger.info("🎛️ AI LIBRARIAN v3 LOADED")
