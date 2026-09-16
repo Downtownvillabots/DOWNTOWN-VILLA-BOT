@@ -2,17 +2,14 @@
 """
 🎛️ DOWNTOWN VILLA — AI LIBRARIAN
 
-Scans your media_files DB, groups series by season/episode/quality,
-suggests duplicates to delete, tracks completed series.
-
-No cache · No auto-start · Only acts when you approve.
+Scans media_files DB, groups series by season/episode/quality,
+scores files, suggests duplicates, tracks completed series.
 """
 # ═══════════════════════════════════════════════════════════════════════════
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio
 import logging
-import os
 import random
 import re
 import secrets
@@ -44,16 +41,14 @@ logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 SESSION_TTL = 900
-DAILY_REPORT_HOUR = 9      # 9 AM IST
+DAILY_REPORT_HOUR = 9
 DAILY_REPORT_MINUTE = 0
 SERIES_PER_AUTO = 3
 PROGRESS_UPDATE_INTERVAL = 2.0
-SCAN_BATCH = 200           # files per batch during scan
 
 DIV = "━" * 26
 DIV2 = "─" * 26
 
-# Quality ranking (higher = better)
 QUALITY_RANK = {
     "4320P": 100, "8K": 100,
     "2160P": 90, "4K": 90, "UHD": 90,
@@ -65,6 +60,7 @@ QUALITY_RANK = {
     "360P": 30,
     "240P": 20,
     "CAM": 5, "HDCAM": 5, "TS": 3, "TELESYNC": 3,
+    "UNKNOWN": 25,
 }
 
 # Fancy fonts
@@ -100,15 +96,6 @@ def _fmt_size(bytes_) -> str:
         if s < 1024: return f"{s:.2f} {u}"
         s /= 1024
     return f"{s:.2f} PB"
-
-def _fmt_dur(secs) -> str:
-    try: secs = int(max(0, secs))
-    except (TypeError, ValueError): return "0s"
-    if secs < 60: return f"{secs}s"
-    m, s = divmod(secs, 60)
-    if m < 60: return f"{m}m {s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m}m"
 
 def _esc(t) -> str:
     if t is None: return ""
@@ -159,6 +146,11 @@ def _settings_coll():
     return d["ai_settings"] if d is not None else None
 
 
+def _prefs_coll():
+    d = _get_db()
+    return d["ai_prefs"] if d is not None else None
+
+
 async def _get_setting(key: str, default: Any = None) -> Any:
     c = _settings_coll()
     if c is None: return default
@@ -199,11 +191,9 @@ async def _mark_completed(title: str, title_slug: str,
         await c.update_one(
             {"title_slug": title_slug},
             {"$set": {
-                "title": title,
-                "title_slug": title_slug,
+                "title": title, "title_slug": title_slug,
                 "total_files": total_files,
                 "completed_at": time.time(),
-                "marked_by": "admin",
             }},
             upsert=True,
         )
@@ -251,6 +241,45 @@ async def _delete_file_record(file_id: str) -> bool:
         return False
 
 
+async def _get_prefs(title_slug: str) -> List[str]:
+    c = _prefs_coll()
+    if c is None: return []
+    try:
+        doc = await c.find_one({"title_slug": title_slug})
+        if not doc: return []
+        return list(doc.get("keep_qualities") or [])
+    except Exception:
+        return []
+
+
+async def _set_prefs(title_slug: str, title: str, qualities: List[str]) -> bool:
+    c = _prefs_coll()
+    if c is None: return False
+    try:
+        await c.update_one(
+            {"title_slug": title_slug},
+            {"$set": {
+                "title_slug": title_slug, "title": title,
+                "keep_qualities": list(qualities),
+                "updated_at": time.time(),
+            }},
+            upsert=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _list_prefs() -> List[Dict[str, Any]]:
+    c = _prefs_coll()
+    if c is None: return []
+    try:
+        cursor = c.find({}).sort("updated_at", -1)
+        return await cursor.to_list(length=200)
+    except Exception:
+        return []
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SESSIONS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -279,7 +308,7 @@ def _cleanup_sessions() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AI FILENAME PARSER
+# AI FILENAME PARSER (with uploader-tag stripping)
 # ═══════════════════════════════════════════════════════════════════════════
 SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -308,6 +337,49 @@ QUALITY_MARKERS = [
     ("240p", "240P"),
     ("hdcam", "HDCAM"), ("cam", "CAM"),
     ("telesync", "TS"), ("ts", "TS"),
+]
+
+CODEC_PATTERNS = [
+    (re.compile(r"\bav1\b", re.I), "AV1"),
+    (re.compile(r"\bx265\b|\bh\.?265\b|\bhevc\b", re.I), "X265"),
+    (re.compile(r"\bx264\b|\bh\.?264\b|\bavc\b", re.I), "X264"),
+    (re.compile(r"\bmpeg2?\b|\bxvid\b|\bdivx\b", re.I), "MPEG"),
+]
+
+SOURCE_PATTERNS = [
+    (re.compile(r"\bremux\b", re.I), "REMUX"),
+    (re.compile(r"\bbluray\b|\bblu-ray\b|\bbdrip\b|\bbrrip\b|\bbdremux\b", re.I), "BLURAY"),
+    (re.compile(r"\bweb-?dl\b|\bwebdl\b|\bamzn\b|\bdsnp\b|\bnf\b|\batvp\b|\bitunes\b|\bpcok\b", re.I), "WEBDL"),
+    (re.compile(r"\bweb-?rip\b|\bwebrip\b|\bweb\b", re.I), "WEBRIP"),
+    (re.compile(r"\bhdtv\b|\bpdtv\b", re.I), "HDTV"),
+    (re.compile(r"\bdvdrip\b|\bdvdscr\b|\bdvd\b|\bhdrip\b", re.I), "DVDRIP"),
+    (re.compile(r"\bhdcam\b|\bcam\b", re.I), "CAM"),
+    (re.compile(r"\bts\b|\btelesync\b|\btc\b", re.I), "TS"),
+    (re.compile(r"\bscreener\b|\bscr\b|\br5\b", re.I), "SCR"),
+]
+
+AUDIO_PATTERNS = [
+    (re.compile(r"\batmos\b", re.I), "ATMOS"),
+    (re.compile(r"\btruehd\b|\bthd\b", re.I), "TRUEHD"),
+    (re.compile(r"\bdts-?hd[\s._-]?ma\b|\bdts[\s._-]?hd\b", re.I), "DTS-HD"),
+    (re.compile(r"\bdts-?x\b|\bdtsx\b", re.I), "DTSX"),
+    (re.compile(r"\bdts\b", re.I), "DTS"),
+    (re.compile(r"\bddp[\s._-]?7\.1\b|\bdd\+[\s._-]?7\.1\b|\beac3[\s._-]?7\.1\b", re.I), "DDP7.1"),
+    (re.compile(r"\bddp[\s._-]?5\.1\b|\bdd\+[\s._-]?5\.1\b|\beac3\b|\bdd5\.1\b", re.I), "DDP5.1"),
+    (re.compile(r"\bddp\b|\bdd\+\b", re.I), "DDP"),
+    (re.compile(r"\bac3\b|\bdd\b", re.I), "AC3"),
+    (re.compile(r"\baac\b", re.I), "AAC"),
+    (re.compile(r"\bflac\b", re.I), "FLAC"),
+    (re.compile(r"\bopus\b", re.I), "OPUS"),
+    (re.compile(r"\bmp3\b", re.I), "MP3"),
+]
+
+SIZE_REGEX = re.compile(r"\b(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b", re.IGNORECASE)
+
+MULTI_AUDIO_MARKERS = [
+    re.compile(r"\bmulti\b", re.I),
+    re.compile(r"\bdual[\s._-]?audio\b", re.I),
+    re.compile(r"\bdubbed\b", re.I),
 ]
 
 LANGUAGE_ALIASES: Dict[str, List[str]] = {
@@ -359,6 +431,26 @@ def _smart_title_case(s: str) -> str:
     return " ".join(out)
 
 
+def _parse_size_from_name(name: str) -> int:
+    m = SIZE_REGEX.search(name)
+    if not m: return 0
+    try:
+        val = float(m.group(1))
+        unit = m.group(2).upper()
+        if unit in ("GB", "GIB"): return int(val * 1024 * 1024 * 1024)
+        if unit in ("MB", "MIB"): return int(val * 1024 * 1024)
+    except Exception:
+        pass
+    return 0
+
+
+def _detect_from_patterns(name: str, patterns) -> Optional[str]:
+    for pat, label in patterns:
+        if pat.search(name):
+            return label
+    return None
+
+
 def parse_filename(filename: str) -> Dict[str, Any]:
     """Extract structured data from any messy filename."""
     result: Dict[str, Any] = {
@@ -366,7 +458,10 @@ def parse_filename(filename: str) -> Dict[str, Any]:
         "title": "", "title_slug": "",
         "year": None, "season": None, "episode": None,
         "quality": None, "quality_rank": 0,
+        "codec": None, "source": None, "audio_codec": None,
+        "is_multi": False,
         "languages": [],
+        "size_from_name": 0,
         "is_series": False, "is_season_pack": False,
     }
     if not filename:
@@ -417,6 +512,19 @@ def parse_filename(filename: str) -> Dict[str, Any]:
             result["quality_rank"] = QUALITY_RANK.get(label, 0)
             break
 
+    # Codec / Source / Audio
+    result["codec"] = _detect_from_patterns(work_lower, CODEC_PATTERNS)
+    result["source"] = _detect_from_patterns(work_lower, SOURCE_PATTERNS)
+    result["audio_codec"] = _detect_from_patterns(work_lower, AUDIO_PATTERNS)
+
+    if result.get("quality") in ("CAM", "HDCAM"):
+        result["source"] = result.get("source") or "CAM"
+    if result.get("quality") == "TS":
+        result["source"] = result.get("source") or "TS"
+
+    # Multi
+    result["is_multi"] = any(p.search(work_lower) for p in MULTI_AUDIO_MARKERS)
+
     # Languages
     langs = []
     for lang_name, aliases in LANGUAGE_ALIASES.items():
@@ -426,6 +534,9 @@ def parse_filename(filename: str) -> Dict[str, Any]:
                     langs.append(lang_name)
                 break
     result["languages"] = langs
+
+    # Size
+    result["size_from_name"] = _parse_size_from_name(name)
 
     # Type
     if season is not None or episode is not None:
@@ -449,8 +560,20 @@ def parse_filename(filename: str) -> Dict[str, Any]:
     for noise in NOISE_WORDS:
         title_work = re.sub(r"\b" + re.escape(noise) + r"\b", " ",
                             title_work, flags=re.IGNORECASE)
+
+    # ⭐ STRIP UPLOADER / RELEASE GROUP TAGS
+    title_work = re.sub(r"[-_.\s]*@\w+\b", " ", title_work)
+    title_work = re.sub(r"[-_.\s]*\[[^\]]{1,40}\]", " ", title_work)
+    title_work = re.sub(r"[-_.\s]*\([^\)]{1,20}\)\s*$", " ", title_work)
+    title_work = re.sub(
+        r"[-_.\s]*(?:rarbg|eztv|yts|yify|galaxyrg|psa|hon3y|bolly4u|"
+        r"subsplease|evo|fgt|nf|amzn|thetvshare|tvshare|hdhub4u|"
+        r"mkvcage|shaanig|dusicyon|tamilrockers|isaimini)\b",
+        " ", title_work, flags=re.IGNORECASE)
+
     title_work = re.sub(r"[._\-]+", " ", title_work)
     title_work = re.sub(r"\s+", " ", title_work).strip()
+
     parts = [p for p in title_work.split() if len(p) > 1]
     title_clean = " ".join(parts)
 
@@ -461,18 +584,73 @@ def parse_filename(filename: str) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATALOG BUILDER
+# FILE QUALITY SCORING ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+RESOLUTION_SCORE = QUALITY_RANK
+
+CODEC_BONUS = {"AV1": 10, "X265": 8, "X264": 4, "MPEG": 0, None: 2}
+SOURCE_BONUS = {"REMUX": 15, "BLURAY": 12, "WEBDL": 10, "WEBRIP": 7,
+                "HDTV": 4, "DVDRIP": 3, "SCR": 2, "CAM": 0, "TS": 0, None: 2}
+AUDIO_BONUS = {"ATMOS": 8, "TRUEHD": 7, "DTS-HD": 6, "DTSX": 6, "DTS": 5,
+               "DDP7.1": 5, "DDP5.1": 4, "DDP": 3, "AC3": 2, "AAC": 2,
+               "FLAC": 5, "OPUS": 2, "MP3": 1, None: 1}
+
+
+def _compute_file_score(f: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    resolution = (f.get("quality") or "UNKNOWN").upper()
+    codec = (f.get("codec") or "").upper() or None
+    source = (f.get("source") or "").upper() or None
+    audio = (f.get("audio_codec") or "").upper() or None
+    languages = f.get("languages") or []
+    size_bytes = f.get("size") or f.get("size_from_name") or 0
+
+    r_score = RESOLUTION_SCORE.get(resolution, 25)
+    c_bonus = CODEC_BONUS.get(codec, 2)
+    s_bonus = SOURCE_BONUS.get(source, 2)
+    a_bonus = AUDIO_BONUS.get(audio, 1)
+    l_bonus = len(languages) * 2
+
+    try:
+        size_mb = max(0, size_bytes) / (1024 * 1024)
+        size_bonus = min(20.0, size_mb / 500.0)
+    except Exception:
+        size_bonus = 0.0
+
+    total = (r_score + c_bonus + s_bonus + a_bonus + l_bonus + size_bonus)
+    return round(total, 1), {
+        "resolution": r_score, "codec": c_bonus, "source": s_bonus,
+        "audio": a_bonus, "languages": l_bonus,
+        "size": round(size_bonus, 1), "total": round(total, 1),
+    }
+
+
+def _pick_best_file(files: List[Dict[str, Any]]) -> Tuple[Optional[Dict], List[Dict]]:
+    if not files:
+        return None, []
+    scored = [( _compute_file_score(f)[0], f) for f in files]
+    if all((f.get("quality") or "UNKNOWN").upper() == "UNKNOWN"
+           for _, f in scored):
+        return None, []
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+    best["_score"] = scored[0][0]
+    others = []
+    for s, f in scored[1:]:
+        f["_score"] = s
+        others.append(f)
+    return best, others
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATALOG
 # ═══════════════════════════════════════════════════════════════════════════
 class SeriesCatalog:
-    """Groups files by series → season → episode → (quality, language)."""
     def __init__(self):
-        # {title_slug: {title, seasons: {s: {ep: [file, ...]}}}}
         self.data: Dict[str, Dict[str, Any]] = {}
 
     def add(self, parsed: Dict[str, Any], file_record: Dict[str, Any]) -> None:
         if not parsed.get("is_series"): return
         if parsed.get("season") is None: return
-
         slug = parsed["title_slug"]
         if not slug: return
 
@@ -486,13 +664,23 @@ class SeriesCatalog:
         season = parsed["season"]
         episode = parsed.get("episode")
 
+        size_bytes = (file_record.get("file_size")
+                       or file_record.get("size")
+                       or parsed.get("size_from_name") or 0)
+
         entry = {
-            "file_id": file_record.get("file_id") or file_record.get("file_unique_id") or "",
+            "file_id": (file_record.get("file_id")
+                        or file_record.get("file_unique_id") or ""),
             "file_name": parsed.get("raw", ""),
-            "quality": parsed.get("quality") or "UNKNOWN",
-            "quality_rank": parsed.get("quality_rank", 0),
+            "quality": (parsed.get("quality") or "UNKNOWN").upper(),
+            "quality_rank": QUALITY_RANK.get(parsed.get("quality") or "", 0),
+            "codec": (parsed.get("codec") or "").upper() or None,
+            "source": (parsed.get("source") or "").upper() or None,
+            "audio_codec": (parsed.get("audio_codec") or "").upper() or None,
+            "is_multi": parsed.get("is_multi", False),
             "languages": parsed.get("languages", []),
-            "size": file_record.get("file_size") or file_record.get("size") or 0,
+            "size": size_bytes,
+            "size_from_name": parsed.get("size_from_name", 0),
             "chat_id": file_record.get("chat_id"),
             "message_id": file_record.get("message_id") or file_record.get("msg_id"),
             "raw": file_record,
@@ -514,111 +702,6 @@ class SeriesCatalog:
         return out
 
 
-def _duplicates_in_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Return files that are duplicates of another file
-    (same quality + same language set) — keep the largest.
-    """
-    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for f in files:
-        key = f"{f.get('quality', '?')}|{','.join(sorted(f.get('languages', [])))}"
-        groups[key].append(f)
-
-    dupes = []
-    for key, grp in groups.items():
-        if len(grp) <= 1: continue
-        # Keep the largest, mark others
-        sorted_grp = sorted(grp, key=lambda x: x.get("size", 0), reverse=True)
-        for f in sorted_grp[1:]:
-            dupes.append(f)
-    return dupes
-
-
-def _episode_summary(files: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Summarize files in one episode."""
-    if not files:
-        return {"count": 0, "qualities": [], "languages": [], "dupes": 0}
-
-    qualities = sorted({f.get("quality", "?") for f in files},
-                       key=lambda q: QUALITY_RANK.get(q, 0), reverse=True)
-    languages: Set[str] = set()
-    for f in files:
-        for l in f.get("languages", []):
-            languages.add(l)
-    dupes = _duplicates_in_episode(files)
-    return {
-        "count": len(files),
-        "qualities": qualities,
-        "languages": sorted(languages),
-        "dupes": len(dupes),
-    }
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PREFERENCES (per-series quality settings)
-# ═══════════════════════════════════════════════════════════════════════════
-def _prefs_coll():
-    d = _get_db()
-    return d["ai_prefs"] if d is not None else None
-
-
-async def _get_prefs(title_slug: str) -> List[str]:
-    """Return preferred qualities for this series, or [] if not set."""
-    c = _prefs_coll()
-    if c is None: return []
-    try:
-        doc = await c.find_one({"title_slug": title_slug})
-        if not doc: return []
-        return list(doc.get("keep_qualities") or [])
-    except Exception:
-        return []
-
-
-async def _set_prefs(title_slug: str, title: str, qualities: List[str]) -> bool:
-    c = _prefs_coll()
-    if c is None: return False
-    try:
-        await c.update_one(
-            {"title_slug": title_slug},
-            {"$set": {
-                "title_slug": title_slug,
-                "title": title,
-                "keep_qualities": list(qualities),
-                "updated_at": time.time(),
-            }},
-            upsert=True,
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def _list_prefs() -> List[Dict[str, Any]]:
-    c = _prefs_coll()
-    if c is None: return []
-    try:
-        cursor = c.find({}).sort("updated_at", -1)
-        return await cursor.to_list(length=200)
-    except Exception:
-        return []
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PROGRESS BAR
-# ═══════════════════════════════════════════════════════════════════════════
-def _progress_bar(pct: float, width: int = 16) -> str:
-    """Colored emoji progress bar red → orange → yellow → green."""
-    pct = max(0.0, min(100.0, float(pct)))
-    filled = int(width * pct / 100.0)
-    empty = width - filled
-
-    if pct >= 75: block = "🟩"
-    elif pct >= 50: block = "🟨"
-    elif pct >= 25: block = "🟧"
-    else: block = "🟥"
-
-    return block * filled + "⬛" * empty + f"  {pct:.0f}%"
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -631,34 +714,31 @@ def kb_main(auto_on: bool, completed: int, total: int):
         [InlineKeyboardButton(f"📚 ALL SERIES ({total})", callback_data="ai:all"),
          InlineKeyboardButton(f"✅ COMPLETED ({completed})", callback_data="ai:completed")],
         [InlineKeyboardButton("🎯 QUALITY PREFS", callback_data="ai:prefs"),
-         InlineKeyboardButton("📊 LAST REPORT", callback_data="ai:last_report")],
+         InlineKeyboardButton("📊 STATUS", callback_data="ai:last_report")],
         [InlineKeyboardButton("🔄 REFRESH", callback_data="ai:main"),
          InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
     ])
 
 
 def kb_scan_result(title_slug: str, series_index: int, total_series: int):
-    """Result screen for one series."""
-    rows = []
-    rows.append([InlineKeyboardButton("👁️ VIEW FILES",
-                                       callback_data=f"ai:view:{title_slug}")])
-    rows.append([InlineKeyboardButton("🎯 SET KEEP QUALITIES",
-                                       callback_data=f"ai:pref:{title_slug}")])
-    rows.append([InlineKeyboardButton("✅ MARK COMPLETE",
-                                       callback_data=f"ai:complete:{title_slug}")])
-
+    rows = [
+        [InlineKeyboardButton("👁️ VIEW FILES",
+                              callback_data=f"ai:view:{title_slug}")],
+        [InlineKeyboardButton("🎯 SET KEEP QUALITIES",
+                              callback_data=f"ai:pref:{title_slug}")],
+        [InlineKeyboardButton("✅ MARK COMPLETE",
+                              callback_data=f"ai:complete:{title_slug}")],
+    ]
     if series_index < total_series:
         rows.append([InlineKeyboardButton(
             f"⏭️ NEXT SERIES ({series_index + 1}/{total_series})",
             callback_data=f"ai:next:{title_slug}")])
-
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_series_list(series_list: List[Dict[str, Any]]):
-    """List of all series."""
     rows = []
     for s in series_list[:25]:
         title = (s.get("title") or "?")[:32]
@@ -674,15 +754,12 @@ def kb_series_list(series_list: List[Dict[str, Any]]):
 
 def kb_episode_files(title_slug: str, season: int, episode: Optional[int],
                      files: List[Dict[str, Any]]):
-    """Show each file with Delete + Send buttons."""
     rows = []
     for i, f in enumerate(files[:10]):
         q = f.get("quality", "?")
         langs = "+".join(f.get("languages", [])) or "?"
-        size = _fmt_size(f.get("size", 0))
-        label = f"🗑️ {i+1}. {q} · {langs}"
         rows.append([InlineKeyboardButton(
-            label,
+            f"🗑️ {i+1}. {q} · {langs}",
             callback_data=f"ai:del_pick:{title_slug}:{season}:"
                           f"{episode if episode is not None else 0}:{i}"
         )])
@@ -707,7 +784,6 @@ def kb_confirm_delete(title_slug: str, season: int, episode: Optional[int],
 
 def kb_quality_picker(title_slug: str, available: List[str],
                       current: List[str]):
-    """Pick which qualities to KEEP for this series."""
     rows = []
     row = []
     for q in available:
@@ -728,13 +804,11 @@ def kb_quality_picker(title_slug: str, available: List[str],
     return InlineKeyboardMarkup(rows)
 
 
-def kb_after_series_delete(title_slug: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ BACK TO SERIES",
-                               callback_data=f"ai:view:{title_slug}")],
-        [InlineKeyboardButton("🏠 MAIN", callback_data="ai:main"),
-         InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
-    ])
+def kb_back(target: str = "ai:main"):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️ BACK", callback_data=target),
+        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close"),
+    ]])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -743,16 +817,13 @@ def kb_after_series_delete(title_slug: str):
 async def _view_main() -> Tuple[str, InlineKeyboardMarkup]:
     auto_on = await _get_setting("auto_mode", True)
     completed = await _count_completed()
-
-    # Count total series quickly (cached setting or estimate)
     total_series = await _get_setting("total_series", 0)
 
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎛️ <b>{fb('AI LIBRARIAN')}</b>",
         DIV, "",
-        f"⚙️ {sc('auto mode')} · "
-        f"{'🟢 ᴏɴ' if auto_on else '🔴 ᴏꜰꜰ'}",
+        f"⚙️ {sc('auto mode')} · {'🟢 ᴏɴ' if auto_on else '🔴 ᴏꜰꜰ'}",
         f"✅ {sc('completed series')} · <code>{_fmt_int(completed)}</code>",
         f"📚 {sc('total series')} · <code>{_fmt_int(total_series)}</code>",
         "",
@@ -767,41 +838,32 @@ async def _view_main() -> Tuple[str, InlineKeyboardMarkup]:
     return text, kb_main(auto_on, completed, total_series)
 
 
-def _view_scanning_auto(current: int, total: int) -> str:
+def _progress_bar(pct: float, width: int = 16) -> str:
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(width * pct / 100.0)
+    empty = width - filled
+    if pct >= 75: block = "🟩"
+    elif pct >= 50: block = "🟨"
+    elif pct >= 25: block = "🟧"
+    else: block = "🟥"
+    return block * filled + "⬛" * empty + f"  {pct:.0f}%"
+
+
+def _view_scanning(current: int, total: int) -> str:
     pct = (current / total) * 100 if total else 0
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🚀 <b>{fb('AUTO SCAN RUNNING')}</b>",
+        f"🔍 <b>{fb('SCANNING')}</b>",
         DIV, "",
-        f"📂 {sc('reading library')}...",
-        "",
         f"<code>{_progress_bar(pct)}</code>",
-        f"",
+        "",
         f"📁 <code>{_fmt_int(current)}</code> / "
         f"<code>{_fmt_int(total)}</code> ꜰɪʟᴇꜱ",
-        "",
-        DIV2, "",
-        f"⏳ {sc('please wait')}",
     ])
 
 
-def _view_scanning_manual(name: str) -> str:
-    return "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🔍 <b>{fb('MANUAL SCAN')}</b>",
-        DIV, "",
-        f"🎬 {sc('searching')} · <b>{_esc(name)}</b>",
-        "",
-        f"<code>{_progress_bar(0)}</code>",
-        f"",
-        f"⏳ {sc('scanning db')}...",
-    ])
-
-
-def _view_series_result(series: Dict[str, Any],
-                        prefs: List[str],
+def _view_series_result(series: Dict[str, Any], prefs: List[str],
                         index: int, total: int) -> str:
-    """Full breakdown for one series."""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
 
@@ -815,11 +877,9 @@ def _view_series_result(series: Dict[str, Any],
     total_files = 0
     for snum in sorted(seasons.keys()):
         eps = seasons[snum]
-        episode_count = len(eps)
         lines.append(f"📺 <b>{sc('season')} {snum}</b> · "
-                     f"<code>{episode_count} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
+                     f"<code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
 
-        # Group by quality across this season
         quality_map: Dict[str, Set[int]] = defaultdict(set)
         for ep, files in eps.items():
             for f in files:
@@ -834,27 +894,22 @@ def _view_series_result(series: Dict[str, Any],
                                     for e in eps_present[:15])
             if len(eps_present) > 15:
                 present_str += f" +{len(eps_present) - 15}"
-
             marker = ""
             if prefs and q not in prefs:
                 marker = " · 🗑️ ᴛᴏ ᴅᴇʟᴇᴛᴇ"
             elif prefs and q in prefs:
                 marker = " · ✅ ᴋᴇᴇᴘ"
-
             lines.append(f"   🎯 <code>{q}</code> · "
                          f"<code>{present_str}</code>{marker}")
         lines.append("")
 
     lines.append(DIV2)
     lines.append(f"📁 {sc('total files')} · <code>{_fmt_int(total_files)}</code>")
-
     if prefs:
         lines.append(f"🎯 {sc('keep qualities')} · "
                      f"<code>{', '.join(prefs)}</code>")
     else:
         lines.append(f"🎯 {sc('keep qualities')} · <i>not set</i>")
-        lines.append(f"📌 {sc('tap set to choose which to keep')}")
-
     return "\n".join(lines)
 
 
@@ -862,6 +917,8 @@ def _view_episode_files(title: str, season: int, episode: Optional[int],
                         files: List[Dict[str, Any]],
                         prefs: List[str]) -> str:
     ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
+    best, _ = _pick_best_file(files)
+
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{_esc(title)}</b> · <code>{ep_label}</code>",
@@ -869,24 +926,30 @@ def _view_episode_files(title: str, season: int, episode: Optional[int],
         f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ",
         "",
     ]
-    for i, f in enumerate(files[:10]):
-        q = f.get("quality", "?")
-        langs = "+".join(f.get("languages", [])) or "?"
-        size = _fmt_size(f.get("size", 0))
-        tag = ""
-        if prefs and q not in prefs:
-            tag = " · 🗑️ ᴛᴏ ᴅᴇʟᴇᴛᴇ"
-        elif prefs:
-            tag = " · ✅ ᴋᴇᴇᴘ"
 
-        lines.append(f"<b>{i + 1}.</b> <code>{q}</code> · "
-                     f"<code>{langs}</code>{tag}")
-        lines.append(f"   📦 {size}")
+    for i, f in enumerate(files[:10]):
+        q_ = f.get("quality", "?")
+        langs = "+".join(f.get("languages", [])) or "?"
+        size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
+        codec = f.get("codec") or "?"
+        source = f.get("source") or "?"
+        score = f.get("_score", 0)
+
+        tag = ""
+        if f is best:
+            tag = " · ⭐ ʙᴇꜱᴛ"
+        elif prefs and q_ not in prefs:
+            tag = " · 🗑️ ʀᴇᴍᴏᴠᴇ"
+        elif q_ == "UNKNOWN":
+            tag = " · ⚠️ ᴜɴᴋɴᴏᴡɴ"
+
+        lines.append(f"<b>{i+1}.</b> <code>{q_}</code> · "
+                     f"<code>{codec}</code> · <code>{source}</code>{tag}")
+        lines.append(f"   🌍 <code>{langs}</code> · 📦 {size}")
 
     lines.append("")
     lines.append(DIV2)
     lines.append(f"📌 {sc('tap a file to delete it')}")
-
     return "\n".join(lines)
 
 
@@ -895,8 +958,7 @@ def _view_confirm_delete(title: str, season: int, episode: Optional[int],
     ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
     q = f.get("quality", "?")
     langs = "+".join(f.get("languages", [])) or "?"
-    size = _fmt_size(f.get("size", 0))
-
+    size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
     return "\n".join([
         f"⚠️ <b>{fb('CONFIRM DELETE')}</b>",
         DIV, "",
@@ -912,7 +974,7 @@ def _view_confirm_delete(title: str, season: int, episode: Optional[int],
 
 def _view_quality_picker(title: str, available: List[str],
                         current: List[str]) -> str:
-    lines = [
+    return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
         DIV, "",
@@ -922,13 +984,9 @@ def _view_quality_picker(title: str, available: List[str],
         f"📌 {sc('others will be marked as deletable')}",
         "",
         DIV2, "",
-        f"📊 {sc('qualities found')} · "
-        f"<code>{', '.join(available) or 'none'}</code>",
-        "",
-        f"✅ {sc('currently keeping')} · "
-        f"<code>{', '.join(current) or 'none'}</code>",
-    ]
-    return "\n".join(lines)
+        f"📊 {sc('qualities found')} · <code>{', '.join(available) or 'none'}</code>",
+        f"✅ {sc('currently keeping')} · <code>{', '.join(current) or 'none'}</code>",
+    ])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -945,6 +1003,95 @@ async def _safe_edit(target, text: str, kb=None) -> bool:
     except Exception as e:
         logger.exception(f"[AI] edit: {type(e).__name__}: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCAN LIBRARY (reads MANY DB field names)
+# ═══════════════════════════════════════════════════════════════════════════
+async def _scan_library(client: Client, chat_id: int, status_msg_id: int,
+                       filter_slug: Optional[str] = None) -> Optional[SeriesCatalog]:
+    coll = _files_coll()
+    if coll is None:
+        return None
+
+    try:
+        total = await coll.estimated_document_count()
+    except Exception:
+        total = 0
+    if total == 0:
+        return SeriesCatalog()
+
+    catalog = SeriesCatalog()
+    processed = 0
+    last_edit = 0.0
+
+    try:
+        cursor = coll.find({})
+        async for doc in cursor:
+            processed += 1
+
+            # ⭐ Try EVERY possible DB field name for the filename
+            fname = (
+                doc.get("file_name")
+                or doc.get("filename")
+                or doc.get("title")
+                or doc.get("name")
+                or doc.get("file_title")
+                or doc.get("caption")
+                or doc.get("file_caption")
+                or doc.get("media_title")
+                or ""
+            )
+
+            # Fallback: if no field matched, search any string field
+            if not fname:
+                for k, v in doc.items():
+                    if k in ("_id", "chat_id", "message_id", "msg_id",
+                             "file_id", "file_unique_id", "file_size", "size"):
+                        continue
+                    if isinstance(v, str) and len(v) > 5:
+                        if any(ext in v.lower() for ext in
+                               (".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts")):
+                            fname = v
+                            break
+
+            if not fname:
+                continue
+
+            parsed = parse_filename(str(fname))
+
+            if filter_slug is not None:
+                slug_match = parsed.get("title_slug", "")
+                if (filter_slug not in slug_match
+                        and slug_match not in filter_slug):
+                    continue
+
+            catalog.add(parsed, doc)
+
+            now = time.time()
+            if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
+                last_edit = now
+                try:
+                    await client.edit_message_text(
+                        chat_id=chat_id, message_id=status_msg_id,
+                        text=_view_scanning(processed, total),
+                        parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+
+        try:
+            await client.edit_message_text(
+                chat_id=chat_id, message_id=status_msg_id,
+                text=_view_scanning(processed, total),
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+        return catalog
+    except Exception as e:
+        logger.exception(f"[AI] scan failed: {e}")
+        return catalog
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # /ai COMMAND
@@ -964,6 +1111,68 @@ async def cmd_ai(client: Client, message: Message):
                                   disable_web_page_preview=True)
     except Exception as e:
         logger.exception(f"[AI] /ai crashed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC /aidb COMMAND
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_message(
+    filters.command(["aidb", "ai_dbcheck", "aidbcheck"]) & filters.private,
+    group=-430,
+)
+async def cmd_aidb(client: Client, message: Message):
+    """Show what fields exist in media_files collection."""
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+
+    coll = _files_coll()
+    if coll is None:
+        return await message.reply_text("❌ ᴅʙ ɴᴏᴛ ᴀᴄᴄᴇꜱꜱɪʙʟᴇ.")
+
+    try:
+        total = await coll.estimated_document_count()
+        sample = await coll.find_one({})
+        if not sample:
+            return await message.reply_text("⚪ ᴅʙ ɪꜱ ᴇᴍᴘᴛʏ.")
+
+        sample.pop("_id", None)
+        fields = sorted(sample.keys())
+
+        # Try to find a Game of Thrones-like file
+        gof = None
+        for field in ("file_name", "filename", "title", "name",
+                      "caption", "file_caption", "media_title"):
+            try:
+                gof = await coll.find_one(
+                    {field: {"$regex": "Thrones", "$options": "i"}})
+                if gof: break
+            except Exception:
+                continue
+
+        lines = [
+            "🔍 <b>ᴅʙ ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"📁 ᴛᴏᴛᴀʟ ꜰɪʟᴇꜱ · <code>{_fmt_int(total)}</code>",
+            "",
+            "🔑 <b>ꜰɪᴇʟᴅꜱ ɪɴ ᴅʙ</b>",
+        ]
+        for f in fields[:40]:
+            lines.append(f"  • <code>{f}</code>")
+
+        if gof:
+            gof.pop("_id", None)
+            lines.append("")
+            lines.append("🎬 <b>ꜱᴀᴍᴘʟᴇ 'ᴛʜʀᴏɴᴇꜱ' ꜰɪʟᴇ</b>")
+            for k, v in list(gof.items())[:20]:
+                v_str = str(v)[:90]
+                lines.append(f"  <code>{k}</code> = {_esc(v_str)}")
+        else:
+            lines.append("")
+            lines.append("⚠️ ɴᴏ 'ᴛʜʀᴏɴᴇꜱ' ꜰɪʟᴇ ꜰᴏᴜɴᴅ ɪɴ ʀᴇɢᴜʟᴀʀ ꜰɪᴇʟᴅꜱ")
+
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.reply_text(f"❌ {_esc(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1007,92 +1216,6 @@ async def cb_toggle_auto(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
-async def _scan_library(client: Client, chat_id: int, status_msg_id: int,
-                       filter_slug: Optional[str] = None) -> Optional[SeriesCatalog]:
-    """
-    Scan media_files collection. Optionally filter to one series by slug.
-    Updates progress message during scan.
-    """
-    coll = _files_coll()
-    if coll is None:
-        return None
-
-    # Count total files (approximation)
-    try:
-        total = await coll.estimated_document_count()
-    except Exception:
-        total = 0
-
-    if total == 0:
-        return SeriesCatalog()
-
-    catalog = SeriesCatalog()
-    processed = 0
-    last_edit = 0.0
-    start = time.time()
-
-    try:
-        cursor = coll.find({})
-        async for doc in cursor:
-            processed += 1
-
-            # Get filename from any likely field
-            fname = (
-                doc.get("file_name")
-                or doc.get("filename")
-                or doc.get("title")
-                or ""
-            )
-            if not fname:
-                continue
-
-            parsed = parse_filename(str(fname))
-
-            # Skip if we're filtering to a specific series
-            if filter_slug is not None:
-                slug_match = parsed.get("title_slug", "")
-                # Fuzzy: filter_slug must be a substring OR title substring
-                if (filter_slug not in slug_match
-                        and slug_match not in filter_slug):
-                    continue
-
-            catalog.add(parsed, doc)
-
-            # Progress update — every ~2 seconds
-            now = time.time()
-            if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
-                last_edit = now
-                pct = (processed / total) * 100 if total else 0
-                text = _view_scanning_auto(processed, total)
-                try:
-                    await client.edit_message_text(
-                        chat_id=chat_id, message_id=status_msg_id,
-                        text=text, parse_mode=ParseMode.HTML)
-                except MessageNotModified:
-                    pass
-                except Exception:
-                    pass
-
-        # Final update
-        try:
-            pct = 100
-            text = _view_scanning_auto(processed, total)
-            await client.edit_message_text(
-                chat_id=chat_id, message_id=status_msg_id,
-                text=text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-        return catalog
-
-    except Exception as e:
-        logger.exception(f"[AI] scan failed: {e}")
-        return catalog
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # AUTO SCAN
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:auto$"), group=-430)
@@ -1103,15 +1226,12 @@ async def cb_auto(client: Client, q: CallbackQuery):
         _clear_session(q.from_user.id)
         await q.answer("🚀 ꜱᴄᴀɴɴɪɴɢ...")
 
-        # Show scanning view
         try:
             status = await q.message.edit_text(
-                _view_scanning_auto(0, 0),
-                parse_mode=ParseMode.HTML)
+                _view_scanning(0, 0), parse_mode=ParseMode.HTML)
         except Exception:
             status = q.message
 
-        # Scan
         catalog = await _scan_library(client, q.message.chat.id, status.id)
         if catalog is None:
             return await client.edit_message_text(
@@ -1119,11 +1239,9 @@ async def cb_auto(client: Client, q: CallbackQuery):
                 text="⚠️ ᴅᴀᴛᴀʙᴀꜱᴇ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ.",
                 parse_mode=ParseMode.HTML)
 
-        # Cache total series count for panel
         all_series = catalog.list_series()
         await _set_setting("total_series", len(all_series))
 
-        # Pick 3 series NOT completed yet
         pending: List[Dict[str, Any]] = []
         for s in all_series:
             if await _is_completed(s["title_slug"]):
@@ -1139,9 +1257,6 @@ async def cb_auto(client: Client, q: CallbackQuery):
                         f"✅ <b>{fb('ALL SERIES REVIEWED')}</b>",
                         DIV, "",
                         f"🎉 {sc('every series is marked complete')}",
-                        f"📌 {sc('nothing to review')}",
-                        "",
-                        f"🕒 <code>{_now_ist()}</code>",
                     ]),
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
@@ -1151,31 +1266,19 @@ async def cb_auto(client: Client, q: CallbackQuery):
             except Exception: pass
             return
 
-        # Shuffle and pick 3
         random.shuffle(pending)
         picked = pending[:SERIES_PER_AUTO]
 
-        # Store picked list in session
-        _new_session(
-            q.from_user.id, "auto_scan",
-            picked=[s["title_slug"] for s in picked],
-            index=0,
-        )
-
-        # Save catalog snapshot in memory (per-session)
+        _new_session(q.from_user.id, "auto_scan",
+                     picked=[s["title_slug"] for s in picked],
+                     index=0)
         sess = _SESSIONS[q.from_user.id]
-        sess["catalog_slugs"] = {
-            s["title_slug"]: s for s in all_series
-        }
-        # Store the full catalog data for later views
         sess["catalog_data"] = catalog.data
+        sess["current_total"] = len(picked)
 
-        # Show first series
         await _show_series_by_slug(
             client, q.message.chat.id, status.id,
-            picked[0]["title_slug"], 1, len(picked)
-        )
-
+            picked[0]["title_slug"], 1, len(picked))
     except Exception as e:
         logger.exception(f"[AI] cb_auto: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -1200,7 +1303,6 @@ async def cb_manual(client: Client, q: CallbackQuery):
                 f"📝 {sc('send the series name as next message')}",
                 "",
                 f"📌 {sc('example')} · <code>Game of Thrones</code>",
-                f"📌 {sc('or')} · <code>breaking bad</code>",
             ]),
             InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
@@ -1209,9 +1311,6 @@ async def cb_manual(client: Client, q: CallbackQuery):
         logger.exception(f"[AI] cb_manual: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TEXT INPUT — MANUAL NAME
-# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(
     filters.private & filters.text & ~filters.regex(r"^/"),
     group=-429,
@@ -1232,15 +1331,12 @@ async def ai_manual_input(client: Client, message: Message):
     _clear_session(message.from_user.id)
     slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
-    # Show scanning view
     try:
         status = await message.reply_text(
-            _view_scanning_manual(text),
-            parse_mode=ParseMode.HTML)
+            _view_scanning(0, 0), parse_mode=ParseMode.HTML)
     except Exception:
         return
 
-    # Scan
     catalog = await _scan_library(client, message.chat.id, status.id,
                                    filter_slug=slug)
 
@@ -1267,32 +1363,26 @@ async def ai_manual_input(client: Client, message: Message):
         except Exception: pass
         return
 
-    # Pick the first matched series
     slugs = list(catalog.data.keys())
     first_slug = slugs[0]
 
-    # Store in session
     _new_session(message.from_user.id, "manual_result",
                  slug=first_slug, all_slugs=slugs)
     sess = _SESSIONS[message.from_user.id]
     sess["catalog_data"] = catalog.data
 
-    # Show result
     await _show_series_by_slug(
         client, message.chat.id, status.id,
-        first_slug, 1, 1
-    )
+        first_slug, 1, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SHOW SERIES BY SLUG (shared by auto + manual)
+# SHOW SERIES
 # ═══════════════════════════════════════════════════════════════════════════
 async def _show_series_by_slug(client: Client, chat_id: int,
                                 msg_id: int, title_slug: str,
                                 index: int, total: int):
-    """Render one series result."""
     sess = None
-    # Find the session that holds catalog_data
     for uid, s in _SESSIONS.items():
         if "catalog_data" in s:
             sess = s
@@ -1319,16 +1409,11 @@ async def _show_series_by_slug(client: Client, chat_id: int,
         return
 
     prefs = await _get_prefs(title_slug)
-
-    # Build view
-    series_obj = {
-        "title": series.get("title"),
-        "seasons": series.get("seasons"),
-    }
-    text = _view_series_result(series_obj, prefs, index, total)
+    text = _view_series_result(
+        {"title": series.get("title"), "seasons": series.get("seasons")},
+        prefs, index, total)
     kb = kb_scan_result(title_slug, index, total)
 
-    # Store current context in session
     sess["current_slug"] = title_slug
     sess["current_index"] = index
     sess["current_total"] = total
@@ -1351,31 +1436,23 @@ async def cb_next(client: Client, q: CallbackQuery):
         sess = _get_session(q.from_user.id)
         if not sess:
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess.get("data") or {}
         picked = data.get("picked") or []
         idx = data.get("index", 0) + 1
-
         if idx >= len(picked):
             return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
-
-        # Update session index
         sess["data"]["index"] = idx
         next_slug = picked[idx]
-
         await q.answer()
         await _show_series_by_slug(
             client, q.message.chat.id, q.message.id,
-            next_slug, idx + 1, len(picked)
-        )
+            next_slug, idx + 1, len(picked))
     except Exception as e:
         logger.exception(f"[AI] next: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW FILES OF A SERIES
+# VIEW FILES
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
 async def cb_view_series(client: Client, q: CallbackQuery):
@@ -1384,36 +1461,27 @@ async def cb_view_series(client: Client, q: CallbackQuery):
         sess = _get_session(q.from_user.id)
         if not sess or not sess.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess["catalog_data"]
         series = data.get(slug)
         if not series:
             return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
-        # Build episode list — show per season → episode
-        # Simplest: flatten to a list of (season, episode) then show files for first
         seasons = series.get("seasons") or {}
         if not seasons:
             return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-
-        # Pick first season + first episode
         first_season = sorted(seasons.keys())[0]
         eps = seasons[first_season]
         first_ep = sorted([e for e in eps.keys() if e is not None])[0] \
             if any(e is not None for e in eps.keys()) else None
-
         if first_ep is None:
             return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-
         files = eps[first_ep]
+        # Score all files
+        for f in files:
+            f["_score"] = _compute_file_score(f)[0]
         prefs = await _get_prefs(slug)
-
-        text = _view_episode_files(
-            series.get("title"), first_season, first_ep,
-            files, prefs)
-
+        text = _view_episode_files(series.get("title"), first_season,
+                                    first_ep, files, prefs)
         kb = kb_episode_files(slug, first_season, first_ep, files)
-
         await _safe_edit(q, text, kb)
         await q.answer()
     except Exception as e:
@@ -1423,7 +1491,7 @@ async def cb_view_series(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# QUALITY PREFERENCE PICKER
+# QUALITY PREFS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
 async def cb_pref(client: Client, q: CallbackQuery):
@@ -1432,40 +1500,29 @@ async def cb_pref(client: Client, q: CallbackQuery):
         sess = _get_session(q.from_user.id)
         if not sess or not sess.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess["catalog_data"]
         series = data.get(slug)
         if not series:
             return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
-        # Discover all qualities present
         available: Set[str] = set()
         for snum, eps in (series.get("seasons") or {}).items():
             for ep, files in eps.items():
                 for f in files:
                     q_ = f.get("quality")
                     if q_: available.add(q_)
-
         avail_list = sorted(available,
                             key=lambda x: QUALITY_RANK.get(x, 0),
                             reverse=True)
-
         if not avail_list:
-            return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ ꜰᴏᴜɴᴅ", show_alert=True)
-
+            return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
         current = await _get_prefs(slug)
-        # Init session working copy
         sess["pref_working"] = list(current)
-
-        text = _view_quality_picker(series.get("title"),
-                                     avail_list, current)
+        text = _view_quality_picker(series.get("title"), avail_list, current)
         kb = kb_quality_picker(slug, avail_list, current)
         await _safe_edit(q, text, kb)
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] pref: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
 
 
 @Client.on_callback_query(
@@ -1474,22 +1531,17 @@ async def cb_pref_toggle(client: Client, q: CallbackQuery):
     try:
         slug = q.matches[0].group(1)
         quality = q.matches[0].group(2)
-
         sess = _get_session(q.from_user.id)
         if not sess:
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         working = sess.get("pref_working") or []
         if quality in working:
             working.remove(quality)
         else:
             working.append(quality)
         sess["pref_working"] = working
-
-        # Re-render
         data = sess.get("catalog_data") or {}
         series = data.get(slug) or {}
-
         available: Set[str] = set()
         for snum, eps in (series.get("seasons") or {}).items():
             for ep, files in eps.items():
@@ -1499,13 +1551,12 @@ async def cb_pref_toggle(client: Client, q: CallbackQuery):
         avail_list = sorted(available,
                             key=lambda x: QUALITY_RANK.get(x, 0),
                             reverse=True)
-
         text = _view_quality_picker(series.get("title"), avail_list, working)
         kb = kb_quality_picker(slug, avail_list, working)
         await _safe_edit(q, text, kb)
         await q.answer("✅" if quality in working else "⬜")
     except Exception as e:
-        logger.exception(f"[AI] pref toggle: {e}")
+        logger.exception(f"[AI] pref_tog: {e}")
 
 
 @Client.on_callback_query(
@@ -1516,21 +1567,16 @@ async def cb_pref_save(client: Client, q: CallbackQuery):
         sess = _get_session(q.from_user.id)
         if not sess:
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         working = sess.get("pref_working") or []
         data = sess.get("catalog_data") or {}
         series = data.get(slug) or {}
         title = series.get("title") or slug
-
         ok = await _set_prefs(slug, title, working)
         await q.answer("✅ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
-
-        # Return to series view
         if not ok: return
-        prefs = working
         text = _view_series_result(
             {"title": title, "seasons": series.get("seasons")},
-            prefs,
+            working,
             sess.get("current_index", 1),
             sess.get("current_total", 1))
         kb = kb_scan_result(slug,
@@ -1538,7 +1584,33 @@ async def cb_pref_save(client: Client, q: CallbackQuery):
                             sess.get("current_total", 1))
         await _safe_edit(q, text, kb)
     except Exception as e:
-        logger.exception(f"[AI] pref save: {e}")
+        logger.exception(f"[AI] pref_save: {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ai:prefs$"), group=-430)
+async def cb_prefs_list(client: Client, q: CallbackQuery):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    try:
+        items = await _list_prefs()
+        lines = [
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
+            DIV, "",
+        ]
+        if not items:
+            lines.append("⚪ ɴᴏ ᴘʀᴇꜰᴇʀᴇɴᴄᴇꜱ ꜱᴇᴛ ʏᴇᴛ.")
+        else:
+            for it in items[:30]:
+                title = it.get("title") or "?"
+                qs = it.get("keep_qualities") or []
+                lines.append(f"🎬 <b>{_esc(title)}</b>")
+                lines.append(f"   ✅ <code>{', '.join(qs)}</code>")
+                lines.append("")
+        await _safe_edit(q, "\n".join(lines), kb_back("ai:main"))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] prefs_list: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1552,19 +1624,15 @@ async def cb_complete(client: Client, q: CallbackQuery):
         sess = _get_session(q.from_user.id)
         if not sess:
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess.get("catalog_data") or {}
         series = data.get(slug)
         if not series:
             return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
         total_files = series.get("file_count", 0)
         title = series.get("title") or slug
-
         ok = await _mark_completed(title, slug, total_files)
         if not ok:
             return await q.answer("❌ ꜰᴀɪʟᴇᴅ", show_alert=True)
-
         await q.answer("✅ ᴍᴀʀᴋᴇᴅ ᴄᴏᴍᴘʟᴇᴛᴇ")
         await _safe_edit(q,
             "\n".join([
@@ -1574,10 +1642,6 @@ async def cb_complete(client: Client, q: CallbackQuery):
                 f"🎬 <b>{_esc(title)}</b>",
                 f"📁 {sc('total files')} · <code>{_fmt_int(total_files)}</code>",
                 f"📅 {sc('marked')} · <code>{_now_ist()}</code>",
-                "",
-                DIV2, "",
-                f"📌 {sc('this series will not appear in future auto scans')}",
-                f"📌 {sc('still visible in manual search')}",
             ]),
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("⏭️ NEXT SERIES",
@@ -1590,7 +1654,7 @@ async def cb_complete(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ALL SERIES LIST
+# ALL SERIES
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:all$"), group=-430)
 async def cb_all(client: Client, q: CallbackQuery):
@@ -1599,21 +1663,16 @@ async def cb_all(client: Client, q: CallbackQuery):
     try:
         _clear_session(q.from_user.id)
         await q.answer("🔍 ʟᴏᴀᴅɪɴɢ...")
-
         try:
             status = await q.message.edit_text(
-                _view_scanning_auto(0, 0),
-                parse_mode=ParseMode.HTML)
+                _view_scanning(0, 0), parse_mode=ParseMode.HTML)
         except Exception:
             status = q.message
-
         catalog = await _scan_library(client, q.message.chat.id, status.id)
         if catalog is None:
             return
-
         all_series = catalog.list_series()
         await _set_setting("total_series", len(all_series))
-
         if not all_series:
             try:
                 await client.edit_message_text(
@@ -1622,14 +1681,9 @@ async def cb_all(client: Client, q: CallbackQuery):
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
-
-        # Store catalog data for later
         sess = _SESSIONS.setdefault(q.from_user.id, {})
         sess["catalog_data"] = catalog.data
-
-        # Build list
         completed_slugs = {s.get("title_slug") for s in await _list_completed()}
-
         lines = [
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"📚 <b>{fb('ALL SERIES')}</b>",
@@ -1643,13 +1697,11 @@ async def cb_all(client: Client, q: CallbackQuery):
             mark = "✅" if s["title_slug"] in completed_slugs else "🎬"
             lines.append(f"{mark} <b>{_esc(s['title'])}</b> · "
                          f"<code>{s['file_count']}</code> ꜰɪʟᴇꜱ")
-
-        kb = kb_series_list(all_series)
-
         try:
             await client.edit_message_text(
                 chat_id=q.message.chat.id, message_id=status.id,
-                text="\n".join(lines), reply_markup=kb,
+                text="\n".join(lines),
+                reply_markup=kb_series_list(all_series),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True)
         except Exception as e:
@@ -1675,8 +1727,6 @@ async def cb_completed(client: Client, q: CallbackQuery):
         if not items:
             lines.append("⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ᴍᴀʀᴋᴇᴅ ᴄᴏᴍᴘʟᴇᴛᴇ ʏᴇᴛ.")
         else:
-            lines.append(f"📊 <code>{len(items)}</code> ꜱᴇʀɪᴇꜱ")
-            lines.append("")
             for it in items[:30]:
                 title = it.get("title") or "?"
                 ts = it.get("completed_at", 0)
@@ -1687,7 +1737,6 @@ async def cb_completed(client: Client, q: CallbackQuery):
                 lines.append(f"✅ <b>{_esc(title)}</b>")
                 lines.append(f"   📅 <code>{d}</code>")
                 lines.append("")
-
         rows = []
         for it in items[:10]:
             rows.append([InlineKeyboardButton(
@@ -1713,435 +1762,31 @@ async def cb_unmark(client: Client, q: CallbackQuery):
     except Exception as e:
         logger.exception(f"[AI] unmark: {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — EXTENDED PARSER (codec, source, audio, size)
-# ═══════════════════════════════════════════════════════════════════════════
-CODEC_PATTERNS = [
-    (re.compile(r"\bav1\b", re.I), "AV1"),
-    (re.compile(r"\bx265\b|\bh\.?265\b|\bhevc\b", re.I), "X265"),
-    (re.compile(r"\bx264\b|\bh\.?264\b|\bavc\b", re.I), "X264"),
-    (re.compile(r"\bmpeg2?\b|\bxvid\b|\bdivx\b", re.I), "MPEG"),
-]
-
-SOURCE_PATTERNS = [
-    (re.compile(r"\bremux\b", re.I), "REMUX"),
-    (re.compile(r"\bbluray\b|\bblu-ray\b|\bbdrip\b|\bbrrip\b|\bbdremux\b", re.I), "BLURAY"),
-    (re.compile(r"\bweb-?dl\b|\bwebdl\b|\bamzn\b|\bdsnp\b|\bnf\b|\batvp\b|\bitunes\b|\bpcok\b|\bip\b", re.I), "WEBDL"),
-    (re.compile(r"\bweb-?rip\b|\bwebrip\b|\bweb\b", re.I), "WEBRIP"),
-    (re.compile(r"\bhdtv\b|\bpdtv\b", re.I), "HDTV"),
-    (re.compile(r"\bdvdrip\b|\bdvdscr\b|\bdvd\b|\bhdrip\b", re.I), "DVDRIP"),
-    (re.compile(r"\bhdcam\b|\bcam\b", re.I), "CAM"),
-    (re.compile(r"\bts\b|\btelesync\b|\btc\b", re.I), "TS"),
-    (re.compile(r"\bscreener\b|\bscr\b|\br5\b", re.I), "SCR"),
-]
-
-AUDIO_PATTERNS = [
-    (re.compile(r"\batmos\b", re.I), "ATMOS"),
-    (re.compile(r"\btruehd\b|\bthd\b", re.I), "TRUEHD"),
-    (re.compile(r"\bdts-?hd[\s._-]?ma\b|\bdts[\s._-]?hd\b", re.I), "DTS-HD"),
-    (re.compile(r"\bdts-?x\b|\bdtsx\b", re.I), "DTSX"),
-    (re.compile(r"\bdts\b", re.I), "DTS"),
-    (re.compile(r"\bddp[\s._-]?7\.1\b|\bdd\+[\s._-]?7\.1\b|\beac3[\s._-]?7\.1\b", re.I), "DDP7.1"),
-    (re.compile(r"\bddp[\s._-]?5\.1\b|\bdd\+[\s._-]?5\.1\b|\beac3\b|\bdd5\.1\b", re.I), "DDP5.1"),
-    (re.compile(r"\bddp\b|\bdd\+\b", re.I), "DDP"),
-    (re.compile(r"\bac3\b|\bdd\b", re.I), "AC3"),
-    (re.compile(r"\baac\b", re.I), "AAC"),
-    (re.compile(r"\bflac\b", re.I), "FLAC"),
-    (re.compile(r"\bopus\b", re.I), "OPUS"),
-    (re.compile(r"\bmp3\b", re.I), "MP3"),
-]
-
-# Size extraction from filename (e.g. "2.4GB", "550MB", "1.1 GiB")
-SIZE_REGEX = re.compile(
-    r"\b(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b",
-    re.IGNORECASE
-)
-
-# Multi-language markers
-MULTI_AUDIO_MARKERS = [
-    re.compile(r"\bmulti\b", re.I),
-    re.compile(r"\bdual[\s._-]?audio\b", re.I),
-    re.compile(r"\bdubbed\b", re.I),
-]
-
-
-def _parse_size_from_name(name: str) -> int:
-    """Extract size in bytes from filename, 0 if not found."""
-    m = SIZE_REGEX.search(name)
-    if not m:
-        return 0
-    try:
-        val = float(m.group(1))
-        unit = m.group(2).upper()
-        if unit in ("GB", "GIB"):
-            return int(val * 1024 * 1024 * 1024)
-        if unit in ("MB", "MIB"):
-            return int(val * 1024 * 1024)
-    except Exception:
-        pass
-    return 0
-
-
-def _detect_from_patterns(name: str, patterns) -> Optional[str]:
-    for pat, label in patterns:
-        if pat.search(name):
-            return label
-    return None
-
-
-def _extended_parse(filename: str) -> Dict[str, Any]:
-    """Full parse: base + codec + source + audio + size + multi."""
-    base = parse_filename(filename)
-
-    name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    name_lower = name.lower()
-
-    base["codec"] = _detect_from_patterns(name_lower, CODEC_PATTERNS)
-    base["source"] = _detect_from_patterns(name_lower, SOURCE_PATTERNS)
-    base["audio_codec"] = _detect_from_patterns(name_lower, AUDIO_PATTERNS)
-
-    # If quality == "CAM" or "TS", also set source to match
-    if base.get("quality") in ("CAM", "HDCAM"):
-        base["source"] = base.get("source") or "CAM"
-    if base.get("quality") == "TS":
-        base["source"] = base.get("source") or "TS"
-
-    # Multi-audio marker
-    base["is_multi"] = any(p.search(name_lower)
-                            for p in MULTI_AUDIO_MARKERS)
-
-    # Size from filename if present
-    size_from_name = _parse_size_from_name(name)
-    base["size_from_name"] = size_from_name
-
-    return base
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION — FILE QUALITY SCORING ENGINE
+# SMART DELETE
 # ═══════════════════════════════════════════════════════════════════════════
-RESOLUTION_SCORE = {
-    "4320P": 100, "8K": 100,
-    "2160P": 90, "4K": 90, "UHD": 90,
-    "1440P": 80, "2K": 80,
-    "1080P": 70, "FULLHD": 70, "FHD": 70,
-    "720P": 60, "HD": 60,
-    "576P": 50,
-    "480P": 40, "SD": 40,
-    "360P": 30,
-    "240P": 20,
-    "CAM": 5, "HDCAM": 5, "TS": 3, "TELESYNC": 3,
-    "UNKNOWN": 25,   # safe middle — never delete these automatically
-}
-
-CODEC_BONUS = {
-    "AV1": 10,
-    "X265": 8,      # HEVC — better compression than x264
-    "X264": 4,
-    "MPEG": 0,
-    None: 2,        # unknown codec → neutral
-}
-
-SOURCE_BONUS = {
-    "REMUX": 15,
-    "BLURAY": 12,
-    "WEBDL": 10,
-    "WEBRIP": 7,
-    "HDTV": 4,
-    "DVDRIP": 3,
-    "SCR": 2,
-    "CAM": 0,
-    "TS": 0,
-    None: 2,        # unknown source → neutral
-}
-
-AUDIO_BONUS = {
-    "ATMOS": 8,
-    "TRUEHD": 7,
-    "DTS-HD": 6,
-    "DTSX": 6,
-    "DTS": 5,
-    "DDP7.1": 5,
-    "DDP5.1": 4,
-    "DDP": 3,
-    "AC3": 2,
-    "AAC": 2,
-    "FLAC": 5,
-    "OPUS": 2,
-    "MP3": 1,
-    None: 1,        # unknown audio → neutral
-}
-
-# How important each dimension is (weight)
-WEIGHT_RESOLUTION = 100   # ← primary factor
-WEIGHT_CODEC = 10
-WEIGHT_SOURCE = 5
-WEIGHT_AUDIO = 3
-WEIGHT_LANGS = 2          # per language
-WEIGHT_SIZE_TINY = 1      # per 500 MB (small boost)
-
-
-def _compute_file_score(f: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
-    """
-    Compute a quality score for a file record.
-    Higher = better. Never returns 0 for valid files.
-    Returns (total_score, breakdown_dict).
-    """
-    resolution = (f.get("quality") or "UNKNOWN").upper()
-    codec = (f.get("codec") or "").upper() or None
-    source = (f.get("source") or "").upper() or None
-    audio = (f.get("audio_codec") or "").upper() or None
-    languages = f.get("languages") or []
-    size_bytes = f.get("size") or f.get("size_from_name") or 0
-
-    r_score = RESOLUTION_SCORE.get(resolution, 25)
-    c_bonus = CODEC_BONUS.get(codec, 2)
-    s_bonus = SOURCE_BONUS.get(source, 2)
-    a_bonus = AUDIO_BONUS.get(audio, 1)
-    l_bonus = len(languages) * WEIGHT_LANGS
-
-    # Size bonus (log-ish — avoid over-weighting huge files)
-    try:
-        size_mb = max(0, size_bytes) / (1024 * 1024)
-        size_bonus = min(20.0, size_mb / 500.0)  # max +20 for 10 GB+
-    except Exception:
-        size_bonus = 0.0
-
-    total = (
-        r_score * (WEIGHT_RESOLUTION / 100)      # 100 → ×1
-        + c_bonus * (WEIGHT_CODEC / 10)          # 10 → ×1
-        + s_bonus * (WEIGHT_SOURCE / 5)          # 5 → ×1
-        + a_bonus * (WEIGHT_AUDIO / 3)           # 3 → ×1
-        + l_bonus
-        + size_bonus
-    )
-
-    breakdown = {
-        "resolution": r_score,
-        "codec": c_bonus,
-        "source": s_bonus,
-        "audio": a_bonus,
-        "languages": l_bonus,
-        "size": round(size_bonus, 1),
-        "total": round(total, 1),
-    }
-    return round(total, 1), breakdown
-
-
-def _pick_best_file(files: List[Dict[str, Any]]) -> Tuple[Optional[Dict], List[Dict]]:
-    """
-    Given files for ONE episode, return (best_file, others_removable).
-    Safety: if all files are missing critical info (quality UNKNOWN),
-    return (None, []) — never suggest deletion of unclear files.
-    """
-    if not files:
-        return None, []
-
-    # Score every file
-    scored: List[Tuple[float, Dict, Dict]] = []
-    for f in files:
-        s, br = _compute_file_score(f)
-        scored.append((s, f, br))
-
-    # If ALL have UNKNOWN quality → don't touch
-    if all((f.get("quality") or "UNKNOWN").upper() == "UNKNOWN"
-           for _, f, _ in scored):
-        return None, []
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    best = scored[0][1]
-    best["_score"] = scored[0][0]
-    best["_breakdown"] = scored[0][2]
-
-    others = []
-    for s, f, br in scored[1:]:
-        f["_score"] = s
-        f["_breakdown"] = br
-        others.append(f)
-
-    return best, others
-
-
-def _duplicates_in_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Return files that are true duplicates:
-    same quality + same language set → keep the largest, delete rest.
-    Never touch UNKNOWN quality.
-    """
-    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for f in files:
-        q = (f.get("quality") or "UNKNOWN").upper()
-        if q == "UNKNOWN":
-            continue  # never consider duplicates of unknown
-        key = f"{q}|{','.join(sorted(f.get('languages', [])))}"
-        groups[key].append(f)
-
-    dupes = []
-    for key, grp in groups.items():
-        if len(grp) <= 1: continue
-        # Sort by score (best first)
-        scored = sorted(grp, key=lambda x: _compute_file_score(x)[0], reverse=True)
-        # Keep best, mark rest
-        for f in scored[1:]:
-            dupes.append(f)
-    return dupes
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — UPDATE CATALOG to include extended parse
-# ═══════════════════════════════════════════════════════════════════════════
-def _add_to_catalog(catalog: "SeriesCatalog", parsed: Dict[str, Any],
-                    file_record: Dict[str, Any]) -> None:
-    """Same as catalog.add() but includes codec/source/audio/size."""
-    if not parsed.get("is_series"): return
-    if parsed.get("season") is None: return
-
-    slug = parsed["title_slug"]
-    if not slug: return
-
-    if slug not in catalog.data:
-        catalog.data[slug] = {
-            "title": parsed["title"],
-            "seasons": defaultdict(lambda: defaultdict(list)),
-            "file_count": 0,
-        }
-
-    season = parsed["season"]
-    episode = parsed.get("episode")
-
-    size_bytes = (file_record.get("file_size")
-                   or file_record.get("size")
-                   or parsed.get("size_from_name")
-                   or 0)
-
-    entry = {
-        "file_id": (file_record.get("file_id")
-                    or file_record.get("file_unique_id") or ""),
-        "file_name": parsed.get("raw", ""),
-        "quality": (parsed.get("quality") or "UNKNOWN").upper(),
-        "quality_rank": QUALITY_RANK.get(parsed.get("quality") or "", 0),
-        "codec": (parsed.get("codec") or "").upper() or None,
-        "source": (parsed.get("source") or "").upper() or None,
-        "audio_codec": (parsed.get("audio_codec") or "").upper() or None,
-        "is_multi": parsed.get("is_multi", False),
-        "languages": parsed.get("languages", []),
-        "size": size_bytes,
-        "chat_id": file_record.get("chat_id"),
-        "message_id": file_record.get("message_id") or file_record.get("msg_id"),
-        "raw": file_record,
-    }
-
-    catalog.data[slug]["seasons"][season][episode].append(entry)
-    catalog.data[slug]["file_count"] += 1
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# UPDATE _scan_library to use _extended_parse + _add_to_catalog
-# ═══════════════════════════════════════════════════════════════════════════
-async def _scan_library(client: Client, chat_id: int, status_msg_id: int,
-                       filter_slug: Optional[str] = None) -> Optional[SeriesCatalog]:
-    coll = _files_coll()
-    if coll is None:
-        return None
-
-    try:
-        total = await coll.estimated_document_count()
-    except Exception:
-        total = 0
-
-    if total == 0:
-        return SeriesCatalog()
-
-    catalog = SeriesCatalog()
-    processed = 0
-    last_edit = 0.0
-
-    try:
-        cursor = coll.find({})
-        async for doc in cursor:
-            processed += 1
-
-            fname = (
-                doc.get("file_name")
-                or doc.get("filename")
-                or doc.get("title")
-                or ""
-            )
-            if not fname:
-                continue
-
-            # Extended parse (with codec, source, audio, size)
-            parsed = _extended_parse(str(fname))
-
-            if filter_slug is not None:
-                slug_match = parsed.get("title_slug", "")
-                if (filter_slug not in slug_match
-                        and slug_match not in filter_slug):
-                    continue
-
-            _add_to_catalog(catalog, parsed, doc)
-
-            now = time.time()
-            if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
-                last_edit = now
-                text = _view_scanning_auto(processed, total)
-                try:
-                    await client.edit_message_text(
-                        chat_id=chat_id, message_id=status_msg_id,
-                        text=text, parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-
-        try:
-            await client.edit_message_text(
-                chat_id=chat_id, message_id=status_msg_id,
-                text=_view_scanning_auto(processed, total),
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-        return catalog
-    except Exception as e:
-        logger.exception(f"[AI] scan failed: {e}")
-        return catalog
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — SMART DELETE FLOW
-# ═══════════════════════════════════════════════════════════════════════════
-async def _do_delete_file(file_id: str, chat_id: Optional[int] = None,
-                          message_id: Optional[int] = None) -> bool:
-    """Delete only the DB record. Telegram message stays."""
-    return await _delete_file_record(file_id)
-
-
 @Client.on_callback_query(
     filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\d+)$"),
     group=-430)
 async def cb_del_pick(client: Client, q: CallbackQuery):
-    """Show confirmation for a specific file."""
     try:
         slug = q.matches[0].group(1)
         season = int(q.matches[0].group(2))
         episode_raw = int(q.matches[0].group(3))
         idx = int(q.matches[0].group(4))
         episode = episode_raw if episode_raw > 0 else None
-
         sess = _get_session(q.from_user.id)
         if not sess or not sess.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess["catalog_data"]
         series = data.get(slug)
         if not series:
             return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
         eps = (series.get("seasons") or {}).get(season, {})
         files = eps.get(episode, [])
         if idx < 0 or idx >= len(files):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ꜰɪʟᴇ", show_alert=True)
-
         f = files[idx]
         text = _view_confirm_delete(series.get("title"), season, episode, f)
         kb = kb_confirm_delete(slug, season, episode, idx)
@@ -2149,218 +1794,70 @@ async def cb_del_pick(client: Client, q: CallbackQuery):
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] del_pick: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
 
 
 @Client.on_callback_query(
     filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\d+)$"),
     group=-430)
 async def cb_del_go(client: Client, q: CallbackQuery):
-    """Actually delete the file."""
     try:
         slug = q.matches[0].group(1)
         season = int(q.matches[0].group(2))
         episode_raw = int(q.matches[0].group(3))
         idx = int(q.matches[0].group(4))
         episode = episode_raw if episode_raw > 0 else None
-
         sess = _get_session(q.from_user.id)
         if not sess or not sess.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         data = sess["catalog_data"]
         series = data.get(slug)
         if not series:
             return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
         eps = (series.get("seasons") or {}).get(season, {})
         files = eps.get(episode, [])
         if idx < 0 or idx >= len(files):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ꜰɪʟᴇ", show_alert=True)
-
         f = files[idx]
         file_id = f.get("file_id") or ""
         if not file_id:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
-
-        ok = await _do_delete_file(file_id)
+        ok = await _delete_file_record(file_id)
         if not ok:
             return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
-
-        # Remove from session catalog
         files.pop(idx)
         sess["catalog_data"][slug]["seasons"][season][episode] = files
-
         await q.answer("🗑️ ᴅᴇʟᴇᴛᴇᴅ")
-
-        # Re-render episode view
-        remaining = files
+        for f2 in files:
+            f2["_score"] = _compute_file_score(f2)[0]
         prefs = await _get_prefs(slug)
-        text = _view_episode_files(series.get("title"), season, episode,
-                                    remaining, prefs)
-        kb = kb_episode_files(slug, season, episode, remaining)
+        text = _view_episode_files(series.get("title"), season,
+                                    episode, files, prefs)
+        kb = kb_episode_files(slug, season, episode, files)
         await _safe_edit(q, text, kb)
     except Exception as e:
         logger.exception(f"[AI] del_go: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION — ENHANCED EPISODE VIEW (show best + deletable)
-# ═══════════════════════════════════════════════════════════════════════════
-def _view_episode_files_smart(title: str, season: int, episode: Optional[int],
-                              files: List[Dict[str, Any]],
-                              prefs: List[str]) -> str:
-    ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
-    best, others = _pick_best_file(files)
-
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎬 <b>{_esc(title)}</b> · <code>{ep_label}</code>",
-        DIV, "",
-        f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ",
-        "",
-    ]
-
-    if best:
-        br = best.get("_breakdown") or {}
-        lines.append(f"⭐ <b>{sc('best file')}</b>")
-        lines.append(
-            f"<code>{best.get('quality')} · "
-            f"{best.get('codec') or '?'} · "
-            f"{best.get('source') or '?'}</code>")
-        langs = "+".join(best.get("languages", [])) or "?"
-        lines.append(f"🌍 <code>{langs}</code>")
-        lines.append(f"📦 {_fmt_size(best.get('size', 0))}")
-        lines.append(f"🎯 <code>{best.get('_score', 0)}</code>")
-        lines.append("")
-        lines.append(DIV2)
-        lines.append("")
-
-    for i, f in enumerate(files[:10]):
-        q_ = f.get("quality", "?")
-        langs = "+".join(f.get("languages", [])) or "?"
-        size = _fmt_size(f.get("size", 0))
-        codec = f.get("codec") or "?"
-        source = f.get("source") or "?"
-        score = f.get("_score", 0)
-
-        tag = ""
-        if f is best:
-            tag = " · ⭐ BEST"
-        elif prefs and q_ not in prefs:
-            tag = " · 🗑️ ʀᴇᴍᴏᴠᴇ"
-        elif q_ == "UNKNOWN":
-            tag = " · ⚠️ ᴜɴᴋɴᴏᴡɴ"
-
-        lines.append(
-            f"<b>{i+1}.</b> <code>{q_}</code> · "
-            f"<code>{codec}</code> · <code>{source}</code>{tag}")
-        lines.append(f"   🌍 <code>{langs}</code> · 📦 {size}")
-
-    lines.append("")
-    lines.append(DIV2)
-    lines.append(f"📌 {sc('tap a file to delete it')}")
-    lines.append(f"📌 {sc('best file has the highest score')}")
-    return "\n".join(lines)
-
-
-@Client.on_callback_query(
-    filters.regex(r"^ai:view_ep:([a-z0-9_]+):(\d+):(\d+)$"), group=-430)
-async def cb_view_episode(client: Client, q: CallbackQuery):
-    """View one specific episode."""
-    try:
-        slug = q.matches[0].group(1)
-        season = int(q.matches[0].group(2))
-        episode_raw = int(q.matches[0].group(3))
-        episode = episode_raw if episode_raw > 0 else None
-
-        sess = _get_session(q.from_user.id)
-        if not sess or not sess.get("catalog_data"):
-            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
-        series = sess["catalog_data"].get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
-        eps = (series.get("seasons") or {}).get(season, {})
-        files = eps.get(episode, [])
-        if not files:
-            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
-
-        prefs = await _get_prefs(slug)
-        text = _view_episode_files_smart(series.get("title"), season,
-                                          episode, files, prefs)
-        kb = kb_episode_files(slug, season, episode, files)
-        await _safe_edit(q, text, kb)
-        await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] view_ep: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — QUALITY PREFS LIST VIEW
-# ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^ai:prefs$"), group=-430)
-async def cb_prefs_list(client: Client, q: CallbackQuery):
-    if not _is_admin(q.from_user.id):
-        return await q.answer("⛔", show_alert=True)
-    try:
-        items = await _list_prefs()
-        lines = [
-            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
-            DIV, "",
-        ]
-        if not items:
-            lines.append("⚪ ɴᴏ ᴘʀᴇꜰᴇʀᴇɴᴄᴇꜱ ꜱᴇᴛ ʏᴇᴛ.")
-            lines.append("")
-            lines.append("📌 ꜱᴄᴀɴ ᴀ ꜱᴇʀɪᴇꜱ ᴛᴏ ꜱᴇᴛ ᴘʀᴇꜰᴇʀᴇɴᴄᴇꜱ.")
-        else:
-            lines.append(f"📊 <code>{len(items)}</code> ꜱᴇʀɪᴇꜱ ᴄᴏɴꜰɪɢᴜʀᴇᴅ")
-            lines.append("")
-            for it in items[:30]:
-                title = it.get("title") or "?"
-                qs = it.get("keep_qualities") or []
-                lines.append(f"🎬 <b>{_esc(title)}</b>")
-                lines.append(f"   ✅ <code>{', '.join(qs)}</code>")
-                lines.append("")
-
-        await _safe_edit(q, "\n".join(lines), kb_back("ai:main"))
-        await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] prefs_list: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — DAILY REPORT LOOP
+# DAILY REPORT
 # ═══════════════════════════════════════════════════════════════════════════
 _LAST_REPORT_DATE: Optional[str] = None
 
 
 async def _daily_report_loop(client: Client):
-    """Send daily report at 9 AM IST if auto mode is ON."""
     global _LAST_REPORT_DATE
     await asyncio.sleep(120)
-
     while True:
         try:
             now = datetime.now(IST)
             today_key = now.strftime("%Y-%m-%d")
-
             auto_on = await _get_setting("auto_mode", True)
-
             if (auto_on
                     and now.hour == DAILY_REPORT_HOUR
                     and now.minute < 5
                     and _LAST_REPORT_DATE != today_key):
                 _LAST_REPORT_DATE = today_key
                 await _send_daily_report(client)
-
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -2369,11 +1866,9 @@ async def _daily_report_loop(client: Client):
 
 
 async def _send_daily_report(client: Client):
-    """Send the daily report to all admins."""
     try:
         completed_count = await _count_completed()
         total_series = await _get_setting("total_series", 0)
-
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"🎛️ <b>{fb('DAILY AI REPORT')}</b>",
@@ -2387,16 +1882,13 @@ async def _send_daily_report(client: Client):
             "",
             DIV2, "",
             f"📌 {sc('tap auto to review 3 series today')}",
-            f"📌 {sc('or manual to search one by name')}",
         ])
-
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🚀 AUTO SCAN", callback_data="ai:auto"),
              InlineKeyboardButton("✍️ MANUAL", callback_data="ai:manual")],
             [InlineKeyboardButton("🎛️ OPEN PANEL", callback_data="ai:main"),
              InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
         ])
-
         for admin_id in ADMINS:
             try:
                 aid = int(admin_id) if str(admin_id).lstrip("-").isdigit() else None
@@ -2436,7 +1928,7 @@ async def cb_last_report(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION — CLEANUP LOOP
+# CLEANUP + BOOT
 # ═══════════════════════════════════════════════════════════════════════════
 async def _cleanup_loop():
     while True:
@@ -2449,9 +1941,6 @@ async def _cleanup_loop():
             pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION — BOOT
-# ═══════════════════════════════════════════════════════════════════════════
 _BOOTED = False
 
 
@@ -2479,25 +1968,11 @@ logger.info("║                                                                
 logger.info("║  Commands:                                                     ║")
 logger.info("║    /ai          — open AI panel                                ║")
 logger.info("║    /librarian   — alias                                        ║")
+logger.info("║    /aidb        — DB diagnostic (shows fields)                 ║")
 logger.info("║                                                                ║")
-logger.info("║  Features:                                                     ║")
-logger.info("║    🚀 AUTO scan — analyzes 3 series from DB                    ║")
-logger.info("║    ✍️ MANUAL   — search one series by name                     ║")
-logger.info("║    🎯 Quality prefs — per-series keep list                     ║")
-logger.info("║    ⭐ Best file scoring — resolution + codec + source + audio  ║")
-logger.info("║    🗑️ Safe delete — one file at a time, 2-step confirm         ║")
-logger.info("║    ✅ Mark complete — hides from future auto scans             ║")
-logger.info("║                                                                ║")
-logger.info("║  Scoring engine considers:                                     ║")
-logger.info("║    · Resolution (4K > 1080p > 720p > 480p)                     ║")
-logger.info("║    · Codec (AV1 > x265/HEVC > x264)                            ║")
-logger.info("║    · Source (REMUX > BluRay > WEB-DL > WEBRip > HDTV)          ║")
-logger.info("║    · Audio (Atmos > TrueHD > DTS-HD > DDP > AC3 > AAC)         ║")
-logger.info("║    · Languages (each adds bonus)                               ║")
-logger.info("║    · Size (larger = usually better)                            ║")
-logger.info("║                                                                ║")
-logger.info("║  Safety:                                                       ║")
-logger.info("║    · UNKNOWN files never auto-flagged                          ║")
-logger.info("║    · Never deletes without your tap                            ║")
-logger.info("║    · Never batch deletes                                       ║")
+logger.info("║  Fixes:                                                        ║")
+logger.info("║    · Strips @TheTvShare, [YTS.MX], -RARBG, etc.                ║")
+logger.info("║    · Reads 8+ DB field names for filenames                     ║")
+logger.info("║    · Fallback: scans any string field with video ext           ║")
+logger.info("║    · Smart file scoring (resolution+codec+source+audio)        ║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
