@@ -1,15 +1,8 @@
 # plugins/ai_librarian.py
-"""
-🎛️ DOWNTOWN VILLA — AI LIBRARIAN
-
-Scans media_files DB, groups series by season/episode/quality,
-scores files, suggests duplicates, tracks completed series.
-"""
-# ═══════════════════════════════════════════════════════════════════════════
-# IMPORTS
-# ═══════════════════════════════════════════════════════════════════════════
+"""🎛️ AI LIBRARIAN — v2 (sharded + TMDB suggest)"""
 import asyncio
 import logging
+import os
 import random
 import re
 import secrets
@@ -20,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -35,14 +28,11 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
 SESSION_TTL = 900
 DAILY_REPORT_HOUR = 9
-DAILY_REPORT_MINUTE = 0
 SERIES_PER_AUTO = 3
 PROGRESS_UPDATE_INTERVAL = 2.0
 
@@ -50,20 +40,13 @@ DIV = "━" * 26
 DIV2 = "─" * 26
 
 QUALITY_RANK = {
-    "4320P": 100, "8K": 100,
-    "2160P": 90, "4K": 90, "UHD": 90,
-    "1440P": 80, "2K": 80,
-    "1080P": 70, "FULLHD": 70, "FHD": 70,
-    "720P": 60, "HD": 60,
-    "576P": 50,
-    "480P": 40, "SD": 40,
-    "360P": 30,
-    "240P": 20,
-    "CAM": 5, "HDCAM": 5, "TS": 3, "TELESYNC": 3,
-    "UNKNOWN": 25,
+    "4320P": 100, "8K": 100, "2160P": 90, "4K": 90, "UHD": 90,
+    "1440P": 80, "2K": 80, "1080P": 70, "FULLHD": 70, "FHD": 70,
+    "720P": 60, "HD": 60, "576P": 50, "480P": 40, "SD": 40,
+    "360P": 30, "240P": 20, "CAM": 5, "HDCAM": 5, "TS": 3,
+    "TELESYNC": 3, "UNKNOWN": 25,
 }
 
-# Fancy fonts
 _M_BOLD = {
     **{chr(ord('A') + i): "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"[i] for i in range(26)},
     **{chr(ord('a') + i): "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"[i] for i in range(26)},
@@ -81,18 +64,15 @@ def fb(s): return "".join(_M_BOLD.get(c, c) for c in str(s))
 def sc(s): return "".join(_M_SC.get(c, c) for c in str(s))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
 def _fmt_int(n) -> str:
     try: return f"{int(n):,}"
     except (TypeError, ValueError): return "0"
 
-def _fmt_size(bytes_) -> str:
-    if not bytes_: return "0 B"
-    try: s = float(bytes_)
+def _fmt_size(b) -> str:
+    if not b: return "0 B"
+    try: s = float(b)
     except (TypeError, ValueError): return "0 B"
-    for u in ["B", "KB", "MB", "GB", "TB"]:
+    for u in ("B", "KB", "MB", "GB", "TB"):
         if s < 1024: return f"{s:.2f} {u}"
         s /= 1024
     return f"{s:.2f} PB"
@@ -111,7 +91,7 @@ def _now_ist() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DB HELPERS
+# DB
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_db():
     try:
@@ -125,15 +105,11 @@ def _get_db():
     except Exception: return None
 
 
-def _files_coll():
-    d = _get_db()
-    if d is None: return None
-    for name in ("media_files", "files", "media"):
-        try:
-            c = d[name]
-            if c is not None: return c
-        except Exception: pass
-    return None
+def _get_client():
+    try:
+        return db_manager._client or db_manager.client
+    except Exception:
+        return None
 
 
 def _completed_coll():
@@ -151,17 +127,16 @@ def _prefs_coll():
     return d["ai_prefs"] if d is not None else None
 
 
-async def _get_setting(key: str, default: Any = None) -> Any:
+async def _get_setting(key, default=None):
     c = _settings_coll()
     if c is None: return default
     try:
         doc = await c.find_one({"_id": "settings"}) or {}
         return doc.get(key, default)
-    except Exception:
-        return default
+    except Exception: return default
 
 
-async def _set_setting(key: str, value: Any) -> bool:
+async def _set_setting(key, value):
     c = _settings_coll()
     if c is None: return False
     try:
@@ -169,115 +144,149 @@ async def _set_setting(key: str, value: Any) -> bool:
                            {"$set": {key: value, "updated_at": time.time()}},
                            upsert=True)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 
-async def _is_completed(title_slug: str) -> bool:
+async def _is_completed(slug):
     c = _completed_coll()
     if c is None: return False
     try:
-        doc = await c.find_one({"title_slug": title_slug})
-        return doc is not None
-    except Exception:
-        return False
+        return (await c.find_one({"title_slug": slug})) is not None
+    except Exception: return False
 
 
-async def _mark_completed(title: str, title_slug: str,
-                          total_files: int) -> bool:
+async def _mark_completed(title, slug, count):
     c = _completed_coll()
     if c is None: return False
     try:
-        await c.update_one(
-            {"title_slug": title_slug},
-            {"$set": {
-                "title": title, "title_slug": title_slug,
-                "total_files": total_files,
-                "completed_at": time.time(),
-            }},
-            upsert=True,
-        )
+        await c.update_one({"title_slug": slug},
+            {"$set": {"title": title, "title_slug": slug,
+                      "total_files": count, "completed_at": time.time()}},
+            upsert=True)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 
-async def _unmark_completed(title_slug: str) -> bool:
+async def _unmark_completed(slug):
     c = _completed_coll()
     if c is None: return False
     try:
-        r = await c.delete_one({"title_slug": title_slug})
-        return r.deleted_count > 0
-    except Exception:
-        return False
+        return (await c.delete_one({"title_slug": slug})).deleted_count > 0
+    except Exception: return False
 
 
-async def _list_completed(limit: int = 100) -> List[Dict[str, Any]]:
+async def _list_completed(limit=100):
     c = _completed_coll()
     if c is None: return []
     try:
-        cursor = c.find({}).sort("completed_at", -1).limit(limit)
-        return await cursor.to_list(length=limit)
-    except Exception:
-        return []
+        return await c.find({}).sort("completed_at", -1).limit(limit).to_list(limit)
+    except Exception: return []
 
 
-async def _count_completed() -> int:
+async def _count_completed():
     c = _completed_coll()
     if c is None: return 0
     try: return await c.count_documents({})
     except Exception: return 0
 
 
-async def _delete_file_record(file_id: str) -> bool:
-    c = _files_coll()
-    if c is None: return False
-    try:
-        r = await c.delete_one({"file_id": file_id})
-        if r.deleted_count == 0:
-            r = await c.delete_one({"file_unique_id": file_id})
-        return r.deleted_count > 0
-    except Exception:
-        return False
+async def _delete_file_record(file_id):
+    """Delete from ALL file collections."""
+    if not file_id: return False
+    colls = await _all_file_collections()
+    deleted = False
+    for _, coll in colls:
+        try:
+            r = await coll.delete_one({"file_id": file_id})
+            if r.deleted_count > 0:
+                deleted = True; continue
+            r = await coll.delete_one({"file_unique_id": file_id})
+            if r.deleted_count > 0: deleted = True
+        except Exception:
+            continue
+    return deleted
 
 
-async def _get_prefs(title_slug: str) -> List[str]:
+async def _get_prefs(slug):
     c = _prefs_coll()
     if c is None: return []
     try:
-        doc = await c.find_one({"title_slug": title_slug})
-        if not doc: return []
-        return list(doc.get("keep_qualities") or [])
-    except Exception:
-        return []
+        doc = await c.find_one({"title_slug": slug})
+        return list(doc.get("keep_qualities") or []) if doc else []
+    except Exception: return []
 
 
-async def _set_prefs(title_slug: str, title: str, qualities: List[str]) -> bool:
+async def _set_prefs(slug, title, quals):
     c = _prefs_coll()
     if c is None: return False
     try:
-        await c.update_one(
-            {"title_slug": title_slug},
-            {"$set": {
-                "title_slug": title_slug, "title": title,
-                "keep_qualities": list(qualities),
-                "updated_at": time.time(),
-            }},
-            upsert=True,
-        )
+        await c.update_one({"title_slug": slug},
+            {"$set": {"title_slug": slug, "title": title,
+                      "keep_qualities": list(quals),
+                      "updated_at": time.time()}},
+            upsert=True)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 
-async def _list_prefs() -> List[Dict[str, Any]]:
+async def _list_prefs():
     c = _prefs_coll()
     if c is None: return []
     try:
-        cursor = c.find({}).sort("updated_at", -1)
-        return await cursor.to_list(length=200)
+        return await c.find({}).sort("updated_at", -1).to_list(200)
+    except Exception: return []
+
+
+async def _all_file_collections():
+    """Return [(name, collection), ...] of ALL file-like collections in ALL DBs."""
+    results = []
+    client = _get_client()
+
+    if client is None:
+        d = _get_db()
+        if d is not None:
+            for n in ("media_files", "files", "media"):
+                try:
+                    results.append((n, d[n]))
+                except Exception: pass
+        return results
+
+    try:
+        dbs = await client.list_database_names()
     except Exception:
-        return []
+        dbs = []
+
+    patterns = ("media", "file", "shard", "index", "content", "db_", "movie", "series")
+
+    for db_name in dbs:
+        if db_name in ("admin", "local", "config"): continue
+        try:
+            db = client[db_name]
+            colls = await db.list_collection_names()
+        except Exception:
+            continue
+        for cname in colls:
+            cl = cname.lower()
+            if any(p in cl for p in patterns):
+                # skip our own collections
+                if cname.startswith("ai_"): continue
+                try:
+                    results.append((f"{db_name}.{cname}", db[cname]))
+                except Exception:
+                    continue
+
+    # dedupe by collection id
+    seen = set()
+    unique = []
+    for n, c in results:
+        try:
+            key = str(id(c))
+        except Exception:
+            key = n
+        if key in seen: continue
+        seen.add(key)
+        unique.append((n, c))
+    return unique
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -285,30 +294,27 @@ async def _list_prefs() -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
 
-def _new_session(uid: int, action: str, **data) -> str:
-    tok = secrets.token_urlsafe(8)[:10]
-    _SESSIONS[uid] = {"token": tok, "action": action, "data": data,
+def _new_session(uid, action, **data):
+    _SESSIONS[uid] = {"action": action, "data": data,
                       "expires": time.time() + SESSION_TTL}
-    return tok
 
-def _get_session(uid: int) -> Optional[Dict[str, Any]]:
+def _get_session(uid):
     s = _SESSIONS.get(uid)
     if not s: return None
     if time.time() > s["expires"]:
         _SESSIONS.pop(uid, None); return None
     return s
 
-def _clear_session(uid: int) -> None:
-    _SESSIONS.pop(uid, None)
+def _clear_session(uid): _SESSIONS.pop(uid, None)
 
-def _cleanup_sessions() -> None:
+def _cleanup_sessions():
     now = time.time()
     for uid in list(_SESSIONS.keys()):
         if _SESSIONS[uid]["expires"] < now: _SESSIONS.pop(uid, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AI FILENAME PARSER (with uploader-tag stripping)
+# PARSER
 # ═══════════════════════════════════════════════════════════════════════════
 SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -317,35 +323,26 @@ SE_PATTERNS = [
     re.compile(r"[sS]eason[\s._-]?(\d{1,2})[\s._-]?(?:[eE]p|EP)[\s._-]?(\d{1,3})"),
     re.compile(r"[sS](\d{1,2})[\s._-]+[eE](\d{1,3})"),
 ]
-
-SEASON_ONLY_PATTERNS = [
+SEASON_ONLY = [
     re.compile(r"\b[sS](\d{1,2})\b(?![\s._-]?[eE])"),
     re.compile(r"[sS]eason[\s._-]?(\d{1,2})\b(?![\s._-]?[eE])"),
 ]
-
 YEAR_PATTERN = re.compile(r"\b(19[3-9]\d|20[0-4]\d)\b")
 
 QUALITY_MARKERS = [
-    ("4320p", "4320P"), ("8k", "8K"),
-    ("2160p", "2160P"), ("4k", "4K"), ("uhd", "UHD"),
-    ("1440p", "1440P"), ("2k", "2K"),
-    ("1080p", "1080P"), ("fullhd", "1080P"), ("fhd", "1080P"),
-    ("720p", "720P"),
-    ("576p", "576P"),
-    ("480p", "480P"),
-    ("360p", "360P"),
-    ("240p", "240P"),
-    ("hdcam", "HDCAM"), ("cam", "CAM"),
+    ("4320p", "4320P"), ("8k", "8K"), ("2160p", "2160P"), ("4k", "4K"),
+    ("uhd", "UHD"), ("1440p", "1440P"), ("2k", "2K"), ("1080p", "1080P"),
+    ("fullhd", "1080P"), ("fhd", "1080P"), ("720p", "720P"),
+    ("576p", "576P"), ("480p", "480P"), ("360p", "360P"),
+    ("240p", "240P"), ("hdcam", "HDCAM"), ("cam", "CAM"),
     ("telesync", "TS"), ("ts", "TS"),
 ]
-
 CODEC_PATTERNS = [
     (re.compile(r"\bav1\b", re.I), "AV1"),
     (re.compile(r"\bx265\b|\bh\.?265\b|\bhevc\b", re.I), "X265"),
     (re.compile(r"\bx264\b|\bh\.?264\b|\bavc\b", re.I), "X264"),
     (re.compile(r"\bmpeg2?\b|\bxvid\b|\bdivx\b", re.I), "MPEG"),
 ]
-
 SOURCE_PATTERNS = [
     (re.compile(r"\bremux\b", re.I), "REMUX"),
     (re.compile(r"\bbluray\b|\bblu-ray\b|\bbdrip\b|\bbrrip\b|\bbdremux\b", re.I), "BLURAY"),
@@ -357,14 +354,13 @@ SOURCE_PATTERNS = [
     (re.compile(r"\bts\b|\btelesync\b|\btc\b", re.I), "TS"),
     (re.compile(r"\bscreener\b|\bscr\b|\br5\b", re.I), "SCR"),
 ]
-
 AUDIO_PATTERNS = [
     (re.compile(r"\batmos\b", re.I), "ATMOS"),
     (re.compile(r"\btruehd\b|\bthd\b", re.I), "TRUEHD"),
     (re.compile(r"\bdts-?hd[\s._-]?ma\b|\bdts[\s._-]?hd\b", re.I), "DTS-HD"),
     (re.compile(r"\bdts-?x\b|\bdtsx\b", re.I), "DTSX"),
     (re.compile(r"\bdts\b", re.I), "DTS"),
-    (re.compile(r"\bddp[\s._-]?7\.1\b|\bdd\+[\s._-]?7\.1\b|\beac3[\s._-]?7\.1\b", re.I), "DDP7.1"),
+    (re.compile(r"\bddp[\s._-]?7\.1\b|\bdd\+[\s._-]?7\.1\b", re.I), "DDP7.1"),
     (re.compile(r"\bddp[\s._-]?5\.1\b|\bdd\+[\s._-]?5\.1\b|\beac3\b|\bdd5\.1\b", re.I), "DDP5.1"),
     (re.compile(r"\bddp\b|\bdd\+\b", re.I), "DDP"),
     (re.compile(r"\bac3\b|\bdd\b", re.I), "AC3"),
@@ -373,39 +369,19 @@ AUDIO_PATTERNS = [
     (re.compile(r"\bopus\b", re.I), "OPUS"),
     (re.compile(r"\bmp3\b", re.I), "MP3"),
 ]
-
 SIZE_REGEX = re.compile(r"\b(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b", re.IGNORECASE)
 
-MULTI_AUDIO_MARKERS = [
-    re.compile(r"\bmulti\b", re.I),
-    re.compile(r"\bdual[\s._-]?audio\b", re.I),
-    re.compile(r"\bdubbed\b", re.I),
-]
-
-LANGUAGE_ALIASES: Dict[str, List[str]] = {
-    "English":   ["english", "eng"],
-    "Hindi":     ["hindi", "hin"],
-    "Tamil":     ["tamil", "tam"],
-    "Telugu":    ["telugu", "tel"],
-    "Malayalam": ["malayalam", "mal"],
-    "Kannada":   ["kannada", "kan"],
-    "Bengali":   ["bengali", "bangla"],
-    "Marathi":   ["marathi"],
-    "Punjabi":   ["punjabi"],
-    "Gujarati":  ["gujarati"],
-    "Urdu":      ["urdu"],
-    "Korean":    ["korean"],
-    "Japanese":  ["japanese"],
-    "Chinese":   ["chinese", "mandarin"],
-    "Thai":      ["thai"],
-    "Spanish":   ["spanish"],
-    "French":    ["french"],
-    "German":    ["german"],
-    "Italian":   ["italian"],
-    "Portuguese":["portuguese"],
-    "Russian":   ["russian"],
-    "Turkish":   ["turkish"],
-    "Arabic":    ["arabic"],
+LANGUAGE_ALIASES = {
+    "English": ["english", "eng"], "Hindi": ["hindi", "hin"],
+    "Tamil": ["tamil", "tam"], "Telugu": ["telugu", "tel"],
+    "Malayalam": ["malayalam", "mal"], "Kannada": ["kannada", "kan"],
+    "Bengali": ["bengali", "bangla"], "Marathi": ["marathi"],
+    "Punjabi": ["punjabi"], "Gujarati": ["gujarati"], "Urdu": ["urdu"],
+    "Korean": ["korean"], "Japanese": ["japanese"],
+    "Chinese": ["chinese", "mandarin"], "Thai": ["thai"],
+    "Spanish": ["spanish"], "French": ["french"], "German": ["german"],
+    "Italian": ["italian"], "Portuguese": ["portuguese"],
+    "Russian": ["russian"], "Turkish": ["turkish"], "Arabic": ["arabic"],
 }
 
 NOISE_WORDS = {
@@ -419,7 +395,7 @@ NOISE_WORDS = {
 }
 
 
-def _smart_title_case(s: str) -> str:
+def _smart_title_case(s):
     if not s: return ""
     small = {"of", "the", "and", "or", "a", "an", "in", "on", "at",
              "to", "for", "by", "with", "from"}
@@ -431,163 +407,119 @@ def _smart_title_case(s: str) -> str:
     return " ".join(out)
 
 
-def _parse_size_from_name(name: str) -> int:
+def _parse_size(name):
     m = SIZE_REGEX.search(name)
     if not m: return 0
     try:
-        val = float(m.group(1))
-        unit = m.group(2).upper()
-        if unit in ("GB", "GIB"): return int(val * 1024 * 1024 * 1024)
-        if unit in ("MB", "MIB"): return int(val * 1024 * 1024)
-    except Exception:
-        pass
+        v = float(m.group(1)); u = m.group(2).upper()
+        if u in ("GB", "GIB"): return int(v * 1024**3)
+        if u in ("MB", "MIB"): return int(v * 1024**2)
+    except Exception: pass
     return 0
 
 
-def _detect_from_patterns(name: str, patterns) -> Optional[str]:
+def _detect(name, patterns):
     for pat, label in patterns:
-        if pat.search(name):
-            return label
+        if pat.search(name): return label
     return None
 
 
-def parse_filename(filename: str) -> Dict[str, Any]:
-    """Extract structured data from any messy filename."""
-    result: Dict[str, Any] = {
-        "raw": filename,
-        "title": "", "title_slug": "",
-        "year": None, "season": None, "episode": None,
-        "quality": None, "quality_rank": 0,
-        "codec": None, "source": None, "audio_codec": None,
-        "is_multi": False,
-        "languages": [],
-        "size_from_name": 0,
-        "is_series": False, "is_season_pack": False,
-    }
-    if not filename:
-        return result
+def parse_filename(filename):
+    result = {"raw": filename, "title": "", "title_slug": "",
+              "year": None, "season": None, "episode": None,
+              "quality": None, "quality_rank": 0,
+              "codec": None, "source": None, "audio_codec": None,
+              "languages": [], "size_from_name": 0,
+              "is_series": False, "is_season_pack": False}
+    if not filename: return result
 
     name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    name = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts)$",
-                  "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts)$", "",
+                  name, flags=re.I)
     work = name
-    work_lower = work.lower()
+    wl = work.lower()
 
-    # Season / Episode
     season = episode = None
     for pat in SE_PATTERNS:
         m = pat.search(work)
         if m:
             try:
-                season = int(m.group(1))
-                episode = int(m.group(2))
-                break
-            except (TypeError, ValueError, IndexError):
-                continue
+                season = int(m.group(1)); episode = int(m.group(2)); break
+            except Exception: continue
 
     if season is None:
-        for pat in SEASON_ONLY_PATTERNS:
+        for pat in SEASON_ONLY:
             m = pat.search(work)
             if m:
                 try:
                     season = int(m.group(1))
-                    result["is_season_pack"] = True
-                    break
-                except (TypeError, ValueError, IndexError):
-                    continue
+                    result["is_season_pack"] = True; break
+                except Exception: continue
 
     result["season"] = season
     result["episode"] = episode
 
-    # Year
     ym = YEAR_PATTERN.search(work)
     if ym:
         try: result["year"] = int(ym.group(1))
-        except (TypeError, ValueError): pass
+        except Exception: pass
 
-    # Quality
     for marker, label in QUALITY_MARKERS:
-        if re.search(r"\b" + re.escape(marker) + r"\b", work_lower):
+        if re.search(r"\b" + re.escape(marker) + r"\b", wl):
             result["quality"] = label
-            result["quality_rank"] = QUALITY_RANK.get(label, 0)
-            break
+            result["quality_rank"] = QUALITY_RANK.get(label, 0); break
 
-    # Codec / Source / Audio
-    result["codec"] = _detect_from_patterns(work_lower, CODEC_PATTERNS)
-    result["source"] = _detect_from_patterns(work_lower, SOURCE_PATTERNS)
-    result["audio_codec"] = _detect_from_patterns(work_lower, AUDIO_PATTERNS)
+    result["codec"] = _detect(wl, CODEC_PATTERNS)
+    result["source"] = _detect(wl, SOURCE_PATTERNS)
+    result["audio_codec"] = _detect(wl, AUDIO_PATTERNS)
 
-    if result.get("quality") in ("CAM", "HDCAM"):
-        result["source"] = result.get("source") or "CAM"
-    if result.get("quality") == "TS":
-        result["source"] = result.get("source") or "TS"
-
-    # Multi
-    result["is_multi"] = any(p.search(work_lower) for p in MULTI_AUDIO_MARKERS)
-
-    # Languages
     langs = []
-    for lang_name, aliases in LANGUAGE_ALIASES.items():
-        for alias in aliases:
-            if re.search(r"\b" + re.escape(alias) + r"\b", work_lower):
-                if lang_name not in langs:
-                    langs.append(lang_name)
+    for ln, aliases in LANGUAGE_ALIASES.items():
+        for a in aliases:
+            if re.search(r"\b" + re.escape(a) + r"\b", wl):
+                if ln not in langs: langs.append(ln)
                 break
     result["languages"] = langs
+    result["size_from_name"] = _parse_size(name)
 
-    # Size
-    result["size_from_name"] = _parse_size_from_name(name)
-
-    # Type
     if season is not None or episode is not None:
         result["is_series"] = True
 
-    # Title cleanup
-    title_work = work
-    for pat in SE_PATTERNS:
-        title_work = pat.sub(" ", title_work)
-    for pat in SEASON_ONLY_PATTERNS:
-        title_work = pat.sub(" ", title_work)
+    tw = work
+    for pat in SE_PATTERNS: tw = pat.sub(" ", tw)
+    for pat in SEASON_ONLY: tw = pat.sub(" ", tw)
     if result["year"]:
-        title_work = re.sub(r"\b" + str(result["year"]) + r"\b", " ", title_work)
+        tw = re.sub(r"\b" + str(result["year"]) + r"\b", " ", tw)
     for marker, _ in QUALITY_MARKERS:
-        title_work = re.sub(r"\b" + re.escape(marker) + r"\b", " ",
-                            title_work, flags=re.IGNORECASE)
+        tw = re.sub(r"\b" + re.escape(marker) + r"\b", " ", tw, flags=re.I)
     for lang in langs:
-        for alias in LANGUAGE_ALIASES.get(lang, []):
-            title_work = re.sub(r"\b" + re.escape(alias) + r"\b", " ",
-                                title_work, flags=re.IGNORECASE)
+        for a in LANGUAGE_ALIASES.get(lang, []):
+            tw = re.sub(r"\b" + re.escape(a) + r"\b", " ", tw, flags=re.I)
     for noise in NOISE_WORDS:
-        title_work = re.sub(r"\b" + re.escape(noise) + r"\b", " ",
-                            title_work, flags=re.IGNORECASE)
+        tw = re.sub(r"\b" + re.escape(noise) + r"\b", " ", tw, flags=re.I)
 
-    # ⭐ STRIP UPLOADER / RELEASE GROUP TAGS
-    title_work = re.sub(r"[-_.\s]*@\w+\b", " ", title_work)
-    title_work = re.sub(r"[-_.\s]*\[[^\]]{1,40}\]", " ", title_work)
-    title_work = re.sub(r"[-_.\s]*\([^\)]{1,20}\)\s*$", " ", title_work)
-    title_work = re.sub(
+    # Strip uploader / release group tags
+    tw = re.sub(r"[-_.\s]*@\w+\b", " ", tw)
+    tw = re.sub(r"[-_.\s]*\[[^\]]{1,40}\]", " ", tw)
+    tw = re.sub(r"[-_.\s]*\([^\)]{1,20}\)\s*$", " ", tw)
+    tw = re.sub(
         r"[-_.\s]*(?:rarbg|eztv|yts|yify|galaxyrg|psa|hon3y|bolly4u|"
-        r"subsplease|evo|fgt|nf|amzn|thetvshare|tvshare|hdhub4u|"
-        r"mkvcage|shaanig|dusicyon|tamilrockers|isaimini)\b",
-        " ", title_work, flags=re.IGNORECASE)
+        r"subsplease|evo|fgt|thetvshare|tvshare|hdhub4u|mkvcage|"
+        r"shaanig|tamilrockers|isaimini|katmoviehd|moviesverse)\b",
+        " ", tw, flags=re.I)
 
-    title_work = re.sub(r"[._\-]+", " ", title_work)
-    title_work = re.sub(r"\s+", " ", title_work).strip()
-
-    parts = [p for p in title_work.split() if len(p) > 1]
-    title_clean = " ".join(parts)
-
-    result["title"] = _smart_title_case(title_clean)
+    tw = re.sub(r"[._\-]+", " ", tw)
+    tw = re.sub(r"\s+", " ", tw).strip()
+    parts = [p for p in tw.split() if len(p) > 1]
+    result["title"] = _smart_title_case(" ".join(parts))
     result["title_slug"] = re.sub(r"[^a-z0-9]+", "_",
                                    result["title"].lower()).strip("_")
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FILE QUALITY SCORING ENGINE
+# SCORING
 # ═══════════════════════════════════════════════════════════════════════════
-RESOLUTION_SCORE = QUALITY_RANK
-
 CODEC_BONUS = {"AV1": 10, "X265": 8, "X264": 4, "MPEG": 0, None: 2}
 SOURCE_BONUS = {"REMUX": 15, "BLURAY": 12, "WEBDL": 10, "WEBRIP": 7,
                 "HDTV": 4, "DVDRIP": 3, "SCR": 2, "CAM": 0, "TS": 0, None: 2}
@@ -596,48 +528,36 @@ AUDIO_BONUS = {"ATMOS": 8, "TRUEHD": 7, "DTS-HD": 6, "DTSX": 6, "DTS": 5,
                "FLAC": 5, "OPUS": 2, "MP3": 1, None: 1}
 
 
-def _compute_file_score(f: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
-    resolution = (f.get("quality") or "UNKNOWN").upper()
+def _score(f):
+    res = (f.get("quality") or "UNKNOWN").upper()
     codec = (f.get("codec") or "").upper() or None
-    source = (f.get("source") or "").upper() or None
-    audio = (f.get("audio_codec") or "").upper() or None
-    languages = f.get("languages") or []
-    size_bytes = f.get("size") or f.get("size_from_name") or 0
+    src = (f.get("source") or "").upper() or None
+    aud = (f.get("audio_codec") or "").upper() or None
+    langs = f.get("languages") or []
+    size = f.get("size") or f.get("size_from_name") or 0
 
-    r_score = RESOLUTION_SCORE.get(resolution, 25)
-    c_bonus = CODEC_BONUS.get(codec, 2)
-    s_bonus = SOURCE_BONUS.get(source, 2)
-    a_bonus = AUDIO_BONUS.get(audio, 1)
-    l_bonus = len(languages) * 2
-
+    r = QUALITY_RANK.get(res, 25)
+    c = CODEC_BONUS.get(codec, 2)
+    s = SOURCE_BONUS.get(src, 2)
+    a = AUDIO_BONUS.get(aud, 1)
+    l = len(langs) * 2
     try:
-        size_mb = max(0, size_bytes) / (1024 * 1024)
-        size_bonus = min(20.0, size_mb / 500.0)
+        size_mb = max(0, size) / (1024**2)
+        sz = min(20.0, size_mb / 500.0)
     except Exception:
-        size_bonus = 0.0
-
-    total = (r_score + c_bonus + s_bonus + a_bonus + l_bonus + size_bonus)
-    return round(total, 1), {
-        "resolution": r_score, "codec": c_bonus, "source": s_bonus,
-        "audio": a_bonus, "languages": l_bonus,
-        "size": round(size_bonus, 1), "total": round(total, 1),
-    }
+        sz = 0.0
+    return round(r + c + s + a + l + sz, 1)
 
 
-def _pick_best_file(files: List[Dict[str, Any]]) -> Tuple[Optional[Dict], List[Dict]]:
-    if not files:
+def _pick_best(files):
+    if not files: return None, []
+    scored = sorted([(_score(f), f) for f in files], key=lambda x: x[0], reverse=True)
+    if all((f.get("quality") or "UNKNOWN").upper() == "UNKNOWN" for _, f in scored):
         return None, []
-    scored = [( _compute_file_score(f)[0], f) for f in files]
-    if all((f.get("quality") or "UNKNOWN").upper() == "UNKNOWN"
-           for _, f in scored):
-        return None, []
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = scored[0][1]
-    best["_score"] = scored[0][0]
+    best = scored[0][1]; best["_score"] = scored[0][0]
     others = []
     for s, f in scored[1:]:
-        f["_score"] = s
-        others.append(f)
+        f["_score"] = s; others.append(f)
     return best, others
 
 
@@ -646,69 +566,116 @@ def _pick_best_file(files: List[Dict[str, Any]]) -> Tuple[Optional[Dict], List[D
 # ═══════════════════════════════════════════════════════════════════════════
 class SeriesCatalog:
     def __init__(self):
-        self.data: Dict[str, Dict[str, Any]] = {}
+        self.data: Dict[str, Any] = {}
 
-    def add(self, parsed: Dict[str, Any], file_record: Dict[str, Any]) -> None:
+    def add(self, parsed, rec):
         if not parsed.get("is_series"): return
         if parsed.get("season") is None: return
         slug = parsed["title_slug"]
         if not slug: return
 
         if slug not in self.data:
-            self.data[slug] = {
-                "title": parsed["title"],
-                "seasons": defaultdict(lambda: defaultdict(list)),
-                "file_count": 0,
-            }
+            self.data[slug] = {"title": parsed["title"],
+                                "seasons": defaultdict(lambda: defaultdict(list)),
+                                "file_count": 0}
 
-        season = parsed["season"]
-        episode = parsed.get("episode")
+        s = parsed["season"]; e = parsed.get("episode")
+        size = (rec.get("file_size") or rec.get("size")
+                or parsed.get("size_from_name") or 0)
 
-        size_bytes = (file_record.get("file_size")
-                       or file_record.get("size")
-                       or parsed.get("size_from_name") or 0)
-
-        entry = {
-            "file_id": (file_record.get("file_id")
-                        or file_record.get("file_unique_id") or ""),
+        self.data[slug]["seasons"][s][e].append({
+            "file_id": rec.get("file_id") or rec.get("file_unique_id") or "",
             "file_name": parsed.get("raw", ""),
             "quality": (parsed.get("quality") or "UNKNOWN").upper(),
-            "quality_rank": QUALITY_RANK.get(parsed.get("quality") or "", 0),
             "codec": (parsed.get("codec") or "").upper() or None,
             "source": (parsed.get("source") or "").upper() or None,
             "audio_codec": (parsed.get("audio_codec") or "").upper() or None,
-            "is_multi": parsed.get("is_multi", False),
             "languages": parsed.get("languages", []),
-            "size": size_bytes,
+            "size": size,
             "size_from_name": parsed.get("size_from_name", 0),
-            "chat_id": file_record.get("chat_id"),
-            "message_id": file_record.get("message_id") or file_record.get("msg_id"),
-            "raw": file_record,
-        }
-
-        self.data[slug]["seasons"][season][episode].append(entry)
+            "chat_id": rec.get("chat_id"),
+            "message_id": rec.get("message_id") or rec.get("msg_id"),
+            "_score": 0,
+        })
         self.data[slug]["file_count"] += 1
 
-    def list_series(self) -> List[Dict[str, Any]]:
-        out = []
-        for slug, info in self.data.items():
-            out.append({
-                "title_slug": slug,
-                "title": info["title"],
-                "file_count": info["file_count"],
-                "season_count": len(info["seasons"]),
-            })
+    def list_series(self):
+        out = [{"title_slug": k, "title": v["title"],
+                "file_count": v["file_count"],
+                "season_count": len(v["seasons"])} for k, v in self.data.items()]
         out.sort(key=lambda x: x["title"].lower())
         return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TMDB SUGGEST
+# ═══════════════════════════════════════════════════════════════════════════
+async def _tmdb_suggest(query: str, kind: str = "tv") -> List[Dict[str, Any]]:
+    """Search TMDB for TV shows (or movies) matching query."""
+    if not TMDB_API_KEY: return []
+    try:
+        import aiohttp
+    except ImportError:
+        return []
+
+    endpoint = "/search/tv" if kind == "tv" else "/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": query, "language": "en-US"}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(f"https://api.themoviedb.org/3{endpoint}",
+                                params=params, timeout=12) as r:
+                if r.status != 200: return []
+                data = await r.json()
+    except Exception as e:
+        logger.debug(f"[AI] tmdb suggest: {e}")
+        return []
+
+    out = []
+    for it in (data.get("results") or [])[:8]:
+        if kind == "tv":
+            title = it.get("name") or it.get("original_name") or ""
+            date = it.get("first_air_date") or ""
+        else:
+            title = it.get("title") or it.get("original_title") or ""
+            date = it.get("release_date") or ""
+        if not title: continue
+        out.append({
+            "title": title,
+            "year": (date or "")[:4],
+            "tmdb_id": it.get("id"),
+            "overview": (it.get("overview") or "")[:150],
+            "rating": it.get("vote_average", 0),
+            "poster": it.get("poster_path"),
+            "type": kind,
+        })
+    return out
+
+
+def _tmdb_poster(path):
+    return f"https://image.tmdb.org/t/p/w200{path}" if path else None
+
+
+def kb_tmdb_suggest(items: List[Dict[str, Any]]):
+    rows = []
+    for i, it in enumerate(items):
+        title = (it.get("title") or "?")[:38]
+        year = it.get("year") or ""
+        label = f"🎬 {title}"
+        if year: label += f" ({year})"
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"ai:pick_tmdb:{i}")])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
+                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
-def kb_main(auto_on: bool, completed: int, total: int):
-    auto_label = "🟢 AUTO MODE ON" if auto_on else "🔴 AUTO MODE OFF"
+def kb_main(auto_on, completed, total):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(auto_label, callback_data="ai:toggle_auto")],
+        [InlineKeyboardButton("🟢 AUTO MODE ON" if auto_on else "🔴 AUTO MODE OFF",
+                              callback_data="ai:toggle_auto")],
         [InlineKeyboardButton("🚀 AUTO SCAN", callback_data="ai:auto"),
          InlineKeyboardButton("✍️ MANUAL SCAN", callback_data="ai:manual")],
         [InlineKeyboardButton(f"📚 ALL SERIES ({total})", callback_data="ai:all"),
@@ -720,478 +687,340 @@ def kb_main(auto_on: bool, completed: int, total: int):
     ])
 
 
-def kb_scan_result(title_slug: str, series_index: int, total_series: int):
+def kb_scan_result(slug, i, t):
     rows = [
-        [InlineKeyboardButton("👁️ VIEW FILES",
-                              callback_data=f"ai:view:{title_slug}")],
-        [InlineKeyboardButton("🎯 SET KEEP QUALITIES",
-                              callback_data=f"ai:pref:{title_slug}")],
-        [InlineKeyboardButton("✅ MARK COMPLETE",
-                              callback_data=f"ai:complete:{title_slug}")],
+        [InlineKeyboardButton("👁️ VIEW FILES", callback_data=f"ai:view:{slug}")],
+        [InlineKeyboardButton("🎯 SET KEEP QUALITIES", callback_data=f"ai:pref:{slug}")],
+        [InlineKeyboardButton("✅ MARK COMPLETE", callback_data=f"ai:complete:{slug}")],
     ]
-    if series_index < total_series:
-        rows.append([InlineKeyboardButton(
-            f"⏭️ NEXT SERIES ({series_index + 1}/{total_series})",
-            callback_data=f"ai:next:{title_slug}")])
+    if i < t:
+        rows.append([InlineKeyboardButton(f"⏭️ NEXT ({i+1}/{t})",
+                                           callback_data=f"ai:next:{slug}")])
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_series_list(series_list: List[Dict[str, Any]]):
-    rows = []
-    for s in series_list[:25]:
-        title = (s.get("title") or "?")[:32]
-        count = s.get("file_count", 0)
-        rows.append([InlineKeyboardButton(
-            f"🎬 {title} · {count}",
-            callback_data=f"ai:view:{s['title_slug']}"
-        )])
+def kb_series_list(lst):
+    rows = [[InlineKeyboardButton(f"🎬 {(s.get('title') or '?')[:32]} · {s.get('file_count', 0)}",
+                                   callback_data=f"ai:view:{s['title_slug']}")]
+            for s in lst[:25]]
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_episode_files(title_slug: str, season: int, episode: Optional[int],
-                     files: List[Dict[str, Any]]):
+def kb_episode_files(slug, season, episode, files):
     rows = []
     for i, f in enumerate(files[:10]):
         q = f.get("quality", "?")
         langs = "+".join(f.get("languages", [])) or "?"
-        rows.append([InlineKeyboardButton(
-            f"🗑️ {i+1}. {q} · {langs}",
-            callback_data=f"ai:del_pick:{title_slug}:{season}:"
-                          f"{episode if episode is not None else 0}:{i}"
-        )])
-    rows.append([InlineKeyboardButton("◀️ BACK",
-                                       callback_data=f"ai:view:{title_slug}"),
+        ep_i = episode if episode is not None else 0
+        rows.append([InlineKeyboardButton(f"🗑️ {i+1}. {q} · {langs}",
+            callback_data=f"ai:del_pick:{slug}:{season}:{ep_i}:{i}")])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_confirm_delete(title_slug: str, season: int, episode: Optional[int],
-                     file_index: int):
+def kb_confirm_delete(slug, season, episode, idx):
+    ep_i = episode if episode is not None else 0
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ YES, DELETE",
-                               callback_data=f"ai:del_go:{title_slug}:"
-                                             f"{season}:"
-                                             f"{episode if episode is not None else 0}:"
-                                             f"{file_index}")],
-        [InlineKeyboardButton("❌ CANCEL",
-                               callback_data=f"ai:view:{title_slug}")],
+            callback_data=f"ai:del_go:{slug}:{season}:{ep_i}:{idx}")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:view:{slug}")],
     ])
 
 
-def kb_quality_picker(title_slug: str, available: List[str],
-                      current: List[str]):
-    rows = []
-    row = []
-    for q in available:
-        mark = "✅" if q in current else "⬜"
-        row.append(InlineKeyboardButton(
-            f"{mark} {q}",
-            callback_data=f"ai:pref_tog:{title_slug}:{q}"
-        ))
-        if len(row) == 3:
-            rows.append(row); row = []
+def kb_quality_picker(slug, avail, cur):
+    rows = []; row = []
+    for q in avail:
+        mark = "✅" if q in cur else "⬜"
+        row.append(InlineKeyboardButton(f"{mark} {q}",
+            callback_data=f"ai:pref_tog:{slug}:{q}"))
+        if len(row) == 3: rows.append(row); row = []
     if row: rows.append(row)
-
-    rows.append([InlineKeyboardButton("💾 SAVE",
-                                       callback_data=f"ai:pref_save:{title_slug}")])
-    rows.append([InlineKeyboardButton("◀️ BACK",
-                                       callback_data=f"ai:view:{title_slug}"),
+    rows.append([InlineKeyboardButton("💾 SAVE", callback_data=f"ai:pref_save:{slug}")])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_back(target: str = "ai:main"):
+def kb_back(t="ai:main"):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️ BACK", callback_data=target),
-        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close"),
-    ]])
+        InlineKeyboardButton("◀️ BACK", callback_data=t),
+        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW BUILDERS
+# VIEWS
 # ═══════════════════════════════════════════════════════════════════════════
-async def _view_main() -> Tuple[str, InlineKeyboardMarkup]:
+async def _view_main():
     auto_on = await _get_setting("auto_mode", True)
-    completed = await _count_completed()
-    total_series = await _get_setting("total_series", 0)
-
-    text = "\n".join([
+    comp = await _count_completed()
+    total = await _get_setting("total_series", 0)
+    return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎛️ <b>{fb('AI LIBRARIAN')}</b>",
         DIV, "",
         f"⚙️ {sc('auto mode')} · {'🟢 ᴏɴ' if auto_on else '🔴 ᴏꜰꜰ'}",
-        f"✅ {sc('completed series')} · <code>{_fmt_int(completed)}</code>",
-        f"📚 {sc('total series')} · <code>{_fmt_int(total_series)}</code>",
-        "",
-        DIV2, "",
-        f"🚀 {sc('auto')} · ᴀɴᴀʟʏᴢᴇ 3 ꜱᴇʀɪᴇꜱ ꜰʀᴏᴍ ᴅʙ",
-        f"✍️ {sc('manual')} · ꜱᴇᴀʀᴄʜ ᴏɴᴇ ꜱᴇʀɪᴇꜱ ʙʏ ɴᴀᴍᴇ",
-        f"🎯 {sc('quality prefs')} · ᴘɪᴄᴋ ᴡʜɪᴄʜ ǫᴜᴀʟɪᴛɪᴇꜱ ᴛᴏ ᴋᴇᴇᴘ",
-        "",
-        DIV2,
-        f"🕒 {sc('now')} · <code>{_now_ist()}</code>",
-    ])
-    return text, kb_main(auto_on, completed, total_series)
+        f"✅ {sc('completed')} · <code>{_fmt_int(comp)}</code>",
+        f"📚 {sc('total series')} · <code>{_fmt_int(total)}</code>",
+        "", DIV2, "",
+        f"🚀 {sc('auto')} · 3 ꜱᴇʀɪᴇꜱ ꜰʀᴏᴍ ᴅʙ",
+        f"✍️ {sc('manual')} · ꜱᴇᴀʀᴄʜ ᴏɴᴇ (ᴛᴍᴅʙ ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ)",
+        "", DIV2,
+        f"🕒 <code>{_now_ist()}</code>",
+    ]), kb_main(auto_on, comp, total)
 
 
-def _progress_bar(pct: float, width: int = 16) -> str:
-    pct = max(0.0, min(100.0, float(pct)))
-    filled = int(width * pct / 100.0)
-    empty = width - filled
-    if pct >= 75: block = "🟩"
-    elif pct >= 50: block = "🟨"
-    elif pct >= 25: block = "🟧"
-    else: block = "🟥"
-    return block * filled + "⬛" * empty + f"  {pct:.0f}%"
+def _progress_bar(p, w=16):
+    p = max(0.0, min(100.0, float(p)))
+    filled = int(w * p / 100); empty = w - filled
+    block = "🟩" if p >= 75 else ("🟨" if p >= 50 else ("🟧" if p >= 25 else "🟥"))
+    return block * filled + "⬛" * empty + f"  {p:.0f}%"
 
 
-def _view_scanning(current: int, total: int) -> str:
-    pct = (current / total) * 100 if total else 0
-    return "\n".join([
+def _view_scanning(cur, total, coll=""):
+    p = (cur / total * 100) if total else 0
+    lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🔍 <b>{fb('SCANNING')}</b>",
         DIV, "",
-        f"<code>{_progress_bar(pct)}</code>",
+        f"<code>{_progress_bar(p)}</code>",
         "",
-        f"📁 <code>{_fmt_int(current)}</code> / "
-        f"<code>{_fmt_int(total)}</code> ꜰɪʟᴇꜱ",
-    ])
+        f"📁 <code>{_fmt_int(cur)}</code> / <code>{_fmt_int(total)}</code>",
+    ]
+    if coll: lines.append(f"📚 <code>{_esc(coll[:40])}</code>")
+    return "\n".join(lines)
 
 
-def _view_series_result(series: Dict[str, Any], prefs: List[str],
-                        index: int, total: int) -> str:
+def _view_series_result(series, prefs, i, t):
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
-
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎬 <b>{_esc(title)}</b>",
-        f"📄 {sc('series')} · <code>{index}/{total}</code>",
-        DIV, "",
-    ]
-
+    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+             f"🎬 <b>{_esc(title)}</b>",
+             f"📄 {sc('series')} · <code>{i}/{t}</code>",
+             DIV, ""]
     total_files = 0
-    for snum in sorted(seasons.keys()):
-        eps = seasons[snum]
-        lines.append(f"📺 <b>{sc('season')} {snum}</b> · "
-                     f"<code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
-
-        quality_map: Dict[str, Set[int]] = defaultdict(set)
+    for sn in sorted(seasons.keys()):
+        eps = seasons[sn]
+        lines.append(f"📺 <b>{sc('season')} {sn}</b> · <code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
+        qmap = defaultdict(set)
         for ep, files in eps.items():
             for f in files:
-                quality_map[f.get("quality", "?")].add(ep if ep is not None else 0)
+                qmap[f.get("quality", "?")].add(ep if ep is not None else 0)
                 total_files += 1
-
-        for q in sorted(quality_map.keys(),
-                        key=lambda x: QUALITY_RANK.get(x, 0),
-                        reverse=True):
-            eps_present = sorted(quality_map[q])
-            present_str = ", ".join(f"E{e:02d}" if e else "?"
-                                    for e in eps_present[:15])
-            if len(eps_present) > 15:
-                present_str += f" +{len(eps_present) - 15}"
-            marker = ""
-            if prefs and q not in prefs:
-                marker = " · 🗑️ ᴛᴏ ᴅᴇʟᴇᴛᴇ"
-            elif prefs and q in prefs:
-                marker = " · ✅ ᴋᴇᴇᴘ"
-            lines.append(f"   🎯 <code>{q}</code> · "
-                         f"<code>{present_str}</code>{marker}")
+        for q in sorted(qmap.keys(), key=lambda x: QUALITY_RANK.get(x, 0), reverse=True):
+            eps_p = sorted(qmap[q])
+            ps = ", ".join(f"E{e:02d}" if e else "?" for e in eps_p[:15])
+            if len(eps_p) > 15: ps += f" +{len(eps_p) - 15}"
+            mk = ""
+            if prefs and q not in prefs: mk = " · 🗑️ ᴛᴏ ᴅᴇʟᴇᴛᴇ"
+            elif prefs and q in prefs: mk = " · ✅ ᴋᴇᴇᴘ"
+            lines.append(f"   🎯 <code>{q}</code> · <code>{ps}</code>{mk}")
         lines.append("")
-
     lines.append(DIV2)
     lines.append(f"📁 {sc('total files')} · <code>{_fmt_int(total_files)}</code>")
     if prefs:
-        lines.append(f"🎯 {sc('keep qualities')} · "
-                     f"<code>{', '.join(prefs)}</code>")
-    else:
-        lines.append(f"🎯 {sc('keep qualities')} · <i>not set</i>")
+        lines.append(f"🎯 {sc('keep')} · <code>{', '.join(prefs)}</code>")
     return "\n".join(lines)
 
 
-def _view_episode_files(title: str, season: int, episode: Optional[int],
-                        files: List[Dict[str, Any]],
-                        prefs: List[str]) -> str:
-    ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
-    best, _ = _pick_best_file(files)
-
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎬 <b>{_esc(title)}</b> · <code>{ep_label}</code>",
-        DIV, "",
-        f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ",
-        "",
-    ]
-
+def _view_episode_files(title, season, episode, files, prefs):
+    ep = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
+    best, _ = _pick_best(files)
+    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+             f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
+             DIV, "",
+             f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ",
+             ""]
     for i, f in enumerate(files[:10]):
-        q_ = f.get("quality", "?")
+        q = f.get("quality", "?")
         langs = "+".join(f.get("languages", [])) or "?"
         size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
         codec = f.get("codec") or "?"
-        source = f.get("source") or "?"
-        score = f.get("_score", 0)
-
+        src = f.get("source") or "?"
         tag = ""
-        if f is best:
-            tag = " · ⭐ ʙᴇꜱᴛ"
-        elif prefs and q_ not in prefs:
-            tag = " · 🗑️ ʀᴇᴍᴏᴠᴇ"
-        elif q_ == "UNKNOWN":
-            tag = " · ⚠️ ᴜɴᴋɴᴏᴡɴ"
-
-        lines.append(f"<b>{i+1}.</b> <code>{q_}</code> · "
-                     f"<code>{codec}</code> · <code>{source}</code>{tag}")
+        if f is best: tag = " · ⭐ ʙᴇꜱᴛ"
+        elif prefs and q not in prefs: tag = " · 🗑️ ʀᴇᴍᴏᴠᴇ"
+        elif q == "UNKNOWN": tag = " · ⚠️ ᴜɴᴋɴᴏᴡɴ"
+        lines.append(f"<b>{i+1}.</b> <code>{q}</code> · <code>{codec}</code> · <code>{src}</code>{tag}")
         lines.append(f"   🌍 <code>{langs}</code> · 📦 {size}")
-
-    lines.append("")
-    lines.append(DIV2)
-    lines.append(f"📌 {sc('tap a file to delete it')}")
+    lines += ["", DIV2, f"📌 {sc('tap a file to delete it')}"]
     return "\n".join(lines)
 
 
-def _view_confirm_delete(title: str, season: int, episode: Optional[int],
-                        f: Dict[str, Any]) -> str:
-    ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
-    q = f.get("quality", "?")
-    langs = "+".join(f.get("languages", [])) or "?"
+def _view_confirm_delete(title, season, episode, f):
+    ep = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
+    q = f.get("quality", "?"); langs = "+".join(f.get("languages", [])) or "?"
     size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
     return "\n".join([
         f"⚠️ <b>{fb('CONFIRM DELETE')}</b>",
         DIV, "",
-        f"🎬 <b>{_esc(title)}</b> · <code>{ep_label}</code>",
+        f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
         f"🎯 {sc('quality')} · <code>{q}</code>",
         f"🌍 {sc('languages')} · <code>{langs}</code>",
         f"📦 {sc('size')} · <code>{size}</code>",
-        "",
-        DIV2, "",
-        f"❗ <b>{sc('this cannot be undone')}</b>",
+        "", DIV2, f"❗ <b>{sc('this cannot be undone')}</b>",
     ])
 
 
-def _view_quality_picker(title: str, available: List[str],
-                        current: List[str]) -> str:
+def _view_quality_picker(title, avail, cur):
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
         DIV, "",
         f"🎬 <b>{_esc(title)}</b>",
         "",
-        f"📌 {sc('pick which qualities to keep')}",
-        f"📌 {sc('others will be marked as deletable')}",
-        "",
-        DIV2, "",
-        f"📊 {sc('qualities found')} · <code>{', '.join(available) or 'none'}</code>",
-        f"✅ {sc('currently keeping')} · <code>{', '.join(current) or 'none'}</code>",
+        f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
+        f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>",
     ])
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SAFE EDIT
-# ═══════════════════════════════════════════════════════════════════════════
-async def _safe_edit(target, text: str, kb=None) -> bool:
+async def _safe_edit(t, text, kb=None):
     try:
-        msg = getattr(target, "message", target)
-        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True)
+        m = getattr(t, "message", t)
+        await m.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                           disable_web_page_preview=True)
         return True
-    except MessageNotModified:
-        return True
+    except MessageNotModified: return True
     except Exception as e:
-        logger.exception(f"[AI] edit: {type(e).__name__}: {e}")
-        return False
+        logger.exception(f"[AI] edit: {e}"); return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN LIBRARY (reads MANY DB field names)
+# SCAN LIBRARY — ALL COLLECTIONS
 # ═══════════════════════════════════════════════════════════════════════════
-async def _scan_library(client: Client, chat_id: int, status_msg_id: int,
-                       filter_slug: Optional[str] = None) -> Optional[SeriesCatalog]:
-    coll = _files_coll()
-    if coll is None:
-        return None
-
-    try:
-        total = await coll.estimated_document_count()
-    except Exception:
-        total = 0
-    if total == 0:
+async def _scan_library(client, chat_id, status_msg_id, filter_slug=None):
+    colls = await _all_file_collections()
+    if not colls:
+        logger.warning("[AI] no file collections")
         return SeriesCatalog()
 
-    catalog = SeriesCatalog()
+    total = 0; counts = {}
+    for name, c in colls:
+        try:
+            n = await c.estimated_document_count()
+            counts[name] = n; total += n
+        except Exception: counts[name] = 0
+
+    logger.info(f"[AI] scanning {len(colls)} colls, {total} docs")
+
+    cat = SeriesCatalog()
     processed = 0
     last_edit = 0.0
 
-    try:
-        cursor = coll.find({})
-        async for doc in cursor:
-            processed += 1
-
-            # ⭐ Try EVERY possible DB field name for the filename
-            fname = (
-                doc.get("file_name")
-                or doc.get("filename")
-                or doc.get("title")
-                or doc.get("name")
-                or doc.get("file_title")
-                or doc.get("caption")
-                or doc.get("file_caption")
-                or doc.get("media_title")
-                or ""
-            )
-
-            # Fallback: if no field matched, search any string field
-            if not fname:
-                for k, v in doc.items():
-                    if k in ("_id", "chat_id", "message_id", "msg_id",
-                             "file_id", "file_unique_id", "file_size", "size"):
-                        continue
-                    if isinstance(v, str) and len(v) > 5:
-                        if any(ext in v.lower() for ext in
-                               (".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts")):
-                            fname = v
-                            break
-
-            if not fname:
-                continue
-
-            parsed = parse_filename(str(fname))
-
-            if filter_slug is not None:
-                slug_match = parsed.get("title_slug", "")
-                if (filter_slug not in slug_match
-                        and slug_match not in filter_slug):
-                    continue
-
-            catalog.add(parsed, doc)
-
-            now = time.time()
-            if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
-                last_edit = now
-                try:
-                    await client.edit_message_text(
-                        chat_id=chat_id, message_id=status_msg_id,
-                        text=_view_scanning(processed, total),
-                        parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-
+    for cname, coll in colls:
         try:
-            await client.edit_message_text(
-                chat_id=chat_id, message_id=status_msg_id,
-                text=_view_scanning(processed, total),
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+            async for doc in coll.find({}):
+                processed += 1
+                fname = (doc.get("file_name") or doc.get("filename")
+                         or doc.get("title") or doc.get("name")
+                         or doc.get("file_title") or doc.get("caption")
+                         or doc.get("file_caption") or doc.get("media_title")
+                         or doc.get("text") or "")
+                if not fname:
+                    for k, v in doc.items():
+                        if k in ("_id","chat_id","message_id","msg_id",
+                                 "file_id","file_unique_id","file_size","size"):
+                            continue
+                        if isinstance(v, str) and len(v) > 5:
+                            if any(x in v.lower() for x in
+                                   (".mkv",".mp4",".avi",".mov",".webm",".ts",".m4v")):
+                                fname = v; break
+                if not fname: continue
 
-        return catalog
-    except Exception as e:
-        logger.exception(f"[AI] scan failed: {e}")
-        return catalog
+                p = parse_filename(str(fname))
+                if filter_slug is not None:
+                    sm = p.get("title_slug", "")
+                    if filter_slug not in sm and sm not in filter_slug:
+                        continue
 
+                cat.add(p, doc)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# /ai COMMAND
-# ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(
-    filters.command(["ai", "librarian", "ailib"]) & filters.private,
-    group=-430,
-)
-async def cmd_ai(client: Client, message: Message):
+                now = time.time()
+                if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
+                    last_edit = now
+                    try:
+                        await client.edit_message_text(
+                            chat_id=chat_id, message_id=status_msg_id,
+                            text=_view_scanning(processed, total, cname),
+                            parse_mode=ParseMode.HTML)
+                    except Exception: pass
+        except Exception as e:
+            logger.warning(f"[AI] scan {cname}: {e}"); continue
+
+    logger.info(f"[AI] done: {processed} files, {len(cat.data)} series")
     try:
-        if not message.from_user or not _is_admin(message.from_user.id):
-            return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+        await client.edit_message_text(
+            chat_id=chat_id, message_id=status_msg_id,
+            text=_view_scanning(processed, total),
+            parse_mode=ParseMode.HTML)
+    except Exception: pass
+    return cat
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_message(filters.command(["ai", "librarian", "ailib"]) & filters.private, group=-430)
+async def cmd_ai(client, message):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+    try:
         _clear_session(message.from_user.id)
         text, kb = await _view_main()
         await message.reply_text(text, reply_markup=kb,
                                   parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception as e:
-        logger.exception(f"[AI] /ai crashed: {e}")
+        logger.exception(f"[AI] /ai: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DIAGNOSTIC /aidb COMMAND
-# ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(
-    filters.command(["aidb", "ai_dbcheck", "aidbcheck"]) & filters.private,
-    group=-430,
-)
-async def cmd_aidb(client: Client, message: Message):
-    """Show what fields exist in media_files collection."""
+@Client.on_message(filters.command(["aidb", "aishards"]) & filters.private, group=-430)
+async def cmd_aidb(client, message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
-
-    coll = _files_coll()
-    if coll is None:
-        return await message.reply_text("❌ ᴅʙ ɴᴏᴛ ᴀᴄᴄᴇꜱꜱɪʙʟᴇ.")
-
     try:
-        total = await coll.estimated_document_count()
-        sample = await coll.find_one({})
-        if not sample:
-            return await message.reply_text("⚪ ᴅʙ ɪꜱ ᴇᴍᴘᴛʏ.")
-
-        sample.pop("_id", None)
-        fields = sorted(sample.keys())
-
-        # Try to find a Game of Thrones-like file
-        gof = None
-        for field in ("file_name", "filename", "title", "name",
-                      "caption", "file_caption", "media_title"):
+        colls = await _all_file_collections()
+        lines = ["🗄️ <b>ᴍᴏɴɢᴏ ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
+                 "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                 f"📁 <b>{len(colls)} ꜰɪʟᴇ ᴄᴏʟʟᴇᴄᴛɪᴏɴꜱ ꜰᴏᴜɴᴅ</b>", ""]
+        for name, c in colls:
+            try: n = await c.estimated_document_count()
+            except Exception: n = -1
+            lines.append(f"• <code>{_esc(name[:60])}</code> · {_fmt_int(n)}")
+        # sample
+        if colls:
             try:
-                gof = await coll.find_one(
-                    {field: {"$regex": "Thrones", "$options": "i"}})
-                if gof: break
-            except Exception:
-                continue
-
-        lines = [
-            "🔍 <b>ᴅʙ ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"📁 ᴛᴏᴛᴀʟ ꜰɪʟᴇꜱ · <code>{_fmt_int(total)}</code>",
-            "",
-            "🔑 <b>ꜰɪᴇʟᴅꜱ ɪɴ ᴅʙ</b>",
-        ]
-        for f in fields[:40]:
-            lines.append(f"  • <code>{f}</code>")
-
-        if gof:
-            gof.pop("_id", None)
-            lines.append("")
-            lines.append("🎬 <b>ꜱᴀᴍᴘʟᴇ 'ᴛʜʀᴏɴᴇꜱ' ꜰɪʟᴇ</b>")
-            for k, v in list(gof.items())[:20]:
-                v_str = str(v)[:90]
-                lines.append(f"  <code>{k}</code> = {_esc(v_str)}")
-        else:
-            lines.append("")
-            lines.append("⚠️ ɴᴏ 'ᴛʜʀᴏɴᴇꜱ' ꜰɪʟᴇ ꜰᴏᴜɴᴅ ɪɴ ʀᴇɢᴜʟᴀʀ ꜰɪᴇʟᴅꜱ")
-
+                sample = await colls[0][1].find_one({})
+                if sample:
+                    sample.pop("_id", None)
+                    lines += ["", "🔑 <b>ꜱᴀᴍᴘʟᴇ ꜰɪᴇʟᴅꜱ</b>"]
+                    for k in list(sample.keys())[:25]:
+                        v = str(sample[k])[:70]
+                        lines.append(f"• <code>{k}</code> = {_esc(v)}")
+            except Exception: pass
         await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
+        logger.exception(f"[AI] /aidb: {e}")
         await message.reply_text(f"❌ {_esc(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN PANEL CALLBACKS
+# MAIN CALLBACKS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:main$"), group=-430)
-async def cb_main(client: Client, q: CallbackQuery):
+async def cb_main(client, q):
     try:
         text, kb = await _view_main()
-        await _safe_edit(q, text, kb)
-        await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] cb_main: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        await _safe_edit(q, text, kb); await q.answer()
+    except Exception as e: logger.exception(f"[AI] cb_main: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:close$"), group=-430)
-async def cb_close(client: Client, q: CallbackQuery):
+async def cb_close(client, q):
     try:
         _clear_session(q.from_user.id)
         try: await q.message.delete()
@@ -1203,50 +1032,41 @@ async def cb_close(client: Client, q: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex(r"^ai:toggle_auto$"), group=-430)
-async def cb_toggle_auto(client: Client, q: CallbackQuery):
-    try:
-        current = await _get_setting("auto_mode", True)
-        new_val = not current
-        await _set_setting("auto_mode", new_val)
-        await q.answer("🟢 ᴀᴜᴛᴏ ᴏɴ" if new_val else "🔴 ᴀᴜᴛᴏ ᴏꜰꜰ")
-        text, kb = await _view_main()
-        await _safe_edit(q, text, kb)
-    except Exception as e:
-        logger.exception(f"[AI] toggle: {e}")
+async def cb_toggle_auto(client, q):
+    cur = await _get_setting("auto_mode", True)
+    await _set_setting("auto_mode", not cur)
+    await q.answer("🟢 ᴀᴜᴛᴏ ᴏɴ" if not cur else "🔴 ᴀᴜᴛᴏ ᴏꜰꜰ")
+    text, kb = await _view_main()
+    await _safe_edit(q, text, kb)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AUTO SCAN
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:auto$"), group=-430)
-async def cb_auto(client: Client, q: CallbackQuery):
+async def cb_auto(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
         _clear_session(q.from_user.id)
         await q.answer("🚀 ꜱᴄᴀɴɴɪɴɢ...")
-
         try:
-            status = await q.message.edit_text(
-                _view_scanning(0, 0), parse_mode=ParseMode.HTML)
+            status = await q.message.edit_text(_view_scanning(0, 0),
+                                                parse_mode=ParseMode.HTML)
         except Exception:
             status = q.message
 
-        catalog = await _scan_library(client, q.message.chat.id, status.id)
-        if catalog is None:
+        cat = await _scan_library(client, q.message.chat.id, status.id)
+        if cat is None:
             return await client.edit_message_text(
                 chat_id=q.message.chat.id, message_id=status.id,
-                text="⚠️ ᴅᴀᴛᴀʙᴀꜱᴇ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ.",
-                parse_mode=ParseMode.HTML)
+                text="⚠️ ᴅʙ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ.", parse_mode=ParseMode.HTML)
 
-        all_series = catalog.list_series()
-        await _set_setting("total_series", len(all_series))
+        all_s = cat.list_series()
+        await _set_setting("total_series", len(all_s))
 
-        pending: List[Dict[str, Any]] = []
-        for s in all_series:
-            if await _is_completed(s["title_slug"]):
-                continue
-            pending.append(s)
+        pending = [s for s in all_s
+                   if not await _is_completed(s["title_slug"])]
 
         if not pending:
             try:
@@ -1254,14 +1074,14 @@ async def cb_auto(client: Client, q: CallbackQuery):
                     chat_id=q.message.chat.id, message_id=status.id,
                     text="\n".join([
                         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                        f"✅ <b>{fb('ALL SERIES REVIEWED')}</b>",
+                        f"✅ <b>{fb('ALL REVIEWED')}</b>",
                         DIV, "",
-                        f"🎉 {sc('every series is marked complete')}",
+                        f"🎉 {sc('every series is completed')}",
+                        f"📊 {sc('total')} · <code>{len(all_s)}</code>",
                     ]),
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
-                        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close"),
-                    ]]),
+                        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]]),
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
@@ -1270,15 +1090,13 @@ async def cb_auto(client: Client, q: CallbackQuery):
         picked = pending[:SERIES_PER_AUTO]
 
         _new_session(q.from_user.id, "auto_scan",
-                     picked=[s["title_slug"] for s in picked],
-                     index=0)
+                     picked=[s["title_slug"] for s in picked], index=0)
         sess = _SESSIONS[q.from_user.id]
-        sess["catalog_data"] = catalog.data
+        sess["catalog_data"] = cat.data
         sess["current_total"] = len(picked)
 
-        await _show_series_by_slug(
-            client, q.message.chat.id, status.id,
-            picked[0]["title_slug"], 1, len(picked))
+        await _show_series(client, q.message.chat.id, status.id,
+                            picked[0]["title_slug"], 1, len(picked))
     except Exception as e:
         logger.exception(f"[AI] cb_auto: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -1286,41 +1104,37 @@ async def cb_auto(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MANUAL SCAN
+# MANUAL SCAN — with TMDB SUGGESTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:manual$"), group=-430)
-async def cb_manual(client: Client, q: CallbackQuery):
+async def cb_manual(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
-    try:
-        _clear_session(q.from_user.id)
-        _new_session(q.from_user.id, "manual_name")
-        await _safe_edit(q,
-            "\n".join([
-                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"✍️ <b>{fb('MANUAL SCAN')}</b>",
-                DIV, "",
-                f"📝 {sc('send the series name as next message')}",
-                "",
-                f"📌 {sc('example')} · <code>Game of Thrones</code>",
-            ]),
-            InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
-        await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] cb_manual: {e}")
+    _clear_session(q.from_user.id)
+    _new_session(q.from_user.id, "manual_name")
+    await _safe_edit(q, "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"✍️ <b>{fb('MANUAL SCAN')}</b>",
+        DIV, "",
+        f"📝 {sc('send a name or short form')}",
+        "",
+        f"📌 {sc('examples')}:",
+        f"• <code>got</code>",
+        f"• <code>game of thrones</code>",
+        f"• <code>breaking bad</code>",
+        "",
+        f"💡 {sc('bot will suggest from tmdb')}",
+    ]), InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
+    await q.answer()
 
 
-@Client.on_message(
-    filters.private & filters.text & ~filters.regex(r"^/"),
-    group=-429,
-)
-async def ai_manual_input(client: Client, message: Message):
+@Client.on_message(filters.private & filters.text & ~filters.regex(r"^/"), group=-429)
+async def ai_manual_input(client, message):
     if not message.from_user: return
-    session = _get_session(message.from_user.id)
-    if not session or session["action"] != "manual_name":
+    s = _get_session(message.from_user.id)
+    if not s or s["action"] not in ("manual_name", "manual_tmdb"):
         return
-
     try: message.stop_propagation()
     except Exception: pass
 
@@ -1329,650 +1143,578 @@ async def ai_manual_input(client: Client, message: Message):
         return await message.reply_text("❌ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
 
     _clear_session(message.from_user.id)
-    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
+    # Ask TMDB
     try:
-        status = await message.reply_text(
-            _view_scanning(0, 0), parse_mode=ParseMode.HTML)
+        loading = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ ᴛᴍᴅʙ...")
     except Exception:
         return
 
-    catalog = await _scan_library(client, message.chat.id, status.id,
-                                   filter_slug=slug)
+    suggestions = await _tmdb_suggest(text, kind="tv")
 
-    if catalog is None or not catalog.data:
+    if not suggestions:
+        # No TMDB → try local scan directly
         try:
             await client.edit_message_text(
-                chat_id=message.chat.id, message_id=status.id,
-                text="\n".join([
-                    f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                    f"❌ <b>{fb('NOT FOUND')}</b>",
-                    DIV, "",
-                    f"🔍 {sc('searched')} · <code>{_esc(text)}</code>",
-                    "",
-                    f"📌 {sc('no matching series in your db')}",
-                    f"📌 {sc('try a different name')}",
-                ]),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✍️ TRY AGAIN",
-                                           callback_data="ai:manual")],
-                    [InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
-                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
-                ]),
+                chat_id=message.chat.id, message_id=loading.id,
+                text="🔍 ᴛᴍᴅʙ ɴᴏ ʀᴇꜱᴜʟᴛꜱ · ꜱᴄᴀɴɴɪɴɢ ᴅʙ ʟᴏᴄᴀʟʟʏ...",
                 parse_mode=ParseMode.HTML)
         except Exception: pass
+
+        slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+        cat = await _scan_library(client, message.chat.id, loading.id,
+                                    filter_slug=slug)
+        if cat is None or not cat.data:
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id, message_id=loading.id,
+                    text="\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"❌ <b>{fb('NOT FOUND')}</b>",
+                        DIV, "",
+                        f"🔍 <code>{_esc(text)}</code>",
+                        f"📌 {sc('not in your db')}",
+                    ]),
+                    reply_markup=kb_back("ai:main"),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            return
+
+        _new_session(message.from_user.id, "manual_result")
+        sess = _SESSIONS[message.from_user.id]
+        sess["catalog_data"] = cat.data
+        slug0 = list(cat.data.keys())[0]
+        await _show_series(client, message.chat.id, loading.id, slug0, 1, 1)
         return
 
-    slugs = list(catalog.data.keys())
-    first_slug = slugs[0]
+    # Cache suggestions in session
+    _new_session(message.from_user.id, "manual_tmdb_pick",
+                 suggestions=suggestions, query=text)
 
-    _new_session(message.from_user.id, "manual_result",
-                 slug=first_slug, all_slugs=slugs)
-    sess = _SESSIONS[message.from_user.id]
-    sess["catalog_data"] = catalog.data
-
-    await _show_series_by_slug(
-        client, message.chat.id, status.id,
-        first_slug, 1, 1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SHOW SERIES
-# ═══════════════════════════════════════════════════════════════════════════
-async def _show_series_by_slug(client: Client, chat_id: int,
-                                msg_id: int, title_slug: str,
-                                index: int, total: int):
-    sess = None
-    for uid, s in _SESSIONS.items():
-        if "catalog_data" in s:
-            sess = s
-            break
-
-    if not sess or not sess.get("catalog_data"):
-        try:
-            await client.edit_message_text(
-                chat_id=chat_id, message_id=msg_id,
-                text="⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ. ᴛʀʏ ᴀɢᴀɪɴ.",
-                parse_mode=ParseMode.HTML)
-        except Exception: pass
-        return
-
-    data = sess["catalog_data"]
-    series = data.get(title_slug)
-    if not series:
-        try:
-            await client.edit_message_text(
-                chat_id=chat_id, message_id=msg_id,
-                text="⚠️ ꜱᴇʀɪᴇꜱ ɴᴏᴛ ꜰᴏᴜɴᴅ.",
-                parse_mode=ParseMode.HTML)
-        except Exception: pass
-        return
-
-    prefs = await _get_prefs(title_slug)
-    text = _view_series_result(
-        {"title": series.get("title"), "seasons": series.get("seasons")},
-        prefs, index, total)
-    kb = kb_scan_result(title_slug, index, total)
-
-    sess["current_slug"] = title_slug
-    sess["current_index"] = index
-    sess["current_total"] = total
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🔎 <b>{fb('TMDB SUGGESTIONS')}</b>",
+        DIV, "",
+        f"📝 {sc('you searched')} · <code>{_esc(text)}</code>",
+        "",
+        f"📌 {sc('tap a title to scan your db')}",
+        "",
+        DIV2, "",
+    ]
+    for i, it in enumerate(suggestions, 1):
+        title = it.get("title") or "?"
+        yr = it.get("year") or ""
+        rating = it.get("rating", 0)
+        lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> ({yr})")
+        if rating:
+            lines.append(f"   ⭐ <code>{rating:.1f}</code>")
+        lines.append("")
 
     try:
         await client.edit_message_text(
-            chat_id=chat_id, message_id=msg_id,
-            text=text, reply_markup=kb,
+            chat_id=message.chat.id, message_id=loading.id,
+            text="\n".join(lines),
+            reply_markup=kb_tmdb_suggest(suggestions),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True)
-    except MessageNotModified:
-        pass
     except Exception as e:
-        logger.debug(f"[AI] show series: {e}")
+        logger.warning(f"[AI] tmdb suggest: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:next:([a-z0-9_]+)$"), group=-430)
-async def cb_next(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:pick_tmdb:(\d+)$"), group=-430)
+async def cb_pick_tmdb(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
     try:
-        sess = _get_session(q.from_user.id)
-        if not sess:
+        idx = int(q.matches[0].group(1))
+        s = _get_session(q.from_user.id)
+        if not s or s["action"] != "manual_tmdb_pick":
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess.get("data") or {}
-        picked = data.get("picked") or []
-        idx = data.get("index", 0) + 1
-        if idx >= len(picked):
-            return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
-        sess["data"]["index"] = idx
-        next_slug = picked[idx]
-        await q.answer()
-        await _show_series_by_slug(
-            client, q.message.chat.id, q.message.id,
-            next_slug, idx + 1, len(picked))
-    except Exception as e:
-        logger.exception(f"[AI] next: {e}")
 
+        sugg = (s.get("data") or {}).get("suggestions") or []
+        if idx < 0 or idx >= len(sugg):
+            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# VIEW FILES
-# ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
-async def cb_view_series(client: Client, q: CallbackQuery):
-    try:
-        slug = q.matches[0].group(1)
-        sess = _get_session(q.from_user.id)
-        if not sess or not sess.get("catalog_data"):
-            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess["catalog_data"]
-        series = data.get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        seasons = series.get("seasons") or {}
-        if not seasons:
-            return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-        first_season = sorted(seasons.keys())[0]
-        eps = seasons[first_season]
-        first_ep = sorted([e for e in eps.keys() if e is not None])[0] \
-            if any(e is not None for e in eps.keys()) else None
-        if first_ep is None:
-            return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-        files = eps[first_ep]
-        # Score all files
-        for f in files:
-            f["_score"] = _compute_file_score(f)[0]
-        prefs = await _get_prefs(slug)
-        text = _view_episode_files(series.get("title"), first_season,
-                                    first_ep, files, prefs)
-        kb = kb_episode_files(slug, first_season, first_ep, files)
-        await _safe_edit(q, text, kb)
-        await q.answer()
+        chosen = sugg[idx]
+        title = chosen.get("title") or ""
+        _clear_session(q.from_user.id)
+
+        await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ ᴅʙ...")
+        try:
+            await q.message.edit_text(_view_scanning(0, 0),
+                                       parse_mode=ParseMode.HTML)
+        except Exception: pass
+
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        cat = await _scan_library(client, q.message.chat.id, q.message.id,
+                                    filter_slug=slug)
+
+        if cat is None or not cat.data:
+            try:
+                await client.edit_message_text(
+                    chat_id=q.message.chat.id, message_id=q.message.id,
+                    text="\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"❌ <b>{fb('NOT IN YOUR DB')}</b>",
+                        DIV, "",
+                        f"🎬 <b>{_esc(title)}</b>",
+                        f"📅 <code>{chosen.get('year') or '?'}</code>",
+                        "",
+                        DIV2, "",
+                        f"📌 {sc('this series is not in your library')}",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✍️ SEARCH AGAIN",
+                                               callback_data="ai:manual")],
+                        [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
+                         InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
+                    ]),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            return
+
+        _new_session(q.from_user.id, "manual_result")
+        sess = _SESSIONS[q.from_user.id]
+        sess["catalog_data"] = cat.data
+
+        # Find best slug match
+        best_slug = None
+        for k in cat.data.keys():
+            if slug in k or k in slug:
+                best_slug = k; break
+        if not best_slug:
+            best_slug = list(cat.data.keys())[0]
+
+        await _show_series(client, q.message.chat.id, q.message.id,
+                            best_slug, 1, 1)
     except Exception as e:
-        logger.exception(f"[AI] view series: {e}")
+        logger.exception(f"[AI] pick_tmdb: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
         except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# QUALITY PREFS
+# SHOW SERIES
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
-async def cb_pref(client: Client, q: CallbackQuery):
+async def _show_series(client, chat_id, msg_id, slug, i, t):
+    sess = None
+    for uid, s in _SESSIONS.items():
+        if "catalog_data" in s:
+            sess = s; break
+    if not sess or not sess.get("catalog_data"):
+        try:
+            await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                text="⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ.", parse_mode=ParseMode.HTML)
+        except Exception: pass
+        return
+
+    series = sess["catalog_data"].get(slug)
+    if not series:
+        try:
+            await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                text="⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ.", parse_mode=ParseMode.HTML)
+        except Exception: pass
+        return
+
+    prefs = await _get_prefs(slug)
+    text = _view_series_result(
+        {"title": series.get("title"), "seasons": series.get("seasons")},
+        prefs, i, t)
+    kb = kb_scan_result(slug, i, t)
+
+    sess["current_slug"] = slug
+    sess["current_index"] = i
+    sess["current_total"] = t
+
+    try:
+        await client.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=text, reply_markup=kb,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except MessageNotModified: pass
+    except Exception as e: logger.debug(f"[AI] show_series: {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ai:next:([a-z0-9_]+)$"), group=-430)
+async def cb_next(client, q):
+    try:
+        s = _get_session(q.from_user.id)
+        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        d = s.get("data") or {}
+        picked = d.get("picked") or []
+        i = d.get("index", 0) + 1
+        if i >= len(picked): return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
+        s["data"]["index"] = i
+        await q.answer()
+        await _show_series(client, q.message.chat.id, q.message.id,
+                            picked[i], i + 1, len(picked))
+    except Exception as e: logger.exception(f"[AI] next: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW FILES / QUALITY PREFS / COMPLETE
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
+async def cb_view(client, q):
     try:
         slug = q.matches[0].group(1)
-        sess = _get_session(q.from_user.id)
-        if not sess or not sess.get("catalog_data"):
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess["catalog_data"]
-        series = data.get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        available: Set[str] = set()
-        for snum, eps in (series.get("seasons") or {}).items():
-            for ep, files in eps.items():
-                for f in files:
-                    q_ = f.get("quality")
-                    if q_: available.add(q_)
-        avail_list = sorted(available,
-                            key=lambda x: QUALITY_RANK.get(x, 0),
-                            reverse=True)
-        if not avail_list:
-            return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
-        current = await _get_prefs(slug)
-        sess["pref_working"] = list(current)
-        text = _view_quality_picker(series.get("title"), avail_list, current)
-        kb = kb_quality_picker(slug, avail_list, current)
-        await _safe_edit(q, text, kb)
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        seasons = series.get("seasons") or {}
+        if not seasons: return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
+        fs = sorted(seasons.keys())[0]
+        eps = seasons[fs]
+        fe = sorted([e for e in eps.keys() if e is not None])[0] \
+            if any(e is not None for e in eps.keys()) else None
+        if fe is None: return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
+        files = eps[fe]
+        for f in files: f["_score"] = _score(f)
+        prefs = await _get_prefs(slug)
+        await _safe_edit(q,
+            _view_episode_files(series.get("title"), fs, fe, files, prefs),
+            kb_episode_files(slug, fs, fe, files))
         await q.answer()
     except Exception as e:
-        logger.exception(f"[AI] pref: {e}")
+        logger.exception(f"[AI] view: {e}")
 
 
-@Client.on_callback_query(
-    filters.regex(r"^ai:pref_tog:([a-z0-9_]+):(\w+)$"), group=-430)
-async def cb_pref_toggle(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
+async def cb_pref(client, q):
     try:
         slug = q.matches[0].group(1)
-        quality = q.matches[0].group(2)
-        sess = _get_session(q.from_user.id)
-        if not sess:
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        working = sess.get("pref_working") or []
-        if quality in working:
-            working.remove(quality)
-        else:
-            working.append(quality)
-        sess["pref_working"] = working
-        data = sess.get("catalog_data") or {}
-        series = data.get(slug) or {}
-        available: Set[str] = set()
-        for snum, eps in (series.get("seasons") or {}).items():
-            for ep, files in eps.items():
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        avail = set()
+        for _, eps in (series.get("seasons") or {}).items():
+            for _, files in eps.items():
                 for f in files:
-                    q_ = f.get("quality")
-                    if q_: available.add(q_)
-        avail_list = sorted(available,
-                            key=lambda x: QUALITY_RANK.get(x, 0),
-                            reverse=True)
-        text = _view_quality_picker(series.get("title"), avail_list, working)
-        kb = kb_quality_picker(slug, avail_list, working)
-        await _safe_edit(q, text, kb)
-        await q.answer("✅" if quality in working else "⬜")
-    except Exception as e:
-        logger.exception(f"[AI] pref_tog: {e}")
+                    if f.get("quality"): avail.add(f["quality"])
+        al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+        if not al: return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
+        cur = await _get_prefs(slug)
+        s["pref_working"] = list(cur)
+        await _safe_edit(q, _view_quality_picker(series.get("title"), al, cur),
+                          kb_quality_picker(slug, al, cur))
+        await q.answer()
+    except Exception as e: logger.exception(f"[AI] pref: {e}")
 
 
-@Client.on_callback_query(
-    filters.regex(r"^ai:pref_save:([a-z0-9_]+)$"), group=-430)
-async def cb_pref_save(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:pref_tog:([a-z0-9_]+):(\w+)$"), group=-430)
+async def cb_pref_tog(client, q):
+    try:
+        slug = q.matches[0].group(1); qual = q.matches[0].group(2)
+        s = _get_session(q.from_user.id)
+        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        w = s.get("pref_working") or []
+        w.remove(qual) if qual in w else w.append(qual)
+        s["pref_working"] = w
+        series = (s.get("catalog_data") or {}).get(slug) or {}
+        avail = set()
+        for _, eps in (series.get("seasons") or {}).items():
+            for _, files in eps.items():
+                for f in files:
+                    if f.get("quality"): avail.add(f["quality"])
+        al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+        await _safe_edit(q, _view_quality_picker(series.get("title"), al, w),
+                          kb_quality_picker(slug, al, w))
+        await q.answer("✅" if qual in w else "⬜")
+    except Exception as e: logger.exception(f"[AI] pref_tog: {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ai:pref_save:([a-z0-9_]+)$"), group=-430)
+async def cb_pref_save(client, q):
     try:
         slug = q.matches[0].group(1)
-        sess = _get_session(q.from_user.id)
-        if not sess:
-            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        working = sess.get("pref_working") or []
-        data = sess.get("catalog_data") or {}
-        series = data.get(slug) or {}
+        s = _get_session(q.from_user.id)
+        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        w = s.get("pref_working") or []
+        series = (s.get("catalog_data") or {}).get(slug) or {}
         title = series.get("title") or slug
-        ok = await _set_prefs(slug, title, working)
+        ok = await _set_prefs(slug, title, w)
         await q.answer("✅ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
         if not ok: return
-        text = _view_series_result(
-            {"title": title, "seasons": series.get("seasons")},
-            working,
-            sess.get("current_index", 1),
-            sess.get("current_total", 1))
-        kb = kb_scan_result(slug,
-                            sess.get("current_index", 1),
-                            sess.get("current_total", 1))
-        await _safe_edit(q, text, kb)
-    except Exception as e:
-        logger.exception(f"[AI] pref_save: {e}")
+        await _safe_edit(q,
+            _view_series_result({"title": title, "seasons": series.get("seasons")},
+                                w, s.get("current_index", 1), s.get("current_total", 1)),
+            kb_scan_result(slug, s.get("current_index", 1), s.get("current_total", 1)))
+    except Exception as e: logger.exception(f"[AI] pref_save: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:prefs$"), group=-430)
-async def cb_prefs_list(client: Client, q: CallbackQuery):
+async def cb_prefs(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
         items = await _list_prefs()
-        lines = [
-            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"🎯 <b>{fb('QUALITY PREFERENCES')}</b>",
-            DIV, "",
-        ]
-        if not items:
-            lines.append("⚪ ɴᴏ ᴘʀᴇꜰᴇʀᴇɴᴄᴇꜱ ꜱᴇᴛ ʏᴇᴛ.")
+        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                 f"🎯 <b>{fb('QUALITY PREFS')}</b>", DIV, ""]
+        if not items: lines.append("⚪ ɴᴏɴᴇ ꜱᴇᴛ.")
         else:
             for it in items[:30]:
-                title = it.get("title") or "?"
-                qs = it.get("keep_qualities") or []
-                lines.append(f"🎬 <b>{_esc(title)}</b>")
-                lines.append(f"   ✅ <code>{', '.join(qs)}</code>")
+                lines.append(f"🎬 <b>{_esc(it.get('title'))}</b>")
+                lines.append(f"   ✅ <code>{', '.join(it.get('keep_qualities') or [])}</code>")
                 lines.append("")
         await _safe_edit(q, "\n".join(lines), kb_back("ai:main"))
         await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] prefs_list: {e}")
+    except Exception as e: logger.exception(f"[AI] prefs: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MARK COMPLETE
-# ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(
-    filters.regex(r"^ai:complete:([a-z0-9_]+)$"), group=-430)
-async def cb_complete(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:complete:([a-z0-9_]+)$"), group=-430)
+async def cb_complete(client, q):
     try:
         slug = q.matches[0].group(1)
-        sess = _get_session(q.from_user.id)
-        if not sess:
-            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess.get("catalog_data") or {}
-        series = data.get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        total_files = series.get("file_count", 0)
-        title = series.get("title") or slug
-        ok = await _mark_completed(title, slug, total_files)
-        if not ok:
-            return await q.answer("❌ ꜰᴀɪʟᴇᴅ", show_alert=True)
-        await q.answer("✅ ᴍᴀʀᴋᴇᴅ ᴄᴏᴍᴘʟᴇᴛᴇ")
-        await _safe_edit(q,
-            "\n".join([
-                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"✅ <b>{fb('MARKED COMPLETE')}</b>",
-                DIV, "",
-                f"🎬 <b>{_esc(title)}</b>",
-                f"📁 {sc('total files')} · <code>{_fmt_int(total_files)}</code>",
-                f"📅 {sc('marked')} · <code>{_now_ist()}</code>",
-            ]),
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭️ NEXT SERIES",
-                                       callback_data=f"ai:next:{slug}")],
-                [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
-                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
-            ]))
-    except Exception as e:
-        logger.exception(f"[AI] complete: {e}")
+        s = _get_session(q.from_user.id)
+        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        series = (s.get("catalog_data") or {}).get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        ok = await _mark_completed(series.get("title", slug), slug,
+                                     series.get("file_count", 0))
+        if not ok: return await q.answer("❌ ꜰᴀɪʟᴇᴅ", show_alert=True)
+        await q.answer("✅ ᴍᴀʀᴋᴇᴅ")
+        await _safe_edit(q, "\n".join([
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"✅ <b>{fb('MARKED COMPLETE')}</b>",
+            DIV, "",
+            f"🎬 <b>{_esc(series.get('title'))}</b>",
+            f"📁 <code>{_fmt_int(series.get('file_count', 0))}</code> ꜰɪʟᴇꜱ",
+            f"📅 <code>{_now_ist()}</code>",
+        ]), InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭️ NEXT", callback_data=f"ai:next:{slug}")],
+            [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
+             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]]))
+    except Exception as e: logger.exception(f"[AI] complete: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ALL SERIES
-# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:all$"), group=-430)
-async def cb_all(client: Client, q: CallbackQuery):
+async def cb_all(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
         _clear_session(q.from_user.id)
         await q.answer("🔍 ʟᴏᴀᴅɪɴɢ...")
         try:
-            status = await q.message.edit_text(
-                _view_scanning(0, 0), parse_mode=ParseMode.HTML)
-        except Exception:
-            status = q.message
-        catalog = await _scan_library(client, q.message.chat.id, status.id)
-        if catalog is None:
-            return
-        all_series = catalog.list_series()
-        await _set_setting("total_series", len(all_series))
-        if not all_series:
+            status = await q.message.edit_text(_view_scanning(0, 0),
+                                                parse_mode=ParseMode.HTML)
+        except Exception: status = q.message
+        cat = await _scan_library(client, q.message.chat.id, status.id)
+        if cat is None: return
+        all_s = cat.list_series()
+        await _set_setting("total_series", len(all_s))
+        if not all_s:
             try:
-                await client.edit_message_text(
-                    chat_id=q.message.chat.id, message_id=status.id,
-                    text="⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ ɪɴ ᴅʙ.",
+                await client.edit_message_text(chat_id=q.message.chat.id,
+                    message_id=status.id, text="⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ.",
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
         sess = _SESSIONS.setdefault(q.from_user.id, {})
-        sess["catalog_data"] = catalog.data
-        completed_slugs = {s.get("title_slug") for s in await _list_completed()}
-        lines = [
-            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"📚 <b>{fb('ALL SERIES')}</b>",
-            DIV, "",
-            f"📊 {sc('total')} · <code>{_fmt_int(len(all_series))}</code>",
-            f"✅ {sc('completed')} · <code>{_fmt_int(len(completed_slugs))}</code>",
-            "",
-            DIV2, "",
-        ]
-        for s in all_series[:25]:
-            mark = "✅" if s["title_slug"] in completed_slugs else "🎬"
-            lines.append(f"{mark} <b>{_esc(s['title'])}</b> · "
-                         f"<code>{s['file_count']}</code> ꜰɪʟᴇꜱ")
+        sess["catalog_data"] = cat.data
+        comp = {s.get("title_slug") for s in await _list_completed()}
+        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                 f"📚 <b>{fb('ALL SERIES')}</b>",
+                 DIV, "",
+                 f"📊 <code>{len(all_s)}</code> · ✅ <code>{len(comp)}</code>",
+                 "", DIV2, ""]
+        for s in all_s[:25]:
+            mk = "✅" if s["title_slug"] in comp else "🎬"
+            lines.append(f"{mk} <b>{_esc(s['title'])}</b> · <code>{s['file_count']}</code>")
         try:
-            await client.edit_message_text(
-                chat_id=q.message.chat.id, message_id=status.id,
-                text="\n".join(lines),
-                reply_markup=kb_series_list(all_series),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True)
-        except Exception as e:
-            logger.warning(f"[AI] all list: {e}")
-    except Exception as e:
-        logger.exception(f"[AI] all: {e}")
+            await client.edit_message_text(chat_id=q.message.chat.id,
+                message_id=status.id, text="\n".join(lines),
+                reply_markup=kb_series_list(all_s),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception: pass
+    except Exception as e: logger.exception(f"[AI] all: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# COMPLETED LIST
-# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:completed$"), group=-430)
-async def cb_completed(client: Client, q: CallbackQuery):
+async def cb_comp(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
-        items = await _list_completed(limit=50)
-        lines = [
-            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"✅ <b>{fb('COMPLETED SERIES')}</b>",
-            DIV, "",
-        ]
-        if not items:
-            lines.append("⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ᴍᴀʀᴋᴇᴅ ᴄᴏᴍᴘʟᴇᴛᴇ ʏᴇᴛ.")
+        items = await _list_completed(50)
+        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                 f"✅ <b>{fb('COMPLETED')}</b>", DIV, ""]
+        if not items: lines.append("⚪ ɴᴏɴᴇ ʏᴇᴛ.")
         else:
             for it in items[:30]:
-                title = it.get("title") or "?"
                 ts = it.get("completed_at", 0)
-                try:
-                    d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
-                except Exception:
-                    d = "?"
-                lines.append(f"✅ <b>{_esc(title)}</b>")
-                lines.append(f"   📅 <code>{d}</code>")
-                lines.append("")
-        rows = []
-        for it in items[:10]:
-            rows.append([InlineKeyboardButton(
-                f"🔄 UNMARK · {it.get('title', '?')[:25]}",
-                callback_data=f"ai:unmark:{it.get('title_slug')}"
-            )])
+                try: d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
+                except Exception: d = "?"
+                lines.append(f"✅ <b>{_esc(it.get('title'))}</b> · <code>{d}</code>")
+        rows = [[InlineKeyboardButton(f"🔄 UNMARK · {(it.get('title') or '?')[:25]}",
+                                       callback_data=f"ai:unmark:{it.get('title_slug')}")]
+                for it in items[:10]]
         rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                      InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
         await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
         await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] completed: {e}")
+    except Exception as e: logger.exception(f"[AI] comp: {e}")
 
 
-@Client.on_callback_query(
-    filters.regex(r"^ai:unmark:([a-z0-9_]+)$"), group=-430)
-async def cb_unmark(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:unmark:([a-z0-9_]+)$"), group=-430)
+async def cb_unmark(client, q):
     try:
         slug = q.matches[0].group(1)
         ok = await _unmark_completed(slug)
         await q.answer("✅ ᴜɴᴍᴀʀᴋᴇᴅ" if ok else "❌ ɴᴏᴛ ꜰᴏᴜɴᴅ")
-        await cb_completed(client, q)
-    except Exception as e:
-        logger.exception(f"[AI] unmark: {e}")
+        await cb_comp(client, q)
+    except Exception as e: logger.exception(f"[AI] unmark: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SMART DELETE
+# DELETE
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(
-    filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\d+)$"),
-    group=-430)
-async def cb_del_pick(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\d+)$"), group=-430)
+async def cb_del_pick(client, q):
     try:
         slug = q.matches[0].group(1)
-        season = int(q.matches[0].group(2))
-        episode_raw = int(q.matches[0].group(3))
+        sn = int(q.matches[0].group(2))
+        ep_raw = int(q.matches[0].group(3))
         idx = int(q.matches[0].group(4))
-        episode = episode_raw if episode_raw > 0 else None
-        sess = _get_session(q.from_user.id)
-        if not sess or not sess.get("catalog_data"):
+        ep = ep_raw if ep_raw > 0 else None
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess["catalog_data"]
-        series = data.get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        eps = (series.get("seasons") or {}).get(season, {})
-        files = eps.get(episode, [])
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        files = ((series.get("seasons") or {}).get(sn) or {}).get(ep, [])
         if idx < 0 or idx >= len(files):
-            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ꜰɪʟᴇ", show_alert=True)
-        f = files[idx]
-        text = _view_confirm_delete(series.get("title"), season, episode, f)
-        kb = kb_confirm_delete(slug, season, episode, idx)
-        await _safe_edit(q, text, kb)
+            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        await _safe_edit(q, _view_confirm_delete(series.get("title"), sn, ep, files[idx]),
+                          kb_confirm_delete(slug, sn, ep, idx))
         await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] del_pick: {e}")
+    except Exception as e: logger.exception(f"[AI] del_pick: {e}")
 
 
-@Client.on_callback_query(
-    filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\d+)$"),
-    group=-430)
-async def cb_del_go(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\d+)$"), group=-430)
+async def cb_del_go(client, q):
     try:
         slug = q.matches[0].group(1)
-        season = int(q.matches[0].group(2))
-        episode_raw = int(q.matches[0].group(3))
+        sn = int(q.matches[0].group(2))
+        ep_raw = int(q.matches[0].group(3))
         idx = int(q.matches[0].group(4))
-        episode = episode_raw if episode_raw > 0 else None
-        sess = _get_session(q.from_user.id)
-        if not sess or not sess.get("catalog_data"):
+        ep = ep_raw if ep_raw > 0 else None
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        data = sess["catalog_data"]
-        series = data.get(slug)
-        if not series:
-            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        eps = (series.get("seasons") or {}).get(season, {})
-        files = eps.get(episode, [])
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        files = ((series.get("seasons") or {}).get(sn) or {}).get(ep, [])
         if idx < 0 or idx >= len(files):
-            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ꜰɪʟᴇ", show_alert=True)
-        f = files[idx]
-        file_id = f.get("file_id") or ""
-        if not file_id:
-            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
-        ok = await _delete_file_record(file_id)
-        if not ok:
-            return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
+            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+        fid = files[idx].get("file_id") or ""
+        if not fid: return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
+        ok = await _delete_file_record(fid)
+        if not ok: return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
         files.pop(idx)
-        sess["catalog_data"][slug]["seasons"][season][episode] = files
+        s["catalog_data"][slug]["seasons"][sn][ep] = files
         await q.answer("🗑️ ᴅᴇʟᴇᴛᴇᴅ")
-        for f2 in files:
-            f2["_score"] = _compute_file_score(f2)[0]
+        for f in files: f["_score"] = _score(f)
         prefs = await _get_prefs(slug)
-        text = _view_episode_files(series.get("title"), season,
-                                    episode, files, prefs)
-        kb = kb_episode_files(slug, season, episode, files)
-        await _safe_edit(q, text, kb)
-    except Exception as e:
-        logger.exception(f"[AI] del_go: {e}")
+        await _safe_edit(q,
+            _view_episode_files(series.get("title"), sn, ep, files, prefs),
+            kb_episode_files(slug, sn, ep, files))
+    except Exception as e: logger.exception(f"[AI] del_go: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DAILY REPORT
+# DAILY REPORT + BOOT
 # ═══════════════════════════════════════════════════════════════════════════
-_LAST_REPORT_DATE: Optional[str] = None
+_LAST_REPORT: Optional[str] = None
 
 
-async def _daily_report_loop(client: Client):
-    global _LAST_REPORT_DATE
+async def _daily_loop(client):
+    global _LAST_REPORT
     await asyncio.sleep(120)
     while True:
         try:
             now = datetime.now(IST)
-            today_key = now.strftime("%Y-%m-%d")
-            auto_on = await _get_setting("auto_mode", True)
-            if (auto_on
-                    and now.hour == DAILY_REPORT_HOUR
-                    and now.minute < 5
-                    and _LAST_REPORT_DATE != today_key):
-                _LAST_REPORT_DATE = today_key
-                await _send_daily_report(client)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"[AI] daily loop: {e}")
+            key = now.strftime("%Y-%m-%d")
+            on = await _get_setting("auto_mode", True)
+            if (on and now.hour == DAILY_REPORT_HOUR
+                    and now.minute < 5 and _LAST_REPORT != key):
+                _LAST_REPORT = key
+                await _send_report(client)
+        except asyncio.CancelledError: break
+        except Exception as e: logger.warning(f"[AI] daily: {e}")
         await asyncio.sleep(60)
 
 
-async def _send_daily_report(client: Client):
+async def _send_report(client):
     try:
-        completed_count = await _count_completed()
-        total_series = await _get_setting("total_series", 0)
+        comp = await _count_completed()
+        total = await _get_setting("total_series", 0)
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"🎛️ <b>{fb('DAILY AI REPORT')}</b>",
             DIV, "",
-            f"📅 <code>{_now_ist()}</code>",
-            "",
-            f"📚 {sc('total series')} · <code>{_fmt_int(total_series)}</code>",
-            f"✅ {sc('completed')} · <code>{_fmt_int(completed_count)}</code>",
-            f"⏳ {sc('pending')} · "
-            f"<code>{_fmt_int(max(0, total_series - completed_count))}</code>",
-            "",
-            DIV2, "",
-            f"📌 {sc('tap auto to review 3 series today')}",
+            f"📅 <code>{_now_ist()}</code>", "",
+            f"📚 {sc('total')} · <code>{_fmt_int(total)}</code>",
+            f"✅ {sc('completed')} · <code>{_fmt_int(comp)}</code>",
+            f"⏳ {sc('pending')} · <code>{_fmt_int(max(0, total - comp))}</code>",
+            "", DIV2, "",
+            f"📌 {sc('tap auto to review 3 series')}",
         ])
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 AUTO SCAN", callback_data="ai:auto"),
+            [InlineKeyboardButton("🚀 AUTO", callback_data="ai:auto"),
              InlineKeyboardButton("✍️ MANUAL", callback_data="ai:manual")],
-            [InlineKeyboardButton("🎛️ OPEN PANEL", callback_data="ai:main"),
-             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
-        ])
-        for admin_id in ADMINS:
+            [InlineKeyboardButton("🎛️ PANEL", callback_data="ai:main"),
+             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]])
+        for a in ADMINS:
             try:
-                aid = int(admin_id) if str(admin_id).lstrip("-").isdigit() else None
+                aid = int(a) if str(a).lstrip("-").isdigit() else None
                 if not aid: continue
-                await client.send_message(
-                    chat_id=aid, text=text, reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True)
-            except Exception as e:
-                logger.debug(f"[AI] report to {admin_id}: {e}")
-    except Exception as e:
-        logger.warning(f"[AI] daily report: {e}")
+                await client.send_message(aid, text, reply_markup=kb,
+                                           parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True)
+            except Exception: pass
+    except Exception as e: logger.warning(f"[AI] report: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:last_report$"), group=-430)
-async def cb_last_report(client: Client, q: CallbackQuery):
+async def cb_last(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
-        completed_count = await _count_completed()
-        total_series = await _get_setting("total_series", 0)
-        text = "\n".join([
+        comp = await _count_completed()
+        total = await _get_setting("total_series", 0)
+        await _safe_edit(q, "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"📊 <b>{fb('CURRENT STATUS')}</b>",
-            DIV, "",
-            f"📚 {sc('total series')} · <code>{_fmt_int(total_series)}</code>",
-            f"✅ {sc('completed')} · <code>{_fmt_int(completed_count)}</code>",
-            f"⏳ {sc('pending')} · "
-            f"<code>{_fmt_int(max(0, total_series - completed_count))}</code>",
-            "",
-            f"🕒 <code>{_now_ist()}</code>",
-        ])
-        await _safe_edit(q, text, kb_back("ai:main"))
+            f"📊 <b>{fb('STATUS')}</b>", DIV, "",
+            f"📚 <code>{_fmt_int(total)}</code> · ✅ <code>{_fmt_int(comp)}</code>",
+            f"", f"🕒 <code>{_now_ist()}</code>"]), kb_back("ai:main"))
         await q.answer()
-    except Exception as e:
-        logger.exception(f"[AI] last_report: {e}")
+    except Exception as e: logger.exception(f"[AI] last: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CLEANUP + BOOT
-# ═══════════════════════════════════════════════════════════════════════════
 async def _cleanup_loop():
     while True:
         try:
-            await asyncio.sleep(600)
-            _cleanup_sessions()
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            pass
+            await asyncio.sleep(600); _cleanup_sessions()
+        except asyncio.CancelledError: break
+        except Exception: pass
 
 
 _BOOTED = False
 
-
 @Client.on_message(filters.private, group=-428)
-async def _boot_capture(client: Client, message: Message):
+async def _boot(client, message):
     global _BOOTED
     if _BOOTED: return
     _BOOTED = True
     try:
         loop = asyncio.get_event_loop()
-        loop.create_task(_daily_report_loop(client))
+        loop.create_task(_daily_loop(client))
         loop.create_task(_cleanup_loop())
-        logger.info("[AI] background loops started")
-    except Exception as e:
-        logger.warning(f"[AI] boot: {e}")
+        logger.info("[AI] loops started")
+    except Exception as e: logger.warning(f"[AI] boot: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# FINAL LOG
-# ═══════════════════════════════════════════════════════════════════════════
-logger.info("")
-logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎛️ AI LIBRARIAN LOADED ✅                                     ║")
-logger.info("║                                                                ║")
-logger.info("║  Commands:                                                     ║")
-logger.info("║    /ai          — open AI panel                                ║")
-logger.info("║    /librarian   — alias                                        ║")
-logger.info("║    /aidb        — DB diagnostic (shows fields)                 ║")
-logger.info("║                                                                ║")
-logger.info("║  Fixes:                                                        ║")
-logger.info("║    · Strips @TheTvShare, [YTS.MX], -RARBG, etc.                ║")
-logger.info("║    · Reads 8+ DB field names for filenames                     ║")
-logger.info("║    · Fallback: scans any string field with video ext           ║")
-logger.info("║    · Smart file scoring (resolution+codec+source+audio)        ║")
-logger.info("╚════════════════════════════════════════════════════════════════╝")
+logger.info("🎛️ AI LIBRARIAN v2 LOADED — sharded scan + TMDB suggest")
