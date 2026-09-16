@@ -1,6 +1,7 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (v7 — PM fix + strong dedupe)
+🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE v8)
+Smart DB-first search · TMDB fallback · Request channel · PM redirect
 """
 import asyncio
 import logging
@@ -8,12 +9,14 @@ import os
 import re
 import secrets
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote_plus
 
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ChatType, ParseMode
 from pyrogram.errors import MessageNotModified, FloodWait, UserIsBlocked
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -26,6 +29,18 @@ try:
     ADMINS = list(_ADMINS or [])
 except Exception:
     ADMINS = []
+
+try:
+    from core.config import REQST_CHANNEL as _REQST
+    REQST_CHANNEL = _REQST
+except Exception:
+    REQST_CHANNEL = None
+
+try:
+    from core.config import UPDATE_CHNL_LNK as _UPD
+    UPDATE_CHNL_LNK = _UPD or "https://t.me/"
+except Exception:
+    UPDATE_CHNL_LNK = "https://t.me/"
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +61,7 @@ SERIES_GROUP_ENABLED = os.getenv("SERIES_GROUP_ENABLED", "false").lower() in \
 
 SESSION_TTL = 900
 DELIVER_BATCH_DELAY = 0.5
+SMART_SEARCH_MIN_WORDS = 1
 
 DIV = "━" * 26
 DIV2 = "─" * 26
@@ -109,6 +125,14 @@ def _is_admin(uid) -> bool:
 def _now_ist() -> str:
     return datetime.now(IST).strftime("%d %b %Y · %H:%M IST")
 
+def _normalize(s: str) -> str:
+    if not s: return ""
+    s = s.strip().lower()
+    s = re.sub(r"[.\-_/,;:]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    return s.strip()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DB
@@ -128,6 +152,11 @@ def _get_db():
 def _sgroup_coll():
     d = _get_db()
     return d["series_group"] if d is not None else None
+
+
+def _req_coll():
+    d = _get_db()
+    return d["search_requests"] if d is not None else None
 
 
 async def _get_caption() -> str:
@@ -203,19 +232,128 @@ async def _list_series_prefs() -> List[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #1 — TASK REGISTRY (prevents GC from killing delivery)
+# REQUEST RECORD (REQST_CHANNEL)
+# ═══════════════════════════════════════════════════════════════════════════
+async def _add_request(user_id: int, title: str, year: Optional[str],
+                       tmdb_id: Optional[int], source: str) -> Optional[str]:
+    c = _req_coll()
+    if c is None: return None
+    try:
+        token = uuid.uuid4().hex[:12]
+        await c.insert_one({
+            "token_id": token,
+            "user_id": int(user_id),
+            "movie_name": title,
+            "query": title,
+            "year": year,
+            "tmdb_id": tmdb_id,
+            "kind": "series",
+            "source": source,
+            "status": "not_found",
+            "created_at": time.time(),
+        })
+        return token
+    except Exception as e:
+        logger.warning(f"[SG-REQ] save failed: {e}")
+        return None
+
+
+async def _get_request(token: str) -> Optional[Dict]:
+    c = _req_coll()
+    if c is None: return None
+    try:
+        return await c.find_one({"token_id": token})
+    except Exception:
+        return None
+
+
+async def _update_request(token: str, status: str) -> bool:
+    c = _req_coll()
+    if c is None: return False
+    try:
+        r = await c.update_one({"token_id": token},
+                                {"$set": {"status": status,
+                                          "updated_at": time.time()}})
+        return r.modified_count > 0
+    except Exception:
+        return False
+
+
+async def _post_to_request_channel(
+    client: Client, user_id: int, title: str,
+    year: Optional[str] = None, tmdb_id: Optional[int] = None,
+    source: str = "series_search",
+) -> Optional[str]:
+    """Post a series request to REQST_CHANNEL with action buttons."""
+    if not REQST_CHANNEL:
+        logger.info("[SG-REQ] REQST_CHANNEL not set")
+        return None
+
+    token = await _add_request(user_id, title, year, tmdb_id, source)
+    if not token: return None
+
+    try:
+        user_obj = await client.get_users(user_id)
+        user_mention = user_obj.mention if hasattr(user_obj, "mention") else f"user {user_id}"
+    except Exception:
+        user_mention = f"user {user_id}"
+
+    title_disp = title + (f" ({year})" if year else "")
+
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"📺 <b>{fb('NEW SERIES REQUEST')}</b>",
+        DIV, "",
+        f"🎬 {sc('series')} · <b>{_esc(title_disp)}</b>",
+    ]
+    if tmdb_id:
+        lines.append(f"🎯 {sc('tmdb')} · <code>{tmdb_id}</code>")
+    lines += [
+        "",
+        f"👤 {sc('user')} · {user_mention}",
+        f"🆔 {sc('id')} · <code>{user_id}</code>",
+        "",
+        f"🔑 {sc('token')} · <code>{token}</code>",
+        DIV, "",
+        f"<i>ᴀᴅᴍɪɴ · ᴄʜᴏᴏꜱᴇ ᴀɴ ᴀᴄᴛɪᴏɴ ʙᴇʟᴏᴡ</i>",
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📺 SERIES UPDATED",
+                               callback_data=f"gsreq:{token}:updated")],
+        [InlineKeyboardButton("📅 NOT RELEASED",
+                               callback_data=f"gsreq:{token}:notreleased"),
+         InlineKeyboardButton("🔎 NOT FOUND",
+                               callback_data=f"gsreq:{token}:notfound")],
+        [InlineKeyboardButton("❌ CANCEL",
+                               callback_data=f"gsreq:{token}:cancel")],
+    ])
+
+    try:
+        await client.send_message(
+            chat_id=REQST_CHANNEL,
+            text="\n".join(lines),
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info(f"[SG-REQ] posted token={token} title={title!r}")
+        return token
+    except Exception as e:
+        logger.warning(f"[SG-REQ] post failed: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TASK REGISTRY (prevents GC from killing delivery)
 # ═══════════════════════════════════════════════════════════════════════════
 _DELIVERY_TASKS: Dict[str, asyncio.Task] = {}
 
 
 def _spawn_task(coro, key: str):
-    """Spawn a background task and keep a strong reference so it doesn't get GC'd."""
     task = asyncio.create_task(coro)
     _DELIVERY_TASKS[key] = task
-
-    def _cleanup(t):
-        _DELIVERY_TASKS.pop(key, None)
-
+    def _cleanup(t): _DELIVERY_TASKS.pop(key, None)
     task.add_done_callback(_cleanup)
     return task
 
@@ -253,26 +391,29 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #2 — STRONG DEDUPE (file_id + season/episode/quality)
+# DEDUPE — 1 file per (season, episode, quality)
 # ═══════════════════════════════════════════════════════════════════════════
 def _dedupe_by_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Dedupe: 1) by file_id, 2) by (season, episode, quality) — keep largest."""
-    if not files:
-        return []
+    if not files: return []
 
     # Step 1: dedupe by file_id / file_unique_id
     seen_ids: Set[str] = set()
     by_id: List[Dict[str, Any]] = []
     for f in files:
-        fid = f.get("file_id") or f.get("file_unique_id") or ""
+        fid = str(f.get("file_id") or f.get("file_unique_id") or "")
         if fid and fid in seen_ids:
             continue
         if fid:
             seen_ids.add(fid)
         by_id.append(f)
 
-    # Step 2: sort by size descending
-    by_id.sort(key=lambda x: (x.get("file_size") or 0), reverse=True)
+    # Step 2: sort by size descending (largest first)
+    def _size(f):
+        s = f.get("file_size") or 0
+        try: return int(s)
+        except (TypeError, ValueError): return 0
+
+    by_id.sort(key=_size, reverse=True)
 
     # Step 3: keep first for each (season, episode, quality)
     seen_keys: Set[Tuple] = set()
@@ -280,7 +421,6 @@ def _dedupe_by_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for f in by_id:
         s = f.get("season")
         e = f.get("episode")
-        # If episode missing, try to parse from filename
         if e is None:
             p = _parse_filename_light(f.get("file_name") or "")
             if p.get("episode") is not None:
@@ -318,20 +458,15 @@ async def _engine_search(title: str,
         return []
 
     all_files: List[Dict[str, Any]] = []
-
     try:
         norm = normalize(title)
-        logger.info(f"[SG] engine.search_series({norm!r}) — NO YEAR")
-
         result = await engine.search_series(norm)
         hits = result.hits
-
         if not hits:
-            logger.info(f"[SG] engine.search_any({norm!r})")
             result = await engine.search_any(norm)
             hits = result.hits
 
-        logger.info(f"[SG] engine returned {len(hits)} hits")
+        logger.info(f"[SG] engine: {len(hits)} hits for {norm!r}")
 
         for h in hits:
             h_season = getattr(h, "season", None)
@@ -349,14 +484,12 @@ async def _engine_search(title: str,
 
             if season is not None and h_season != season:
                 continue
-
             if language:
                 lang_lower = language.lower()
                 h_lower = [l.lower() for l in h_langs]
                 if h_lower and not any(lang_lower in l or l in lang_lower
                                         for l in h_lower):
                     continue
-
             if quality and h_quality:
                 if h_quality.upper() != quality.upper():
                     continue
@@ -377,15 +510,32 @@ async def _engine_search(title: str,
                 "message_id": getattr(h, "message_id", None) or
                               getattr(h, "msg_id", None),
             })
-
-        before = len(all_files)
-        all_files = _dedupe_by_episode(all_files)
-        logger.info(f"[SG] filter: {before} files → deduped: {len(all_files)}")
-
     except Exception as e:
         logger.exception(f"[SG] engine search failed: {e}")
 
-    return all_files
+    return _dedupe_by_episode(all_files)
+
+
+async def _smart_db_search(title: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to find the series in DB even with misspellings.
+    Progressively drops words and tries again.
+    Returns {"matched_title": ..., "hits": [...]} or None.
+    """
+    norm = _normalize(title)
+    if not norm: return None
+    words = norm.split()
+
+    # Try full string, then drop words from the end
+    for i in range(len(words), max(0, len(words) - 4), -1):
+        partial = " ".join(words[:i])
+        hits = await _engine_search(partial)
+        if hits:
+            matched = hits[0].get("series_title") or hits[0].get("title") or partial
+            logger.info(f"[SG] smart search: {title!r} → {matched!r} ({len(hits)} hits)")
+            return {"matched_title": matched, "hits": hits, "used": partial}
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -435,7 +585,6 @@ def _parse_filename_light(filename: str) -> Dict[str, Any]:
                 out["episode"] = int(m.group(2))
                 break
             except Exception: continue
-
     if out["season"] is None:
         for pat in _SEASON_ONLY:
             m = pat.search(name)
@@ -538,24 +687,18 @@ def _poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"https://image.tmdb.org/t/p/{size}{path}"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SUMMARIZE
-# ═══════════════════════════════════════════════════════════════════════════
 def _summarize(files: List[Dict[str, Any]]) -> Dict[str, Any]:
     qualities: Set[str] = set()
     languages: Set[str] = set()
     seasons: Dict[int, Set[int]] = defaultdict(set)
-
     for f in files:
         q = f.get("quality") or "UNKNOWN"
         if q != "UNKNOWN": qualities.add(q)
         for l in (f.get("languages") or []):
             languages.add(l)
-        s = f.get("season")
-        e = f.get("episode")
+        s = f.get("season"); e = f.get("episode")
         if s is not None:
             seasons[s].add(e if e is not None else 0)
-
     return {
         "qualities": sorted(qualities, key=lambda x: QUALITY_RANK.get(x, 0),
                             reverse=True),
@@ -573,10 +716,14 @@ def kb_suggestions(items: List[Dict[str, Any]]):
     for i, it in enumerate(items):
         title = (it.get("title") or "?")[:36]
         year = it.get("year") or ""
+        rating = it.get("rating", 0)
         label = f"🎬 {title}"
         if year: label += f" ({year})"
+        if rating: label += f" ⭐{rating:.1f}"
         rows.append([InlineKeyboardButton(label,
                                           callback_data=f"sg:pick:{i}")])
+    rows.append([InlineKeyboardButton("📩 REQUEST TO ADMIN",
+                                       callback_data="sg:request")])
     rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")])
     return InlineKeyboardMarkup(rows)
 
@@ -607,8 +754,8 @@ def kb_seasons(seasons: List[Dict[str, Any]], local: Dict[int, List[int]]):
             mark = "🟢" if count >= eps else "🟡"
         else:
             count = 0; mark = "⚪"
-        label = f"{mark} S{sn:02d} · {eps} ep"
-        if count: label += f" · {count} local"
+        label = f"{mark} S{sn:02d} · {eps} ᴇᴘ"
+        if count: label += f" · {count} ʟᴏᴄᴀʟ"
         rows.append([InlineKeyboardButton(label,
                                           callback_data=f"sg:seas:{i}")])
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="sg:back_lang"),
@@ -636,7 +783,7 @@ def kb_qualities(qualities: List[str]):
 def _view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎬 <b>{fb('SERIES SEARCH')}</b>",
+        f"🎬 <b>{fb('SERIES SUGGESTIONS')}</b>",
         DIV, "",
         f"🔍 {sc('you searched')} · <code>{_esc(raw)}</code>",
         "",
@@ -648,6 +795,7 @@ def _view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
         year = it.get("year") or ""
         rating = it.get("rating", 0)
         lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> ({year}) · ⭐ {rating:.1f}")
+    lines += ["", DIV2, f"💡 {sc('not what you wanted?')} · ᴛᴀᴘ ᴛʜᴇ ʀᴇǫᴜᴇꜱᴛ ʙᴜᴛᴛᴏɴ"]
     return "\n".join(lines)
 
 
@@ -658,7 +806,7 @@ def _view_languages(title: str, year: str) -> str:
         DIV, "",
         f"🌍 {sc('pick language')}",
         "",
-        f"🟢 = ʜᴀᴠᴇ ꜰɪʟᴇꜱ · ⚪ = ᴏɴʟʏ ᴛᴍᴅʙ",
+        f"🟢 {sc('has files')} · ⚪ {sc('tmdb only')}",
     ])
 
 
@@ -673,7 +821,7 @@ def _view_seasons(title: str, year: str) -> str:
     ])
 
 
-def _view_qualities(title: str, season: int) -> str:
+def _view_qualities(title: str, season: int, count: int) -> str:
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{_esc(title)}</b>",
@@ -681,7 +829,24 @@ def _view_qualities(title: str, season: int) -> str:
         DIV, "",
         f"🎯 {sc('pick quality')}",
         "",
-        f"📌 {sc('files will be sent to your pm')}",
+        f"📁 <code>{count}</code> ꜰɪʟᴇꜱ ᴛᴏ ꜱᴇɴᴅ",
+        f"📩 {sc('files will go to your pm')}",
+    ])
+
+
+def _view_sending(title: str, season: int, quality: str,
+                  language: str, count: int) -> str:
+    return "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"📤 <b>{fb('SENDING TO YOUR PM')}</b>",
+        DIV, "",
+        f"🎬 <b>{_esc(title)}</b>",
+        f"📺 <b>Season {season:02d}</b>",
+        f"🎯 <code>{quality}</code> · 🌍 <code>{language}</code>",
+        "",
+        f"📁 <code>{count}</code> ᴇᴘɪꜱᴏᴅᴇꜱ",
+        "",
+        f"📌 {sc('check your bot pm')}",
     ])
 
 
@@ -711,24 +876,62 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if not message.from_user: return
             if "http" in txt.lower(): return
 
-            try:
-                message.stop_propagation()
+            try: message.stop_propagation()
             except Exception: pass
 
-            logger.info(f"[SG] search: {txt!r}")
+            logger.info(f"[SG] search: {txt!r} from {message.from_user.id}")
 
             try:
                 status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
             except Exception: return
 
+            # ⭐ Step 1: Smart DB-first search
+            db_match = await _smart_db_search(txt)
+            if db_match:
+                matched_title = db_match["matched_title"]
+                hits = db_match["hits"]
+                logger.info(f"[SG] DB match: {matched_title!r} ({len(hits)} files)")
+
+                # Try TMDB for this title to get languages/seasons
+                tmdb_results = await _tmdb_search_series(matched_title)
+                tmdb_details = None
+                tmdb_langs = ["English"]
+                tmdb_seasons = []
+                poster = None
+                year = ""
+
+                if tmdb_results:
+                    chosen = tmdb_results[0]
+                    tmdb_details = await _tmdb_series_details(chosen["tmdb_id"])
+                    if tmdb_details:
+                        tmdb_langs = _tmdb_languages(tmdb_details)
+                        tmdb_seasons = _tmdb_seasons(tmdb_details)
+                    poster = chosen.get("poster")
+                    year = chosen.get("year") or ""
+
+                # Save session
+                _new_session(message.from_user.id,
+                             suggestions=[], raw_query=txt)
+                sess = _SESSIONS[message.from_user.id]
+                summary = _summarize(hits)
+                sess["data"]["chosen"] = {
+                    "tmdb_id": tmdb_results[0]["tmdb_id"] if tmdb_results else None,
+                    "title": matched_title,
+                    "year": year,
+                    "poster": poster,
+                    "tmdb_langs": tmdb_langs,
+                    "tmdb_seasons": tmdb_seasons,
+                    "local_langs": summary["languages"],
+                    "local_seasons": summary["seasons"],
+                }
+                await _show_languages_from(client, message.chat.id, status.id)
+                return
+
+            # ⭐ Step 2: TMDB search for suggestions
             results = await _tmdb_search_series(txt)
             if not results:
-                await _safe_edit(status,
-                    f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>\n"
-                    f"❌ ɴᴏ ᴛᴍᴅʙ ᴍᴀᴛᴄʜ ꜰᴏʀ <code>{_esc(txt)}</code>",
-                    InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ CLOSE",
-                                              callback_data="sg:close")]]))
+                # ⭐ Step 3: No DB, no TMDB → request channel
+                await _handle_no_results(client, message, status, txt)
                 return
 
             _new_session(message.from_user.id,
@@ -757,6 +960,68 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             logger.exception(f"[SG] group search: {e}")
 
 
+async def _handle_no_results(client: Client, message: Message,
+                              status: Message, raw: str):
+    """Nothing found anywhere → post to REQST_CHANNEL."""
+    try:
+        await client.edit_message_text(
+            chat_id=message.chat.id, message_id=status.id,
+            text="\n".join([
+                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                f"🔎 <b>{fb('NOT FOUND')}</b>",
+                DIV, "",
+                f"🎬 <code>{_esc(raw)}</code>",
+                "",
+                f"📌 {sc('no match in db')}",
+                f"📌 {sc('no match on tmdb')}",
+                "", DIV2, "",
+                f"📩 {sc('sending request to admin')}...",
+            ]),
+            parse_mode=ParseMode.HTML)
+
+        token = await _post_to_request_channel(
+            client, message.from_user.id, raw,
+            source="series_no_match")
+
+        if token:
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id, message_id=status.id,
+                    text="\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"✅ <b>{fb('REQUEST SENT')}</b>",
+                        DIV, "",
+                        f"🎬 <b>{_esc(raw)}</b>",
+                        "",
+                        f"📌 {sc('admin will review soon')}",
+                        f"📌 {sc('you will be notified in pm')}",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ CLOSE",
+                                              callback_data="sg:close")]]),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+        else:
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id, message_id=status.id,
+                    text="\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"❌ <b>{fb('NOT FOUND')}</b>",
+                        DIV, "",
+                        f"🎬 <code>{_esc(raw)}</code>",
+                        "",
+                        f"📌 {sc('try a different name')}",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ CLOSE",
+                                              callback_data="sg:close")]]),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+    except Exception as e:
+        logger.exception(f"[SG] no results: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PICK SUGGESTION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -767,7 +1032,6 @@ async def cb_pick(client: Client, q: CallbackQuery):
         s = _get_session(q.from_user.id)
         if not s:
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ · ᴛʀʏ ᴀɢᴀɪɴ", show_alert=True)
-
         items = s["data"].get("suggestions") or []
         if idx >= len(items):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
@@ -778,7 +1042,6 @@ async def cb_pick(client: Client, q: CallbackQuery):
         year = chosen.get("year") or ""
 
         await q.answer("🔍 ʟᴏᴀᴅɪɴɢ...")
-
         details = await _tmdb_series_details(tmdb_id)
         if not details:
             return await q.answer("⚠️ ᴛᴍᴅʙ ᴇʀʀᴏʀ", show_alert=True)
@@ -788,8 +1051,7 @@ async def cb_pick(client: Client, q: CallbackQuery):
 
         local_files = await _engine_search(title)
         summary = _summarize(local_files)
-
-        logger.info(f"[SG] pick: {title!r} · local_files={len(local_files)}")
+        logger.info(f"[SG] pick: {title!r} · {len(local_files)} files")
 
         s["data"]["chosen"] = {
             "tmdb_id": tmdb_id, "title": title, "year": year,
@@ -799,12 +1061,41 @@ async def cb_pick(client: Client, q: CallbackQuery):
             "local_langs": summary["languages"],
             "local_seasons": summary["seasons"],
         }
-
         await _show_languages(client, q)
     except Exception as e:
         logger.exception(f"[SG] pick: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
         except Exception: pass
+
+
+@Client.on_callback_query(filters.regex(r"^sg:request$"), group=-9999)
+async def cb_request(client: Client, q: CallbackQuery):
+    try:
+        s = _get_session(q.from_user.id)
+        if not s:
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        raw = s["data"].get("raw_query") or ""
+        await q.answer("📩 ꜱᴇɴᴅɪɴɢ ʀᴇǫᴜᴇꜱᴛ...")
+        token = await _post_to_request_channel(
+            client, q.from_user.id, raw, source="series_manual_request")
+        if token:
+            try:
+                await q.message.edit_text(
+                    "\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"✅ <b>{fb('REQUEST SENT')}</b>",
+                        DIV, "",
+                        f"🎬 <b>{_esc(raw)}</b>",
+                        "",
+                        f"📌 {sc('admin will review soon')}",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ CLOSE",
+                                              callback_data="sg:close")]]),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+    except Exception as e:
+        logger.exception(f"[SG] request: {e}")
 
 
 async def _show_languages(client: Client, q: CallbackQuery):
@@ -813,7 +1104,6 @@ async def _show_languages(client: Client, q: CallbackQuery):
     c = s["data"].get("chosen") or {}
     tmdb_langs = c.get("tmdb_langs") or ["English"]
     local_langs = c.get("local_langs") or []
-
     ordered = [l for l in tmdb_langs if l in local_langs] + \
               [l for l in tmdb_langs if l not in local_langs]
     c["ordered_langs"] = ordered
@@ -833,9 +1123,42 @@ async def _show_languages(client: Client, q: CallbackQuery):
             return
         except Exception as e:
             logger.debug(f"[SG] photo: {e}")
-
     await _safe_edit(q, text, kb)
     await q.answer()
+
+
+async def _show_languages_from(client: Client, chat_id: int, msg_id: int):
+    """Show languages from a session (used by smart search)."""
+    s = None
+    for uid, sess in _SESSIONS.items():
+        if "chosen" in (sess.get("data") or {}):
+            s = sess; break
+    if not s: return
+    c = s["data"].get("chosen") or {}
+    tmdb_langs = c.get("tmdb_langs") or ["English"]
+    local_langs = c.get("local_langs") or []
+    ordered = [l for l in tmdb_langs if l in local_langs] + \
+              [l for l in tmdb_langs if l not in local_langs]
+    c["ordered_langs"] = ordered
+
+    text = _view_languages(c.get("title"), c.get("year"))
+    kb = kb_languages(ordered, local_langs)
+    poster = _poster_url(c.get("poster"), "w500")
+
+    if poster:
+        try: await client.delete_messages(chat_id, msg_id)
+        except Exception: pass
+        try:
+            await client.send_photo(chat_id=chat_id, photo=poster,
+                                     caption=text, reply_markup=kb,
+                                     parse_mode=ParseMode.HTML)
+            return
+        except Exception: pass
+    try:
+        await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                                        text=text, reply_markup=kb,
+                                        parse_mode=ParseMode.HTML)
+    except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -847,7 +1170,6 @@ async def cb_lang(client: Client, q: CallbackQuery):
         idx = int(q.matches[0].group(1))
         s = _get_session(q.from_user.id)
         if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         c = s["data"].get("chosen") or {}
         ordered = c.get("ordered_langs") or []
         if idx >= len(ordered):
@@ -859,17 +1181,14 @@ async def cb_lang(client: Client, q: CallbackQuery):
 
         files = await _engine_search(c.get("title") or "", language=lang)
         c["files_by_lang"] = files
-
         summary = _summarize(files)
         c["seasons_for_lang"] = summary["seasons"]
-
         logger.info(f"[SG] lang {lang}: {len(files)} files")
 
         seasons = c.get("tmdb_seasons") or []
         text = _view_seasons(c.get("title"), c.get("year"))
         kb = kb_seasons(seasons, summary["seasons"])
         await _safe_edit(q, text, kb)
-        await q.answer()
     except Exception as e:
         logger.exception(f"[SG] lang: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -885,7 +1204,6 @@ async def cb_seas(client: Client, q: CallbackQuery):
         idx = int(q.matches[0].group(1))
         s = _get_session(q.from_user.id)
         if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-
         c = s["data"].get("chosen") or {}
         seasons = c.get("tmdb_seasons") or []
         if idx >= len(seasons):
@@ -899,7 +1217,6 @@ async def cb_seas(client: Client, q: CallbackQuery):
         files = await _engine_search(c.get("title") or "",
                                       language=lang, season=season)
         c["files_by_season"] = files
-
         logger.info(f"[SG] S{season} ({lang}): {len(files)} files")
 
         qualities = sorted({f["quality"] for f in files
@@ -910,25 +1227,22 @@ async def cb_seas(client: Client, q: CallbackQuery):
                        (c.get("title") or "").lower()).strip("_")
         pref = await _get_series_pref(slug)
         admin_quals = pref.get("qualities") or []
-
         if admin_quals:
             final_quals = [x for x in admin_quals if x in qualities] or admin_quals
         else:
             final_quals = qualities
 
-        c["available_qualities"] = final_quals
-
         if not final_quals:
             fallback = sorted({f["quality"] for f in files
                                if f.get("quality")}, reverse=True)
             if fallback:
-                c["available_qualities"] = fallback
+                final_quals = fallback
             else:
-                return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇᴀꜱᴏɴ",
-                                       show_alert=True)
+                return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
 
-        text = _view_qualities(c.get("title"), season)
-        kb = kb_qualities(c["available_qualities"])
+        c["available_qualities"] = final_quals
+        text = _view_qualities(c.get("title"), season, len(files))
+        kb = kb_qualities(final_quals)
         await _safe_edit(q, text, kb)
     except Exception as e:
         logger.exception(f"[SG] seas: {e}")
@@ -937,7 +1251,7 @@ async def cb_seas(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #1 — PICK QUALITY → DELIVER (with _spawn_task)
+# PICK QUALITY → DELIVER
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client: Client, q: CallbackQuery):
@@ -957,37 +1271,30 @@ async def cb_qual(client: Client, q: CallbackQuery):
         files = [f for f in (c.get("files_by_season") or [])
                  if (f.get("quality") or "").upper() == quality.upper()
                  or (f.get("quality") == "UNKNOWN")]
-
         files = _dedupe_by_episode(files)
         files.sort(key=lambda x: (x.get("episode") or 0))
 
-        logger.info(f"[SG] qual {quality}: delivering {len(files)} files "
-                    f"to user {q.from_user.id}")
+        logger.info(f"[SG] qual {quality}: {len(files)} files → user {q.from_user.id}")
 
         if not files:
-            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ", show_alert=True)
+            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
 
-        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {len(files)} ᴇᴘɪꜱᴏᴅᴇꜱ ᴛᴏ ʏᴏᴜʀ ᴘᴍ...")
+        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {len(files)} ᴇᴘɪꜱᴏᴅᴇꜱ...")
 
-        text = "\n".join([
-            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"📤 <b>{fb('SENDING TO YOUR PM')}</b>",
-            DIV, "",
-            f"🎬 <b>{_esc(c.get('title'))}</b>",
-            f"📺 <b>Season {c.get('selected_season'):02d}</b>",
-            f"🎯 <code>{quality}</code> · 🌍 <code>{c.get('selected_language')}</code>",
-            "",
-            f"📁 <code>{len(files)}</code> ᴇᴘɪꜱᴏᴅᴇꜱ",
-            "",
-            f"📌 {sc('check your bot pm')}",
-        ])
+        text = _view_sending(
+            c.get("title") or "?", c.get("selected_season") or 0,
+            quality, c.get("selected_language") or "?", len(files))
         await _safe_edit(q, text, InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")]]))
 
-        # ⭐ FIX #1 — Use _spawn_task so the task survives
+        # ⭐ Spawn delivery with strong reference + group info for fallback
         task_key = f"deliver_{q.from_user.id}_{int(time.time() * 1000)}"
         _spawn_task(
-            _deliver_episodes(client, q.from_user.id, c, files),
+            _deliver_episodes(
+                client, q.from_user.id, c, files,
+                group_chat_id=q.message.chat.id,
+                group_msg_id=q.message.id,
+            ),
             task_key,
         )
     except Exception as e:
@@ -997,40 +1304,37 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ FIX #1 — DELIVER (loud logging + robust)
+# DELIVER — Robust, with fallback button if user hasn't started bot
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client: Client, user_id: int,
                              chosen: Dict[str, Any],
-                             files: List[Dict[str, Any]]):
+                             files: List[Dict[str, Any]],
+                             group_chat_id: Optional[int] = None,
+                             group_msg_id: Optional[int] = None):
     try:
         logger.info(f"[SG-DELIVER] START user={user_id} files={len(files)}")
 
-        # Load delivery helper
         delivery = None
         try:
             from media_search.delivery import delivery as _d
             delivery = _d
-            logger.info(f"[SG-DELIVER] delivery module loaded")
         except Exception as e:
             logger.exception(f"[SG-DELIVER] delivery import failed: {e}")
 
-        # Load FileHit class
         FileHit = None
         try:
             from media_search.models import FileHit as _FH
             FileHit = _FH
-        except Exception as e:
-            logger.debug(f"[SG-DELIVER] FileHit import: {e}")
+        except Exception: pass
 
-        # Load normalize
         normalize = None
         try:
             from media_search.normalizer import normalize as _n
             normalize = _n
-        except Exception:
-            pass
+        except Exception: pass
 
-        # Send intro to PM — CRITICAL test of PM access
+        # ── Send intro to PM ──
+        intro_ok = False
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1046,12 +1350,34 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"📁 Sending <code>{len(files)}</code> episodes...",
                 ]),
                 parse_mode=ParseMode.HTML)
+            intro_ok = True
             logger.info(f"[SG-DELIVER] intro sent to {user_id}")
         except UserIsBlocked:
-            logger.warning(f"[SG-DELIVER] USER {user_id} BLOCKED BOT — cannot send PM")
-            return
+            logger.warning(f"[SG-DELIVER] user {user_id} hasn't started bot")
         except Exception as e:
-            logger.exception(f"[SG-DELIVER] intro FAILED: {e}")
+            logger.exception(f"[SG-DELIVER] intro failed: {e}")
+
+        # ── If PM fails, show fallback button in group ──
+        if not intro_ok:
+            if group_chat_id and group_msg_id:
+                try:
+                    me = await client.get_me()
+                    deep_link = f"https://t.me/{me.username}?start=hello"
+                    await client.edit_message_text(
+                        chat_id=group_chat_id, message_id=group_msg_id,
+                        text="\n".join([
+                            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                            f"⚠️ <b>{fb('START THE BOT FIRST')}</b>",
+                            DIV, "",
+                            f"📌 {sc('please open the bot in pm and tap start')}",
+                            f"📌 {sc('then try again here')}",
+                        ]),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🚀 START BOT",
+                                                  url=deep_link)]]),
+                        parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.debug(f"[SG-DELIVER] fallback msg: {e}")
             return
 
         template = await _get_caption()
@@ -1060,8 +1386,7 @@ async def _deliver_episodes(client: Client, user_id: int,
 
         sent = 0
         failed = 0
-
-        for idx, f in enumerate(files):
+        for f in files:
             try:
                 ep = f.get("episode")
                 size = _fmt_size(f.get("file_size", 0))
@@ -1079,27 +1404,26 @@ async def _deliver_episodes(client: Client, user_id: int,
                                f"E{ep or 0:02d}")
 
                 file_hit = f.get("file_hit")
+                fid = f.get("file_id")
 
-                # METHOD 1: original FileHit via delivery
+                ok_any = False
+
+                # Method 1: original FileHit via delivery
                 if delivery is not None and file_hit is not None:
                     try:
                         ok_d, err = await delivery.send_file(
                             client, user_id, file_hit)
                         if ok_d:
-                            sent += 1
+                            sent += 1; ok_any = True
                             logger.info(f"[SG-DELIVER] M1 OK ep={ep}")
-                            await asyncio.sleep(DELIVER_BATCH_DELAY)
-                            continue
-                        else:
-                            logger.warning(f"[SG-DELIVER] M1 fail ep={ep}: {err}")
                     except Exception as e:
-                        logger.exception(f"[SG-DELIVER] M1 exc ep={ep}: {e}")
+                        logger.debug(f"[SG-DELIVER] M1 exc: {e}")
 
-                # METHOD 2: rebuild FileHit
-                if delivery is not None and FileHit is not None:
+                # Method 2: rebuild FileHit
+                if not ok_any and delivery is not None and FileHit is not None:
                     try:
                         hit = FileHit(
-                            file_id=f.get("file_id", "") or "",
+                            file_id=fid or "",
                             file_unique_id=f.get("file_unique_id"),
                             file_name=f.get("file_name"),
                             file_size=f.get("file_size"),
@@ -1107,8 +1431,7 @@ async def _deliver_episodes(client: Client, user_id: int,
                             normalized_title=(normalize(f.get("title") or "")
                                               if normalize else
                                               (f.get("title") or "").lower()),
-                            year=None,
-                            type="series",
+                            year=None, type="series",
                             quality=f.get("quality"),
                             codec=None,
                             audio_languages=list(f.get("languages") or []),
@@ -1121,69 +1444,51 @@ async def _deliver_episodes(client: Client, user_id: int,
                         )
                         ok_d, err = await delivery.send_file(client, user_id, hit)
                         if ok_d:
-                            sent += 1
+                            sent += 1; ok_any = True
                             logger.info(f"[SG-DELIVER] M2 OK ep={ep}")
-                            await asyncio.sleep(DELIVER_BATCH_DELAY)
-                            continue
                     except Exception as e:
-                        logger.debug(f"[SG-DELIVER] M2 exc ep={ep}: {e}")
+                        logger.debug(f"[SG-DELIVER] M2 exc: {e}")
 
-                # METHOD 3: copy_message
-                src_chat = f.get("chat_id")
-                src_msg = f.get("message_id")
-                if src_chat and src_msg:
-                    try:
-                        await client.copy_message(
-                            chat_id=user_id,
-                            from_chat_id=src_chat,
-                            message_id=src_msg,
-                            caption=caption,
-                            reply_markup=extra_kb,
-                            parse_mode=ParseMode.HTML)
-                        sent += 1
-                        logger.info(f"[SG-DELIVER] M3 OK ep={ep}")
-                        await asyncio.sleep(DELIVER_BATCH_DELAY)
-                        continue
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 2)
+                # Method 3: copy_message
+                if not ok_any:
+                    src_chat = f.get("chat_id"); src_msg = f.get("message_id")
+                    if src_chat and src_msg:
                         try:
                             await client.copy_message(
                                 chat_id=user_id,
-                                from_chat_id=src_chat,
-                                message_id=src_msg,
-                                caption=caption,
-                                reply_markup=extra_kb,
+                                from_chat_id=src_chat, message_id=src_msg,
+                                caption=caption, reply_markup=extra_kb,
                                 parse_mode=ParseMode.HTML)
-                            sent += 1
-                            await asyncio.sleep(DELIVER_BATCH_DELAY)
-                            continue
-                        except Exception: failed += 1
-                    except Exception as e:
-                        logger.debug(f"[SG-DELIVER] M3 exc ep={ep}: {e}")
+                            sent += 1; ok_any = True
+                            logger.info(f"[SG-DELIVER] M3 OK ep={ep}")
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value + 2)
+                        except Exception as e:
+                            logger.debug(f"[SG-DELIVER] M3 exc: {e}")
 
-                # METHOD 4: send_cached_media
-                fid = f.get("file_id")
-                if fid:
+                # Method 4: send_cached_media by file_id
+                if not ok_any and fid:
                     try:
                         await client.send_cached_media(
                             chat_id=user_id, file_id=fid,
                             caption=caption, reply_markup=extra_kb,
                             parse_mode=ParseMode.HTML)
-                        sent += 1
+                        sent += 1; ok_any = True
                         logger.info(f"[SG-DELIVER] M4 OK ep={ep}")
-                        await asyncio.sleep(DELIVER_BATCH_DELAY)
-                        continue
                     except Exception as e:
-                        logger.debug(f"[SG-DELIVER] M4 exc ep={ep}: {e}")
+                        logger.debug(f"[SG-DELIVER] M4 exc: {e}")
 
-                failed += 1
-                logger.warning(f"[SG-DELIVER] FAIL ep={ep} - all methods failed")
+                if not ok_any:
+                    failed += 1
+                    logger.warning(f"[SG-DELIVER] FAIL ep={ep} all methods")
+
+                await asyncio.sleep(DELIVER_BATCH_DELAY)
 
             except Exception as e:
-                logger.exception(f"[SG-DELIVER] exc one file: {e}")
+                logger.exception(f"[SG-DELIVER] one file: {e}")
                 failed += 1
 
-        # Final summary
+        # ── Final summary ──
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1202,8 +1507,30 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"🕒 <code>{_now_ist()}</code>",
                 ]),
                 parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.debug(f"[SG-DELIVER] final msg: {e}")
+        except Exception: pass
+
+        # ── Update group message with DONE ──
+        if group_chat_id and group_msg_id:
+            try:
+                await client.edit_message_text(
+                    chat_id=group_chat_id, message_id=group_msg_id,
+                    text="\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"✅ <b>{fb('DELIVERED TO PM')}</b>",
+                        DIV, "",
+                        f"🎬 <b>{_esc(chosen.get('title'))}</b>",
+                        f"📺 Season {chosen.get('selected_season'):02d}",
+                        f"🎯 <code>{chosen.get('selected_quality')}</code>",
+                        "",
+                        f"✅ {sc('sent')} · <code>{sent}</code>",
+                        f"❌ {sc('failed')} · <code>{failed}</code>",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ CLOSE",
+                                              callback_data="sg:close")]]),
+                    parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.debug(f"[SG-DELIVER] group update: {e}")
 
         logger.info(f"[SG-DELIVER] DONE: {sent}/{len(files)} to {user_id}")
     except Exception as e:
@@ -1222,6 +1549,90 @@ def _build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMar
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# REQUEST CHANNEL — Admin Actions
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(filters.regex(r"^gsreq:"), group=-9999)
+async def cb_gsreq(client: Client, q: CallbackQuery):
+    """Admin clicked an action on a series request."""
+    try:
+        _, token, action = q.data.split(":", 2)
+    except Exception:
+        return await q.answer("❌ ɪɴᴠᴀʟɪᴅ", show_alert=True)
+
+    # Admin check
+    if not _is_admin(q.from_user.id):
+        try:
+            m = await client.get_chat_member(q.message.chat.id, q.from_user.id)
+            st = getattr(m, "status", None)
+            st = st.name.lower() if hasattr(st, "name") else str(st).lower()
+            if st not in ("administrator", "creator", "owner"):
+                return await q.answer("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ", show_alert=True)
+        except Exception:
+            return await q.answer("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ", show_alert=True)
+
+    req = await _get_request(token)
+    if not req:
+        return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
+    user_id = req.get("user_id")
+    title = req.get("movie_name") or ""
+
+    messages = {
+        "updated": (
+            f"🎬 <b>{sc('good news!')}</b>\n\n"
+            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{_esc(title)}</b> ʜᴀꜱ ʙᴇᴇɴ ᴜᴘʟᴏᴀᴅᴇᴅ ✅\n\n"
+            f"ᴋɪɴᴅʟʏ ꜱᴇᴀʀᴄʜ ɪɴ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ."
+        ),
+        "notreleased": (
+            f"📅 <b>{sc('not released yet')}</b>\n\n"
+            f"<b>{_esc(title)}</b> ʜᴀꜱ ɴᴏᴛ ʙᴇᴇɴ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ.\n"
+            f"ᴡᴇ'ʟʟ ɴᴏᴛɪꜰʏ ʏᴏᴜ ᴡʜᴇɴ ɪᴛ'ꜱ ᴀᴠᴀɪʟᴀʙʟᴇ."
+        ),
+        "notfound": (
+            f"🔎 <b>{sc('not found')}</b>\n\n"
+            f"ᴡᴇ ᴄᴏᴜʟᴅɴ'ᴛ ꜰɪɴᴅ <b>{_esc(title)}</b>.\n"
+            f"ᴘʟᴇᴀꜱᴇ ᴄʜᴇᴄᴋ ᴛʜᴇ ꜱᴘᴇʟʟɪɴɢ ᴀɴᴅ ᴛʀʏ ᴀɢᴀɪɴ."
+        ),
+        "cancel": (
+            f"❌ <b>{sc('cancelled')}</b>\n\n"
+            f"ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ <b>{_esc(title)}</b> ʜᴀꜱ ʙᴇᴇɴ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴀᴅᴍɪɴ."
+        ),
+    }
+
+    icons = {"updated": "📺 SERIES UPDATED ✅",
+             "notreleased": "📅 NOT RELEASED",
+             "notfound": "🔎 NOT FOUND",
+             "cancel": "❌ CANCELLED"}
+
+    if user_id:
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text=messages.get(action, "✅ ꜱᴛᴀᴛᴜꜱ ᴜᴘᴅᴀᴛᴇᴅ"),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📢 UPDATES", url=UPDATE_CHNL_LNK)]]),
+                parse_mode=ParseMode.HTML)
+            logger.info(f"[SG-REQ] notified user {user_id}")
+        except UserIsBlocked:
+            logger.info(f"[SG-REQ] user {user_id} blocked")
+        except Exception as e:
+            logger.warning(f"[SG-REQ] DM fail: {e}")
+
+    await _update_request(token, action)
+
+    try:
+        original = q.message.text or q.message.caption or ""
+        await q.message.edit_text(
+            f"<b><strike>{original}</strike></b>\n\n"
+            f"<b>{icons.get(action, '✅ DONE')}</b>",
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.debug(f"[SG-REQ] edit: {e}")
+
+    await q.answer(f"✅ {action}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # BACK / CLOSE
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:back_sugg$"), group=-9999)
@@ -1230,6 +1641,8 @@ async def cb_back_sugg(client: Client, q: CallbackQuery):
     if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
     items = s["data"].get("suggestions") or []
     raw = s["data"].get("raw_query") or ""
+    if not items:
+        return await q.answer("⚠️ ɴᴏ ꜱᴜɢɢᴇꜱᴛɪᴏɴꜱ", show_alert=True)
     await _safe_edit(q, _view_suggestions(raw, items), kb_suggestions(items))
     await q.answer()
 
@@ -1261,7 +1674,7 @@ async def cb_close(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ADMIN PANEL
+# ADMIN PANEL (same as before)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(
     filters.command(["sgroup", "series_group"]) & filters.private,
@@ -1283,23 +1696,19 @@ async def _view_admin_main():
     caption = await _get_caption()
     buttons = await _get_buttons()
     prefs = await _list_series_prefs()
-
-    group_status = (f"<code>{SERIES_GROUP_ID}</code>"
-                    if SERIES_GROUP_ID else "⚠️ ɴᴏᴛ ꜱᴇᴛ")
-    enabled_txt = "🟢 ᴏɴ" if SERIES_GROUP_ENABLED else "🔴 ᴏꜰꜰ"
-
+    gid = f"<code>{SERIES_GROUP_ID}</code>" if SERIES_GROUP_ID else "⚠️ ɴᴏᴛ ꜱᴇᴛ"
+    en = "🟢 ᴏɴ" if SERIES_GROUP_ENABLED else "🔴 ᴏꜰꜰ"
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{fb('SERIES GROUP · ADMIN')}</b>",
         DIV, "",
-        f"📢 {sc('group id')} · {group_status}",
-        f"⚙️ {sc('enabled')} · {enabled_txt}",
+        f"📢 {sc('group id')} · {gid}",
+        f"⚙️ {sc('enabled')} · {en}",
         f"📝 {sc('caption')} · "
         f"<code>{'custom' if caption != DEFAULT_EPISODE_CAPTION else 'default'}</code>",
         f"🔘 {sc('buttons')} · <code>{len(buttons)}</code>",
         f"🎯 {sc('series prefs')} · <code>{len(prefs)}</code>",
     ])
-
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 EDIT CAPTION", callback_data="sg:a_caption"),
          InlineKeyboardButton("🔘 MANAGE BUTTONS", callback_data="sg:a_buttons")],
@@ -1335,10 +1744,8 @@ async def cb_a_caption(client: Client, q: CallbackQuery):
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📝 <b>{fb('EPISODE CAPTION')}</b>",
-        DIV, "",
-        f"<code>{_esc(current[:400])}</code>",
-        "",
-        DIV2, "",
+        DIV, "", f"<code>{_esc(current[:400])}</code>",
+        "", DIV2,
         f"📌 {sc('placeholders')}:",
         f"<code>{{series}}</code> <code>{{season}}</code> <code>{{episode}}</code>",
         f"<code>{{quality}}</code> <code>{{language}}</code> <code>{{size}}</code>",
@@ -1360,8 +1767,7 @@ async def cb_a_cap_edit(client: Client, q: CallbackQuery):
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"✏️ <b>{fb('EDIT CAPTION')}</b>",
-        DIV, "",
-        f"📝 {sc('send the new caption template')}",
+        DIV, "", f"📝 {sc('send the new caption template')}",
     ])
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ CANCEL", callback_data="sg:a_caption")]])
@@ -1384,8 +1790,7 @@ async def cb_a_cap_prev(client: Client, q: CallbackQuery):
         preview = template.format(series="Breaking Bad", season=1, episode=5,
                                    quality="1080P", language="English",
                                    size="1.45 GB")
-    except Exception:
-        preview = template
+    except Exception: preview = template
     text = "\n".join([f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
                       f"👁️ <b>{fb('PREVIEW')}</b>", DIV, "", preview])
     kb = InlineKeyboardMarkup([[
@@ -1399,14 +1804,12 @@ async def cb_a_buttons(client: Client, q: CallbackQuery):
     buttons = await _get_buttons()
     lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
              f"🔘 <b>{fb('EXTRA BUTTONS')}</b>", DIV, ""]
-    if not buttons:
-        lines.append("⚪ ɴᴏ ʙᴜᴛᴛᴏɴꜱ ʏᴇᴛ.")
+    if not buttons: lines.append("⚪ ɴᴏ ʙᴜᴛᴛᴏɴꜱ ʏᴇᴛ.")
     else:
         for i, b in enumerate(buttons, 1):
             lines.append(f"{i}. <b>{_esc(b.get('name'))}</b>")
             lines.append(f"   <code>{_esc(b.get('url'))}</code>")
             lines.append("")
-
     rows = [[InlineKeyboardButton(
         f"🗑️ {i}. {(b.get('name') or '?')[:30]}",
         callback_data=f"sg:a_btn_rm:{i-1}")] for i, b in enumerate(buttons, 1)]
@@ -1424,8 +1827,7 @@ async def cb_a_btn_add(client: Client, q: CallbackQuery):
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"➕ <b>{fb('ADD BUTTON')}</b>",
-        DIV, "",
-        f"📝 {sc('send')} <code>Name | URL</code>",
+        DIV, "", f"📝 {sc('send')} <code>Name | URL</code>",
     ])
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ CANCEL", callback_data="sg:a_buttons")]])
@@ -1450,8 +1852,7 @@ async def cb_a_prefs(client: Client, q: CallbackQuery):
     prefs = await _list_series_prefs()
     lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
              f"🎯 <b>{fb('SERIES PREFS')}</b>", DIV, ""]
-    if not prefs:
-        lines.append("⚪ ɴᴏɴᴇ ꜱᴇᴛ.")
+    if not prefs: lines.append("⚪ ɴᴏɴᴇ ꜱᴇᴛ.")
     else:
         for p in prefs[:30]:
             lines.append(f"🎬 <b>{_esc(p.get('title'))}</b>")
@@ -1475,7 +1876,6 @@ async def cb_a_pref_add(client: Client, q: CallbackQuery):
         f"🎯 <b>{fb('SET SERIES PREFS')}</b>",
         DIV, "",
         f"📝 {sc('send the series name')}",
-        f"📌 {sc('example')} · <code>Breaking Bad</code>",
     ])
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ CANCEL", callback_data="sg:a_prefs")]])
@@ -1489,8 +1889,7 @@ async def cb_a_stats(client: Client, q: CallbackQuery):
     buttons = await _get_buttons()
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"📊 <b>{fb('STATS')}</b>",
-        DIV, "",
+        f"📊 <b>{fb('STATS')}</b>", DIV, "",
         f"🎯 {sc('prefs')} · <code>{len(prefs)}</code>",
         f"🔘 {sc('buttons')} · <code>{len(buttons)}</code>",
         f"📢 {sc('group')} · <code>{SERIES_GROUP_ID or '—'}</code>",
@@ -1547,8 +1946,7 @@ async def sg_admin_input(client: Client, message: Message):
     text = (message.text or "").strip()
 
     if action == "edit_caption":
-        if len(text) < 10:
-            return await message.reply_text("❌ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
+        if len(text) < 10: return await message.reply_text("❌ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
         ok = await _set_caption(text)
         _clear_session(message.from_user.id)
         await message.reply_text("✅ ꜱᴀᴠᴇᴅ." if ok else "❌ ꜰᴀɪʟᴇᴅ.")
@@ -1560,8 +1958,7 @@ async def sg_admin_input(client: Client, message: Message):
                 "❌ ꜰᴏʀᴍᴀᴛ: <code>Name | URL</code>",
                 parse_mode=ParseMode.HTML)
         name, url = [p.strip() for p in text.split("|", 1)]
-        if not name or not url:
-            return await message.reply_text("❌ ᴇᴍᴘᴛʏ.")
+        if not name or not url: return await message.reply_text("❌ ᴇᴍᴘᴛʏ.")
         if url.startswith("@"): url = f"https://t.me/{url[1:]}"
         elif not (url.startswith("http") or url.startswith("tg://")):
             if "." in url and " " not in url: url = f"https://{url}"
@@ -1590,11 +1987,9 @@ async def sg_admin_input(client: Client, message: Message):
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
-
         quals = sorted({f.get("quality") for f in files
                         if f.get("quality") not in (None, "UNKNOWN")},
                        key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
-
         if not quals:
             _clear_session(message.from_user.id)
             try:
@@ -1604,13 +1999,10 @@ async def sg_admin_input(client: Client, message: Message):
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
-
         _new_session(message.from_user.id,
                      pref_slug=re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_"),
-                     pref_title=text,
-                     pref_quals=list(quals),
+                     pref_title=text, pref_quals=list(quals),
                      pref_selected=list(quals))
-
         await _show_pref_picker(client, message.chat.id, loading.id)
         return
 
@@ -1621,22 +2013,16 @@ async def _show_pref_picker(client: Client, chat_id: int, msg_id: int):
         d = s.get("data") or {}
         if d.get("pref_slug"): uid = u; break
     if uid is None: return
-
     d = _SESSIONS[uid]["data"]
-    title = d.get("pref_title")
-    quals = d.get("pref_quals") or []
+    title = d.get("pref_title"); quals = d.get("pref_quals") or []
     selected = d.get("pref_selected") or []
-
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎯 <b>{fb('SET SERIES PREFS')}</b>",
-        DIV, "",
-        f"🎬 <b>{_esc(title)}</b>",
-        "",
+        DIV, "", f"🎬 <b>{_esc(title)}</b>", "",
         f"✅ {sc('selected')} · <code>{', '.join(selected) or 'none'}</code>",
     ]
-    rows = []
-    row = []
+    rows = []; row = []
     for q in quals:
         mark = "✅" if q in selected else "⬜"
         row.append(InlineKeyboardButton(f"{mark} {q}",
@@ -1646,10 +2032,8 @@ async def _show_pref_picker(client: Client, chat_id: int, msg_id: int):
     if row: rows.append(row)
     rows.append([InlineKeyboardButton("💾 SAVE", callback_data="sg:a_pref_save")])
     rows.append([InlineKeyboardButton("❌ CANCEL", callback_data="sg:a_prefs")])
-
     try:
-        await client.edit_message_text(
-            chat_id=chat_id, message_id=msg_id,
+        await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
             text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML)
@@ -1678,9 +2062,8 @@ async def cb_a_pref_save(client: Client, q: CallbackQuery):
     s = _get_session(q.from_user.id)
     if not s: return await q.answer("⏱️ ᴇxᴘɪʀᴇᴅ", show_alert=True)
     d = s["data"]
-    ok = await _set_series_pref(
-        d.get("pref_slug"), d.get("pref_title"),
-        d.get("pref_selected") or [])
+    ok = await _set_series_pref(d.get("pref_slug"), d.get("pref_title"),
+                                  d.get("pref_selected") or [])
     _clear_session(q.from_user.id)
     await q.answer("✅ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
     await cb_a_prefs(client, q)
@@ -1704,7 +2087,13 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP v7 — PM FIX + DEDUPE — LOADED ✅              ║")
+logger.info("║  🎬 SERIES GROUP ULTIMATE v8 — LOADED ✅                       ║")
+logger.info("║                                                                ║")
+logger.info("║  ✅ Smart DB-first search                                      ║")
+logger.info("║  ✅ TMDB fallback → suggestions                                ║")
+logger.info("║  ✅ Request channel with admin actions                         ║")
+logger.info("║  ✅ PM redirect with fallback button                           ║")
+logger.info("║  ✅ 1 file per (season, episode, quality)                      ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
 logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO':<50}║")
