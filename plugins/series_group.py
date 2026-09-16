@@ -1,6 +1,6 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (v5 — no year, lenient filters)
+🎬 DOWNTOWN VILLA — SERIES GROUP (v6 — dedupe + no conflict)
 """
 import asyncio
 import logging
@@ -235,7 +235,34 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ ENGINE SEARCH — NO YEAR, LENIENT FILTERS
+# ⭐ FIX #2 — DEDUPE ONE FILE PER (SEASON, EPISODE, QUALITY)
+# ═══════════════════════════════════════════════════════════════════════════
+def _dedupe_by_episode(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep ONE file per (season, episode, quality) — prefer the largest file.
+    So if you have 200MB + 300MB + 5GB of S02E01 720P, only the 5GB one wins.
+    """
+    buckets: Dict[Tuple, Dict[str, Any]] = {}
+    for f in files:
+        key = (
+            f.get("season"),
+            f.get("episode"),
+            (f.get("quality") or "UNKNOWN").upper(),
+        )
+        existing = buckets.get(key)
+        if existing is None:
+            buckets[key] = f
+        else:
+            # Prefer the larger file (usually better bitrate/quality)
+            if (f.get("file_size") or 0) > (existing.get("file_size") or 0):
+                buckets[key] = f
+    out = list(buckets.values())
+    out.sort(key=lambda x: (x.get("season") or 0, x.get("episode") or 0))
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENGINE SEARCH — NO YEAR, LENIENT FILTERS, DEDUPED
 # ═══════════════════════════════════════════════════════════════════════════
 async def _engine_search(title: str,
                          season: Optional[int] = None,
@@ -245,6 +272,7 @@ async def _engine_search(title: str,
     Search via media_search.engine.
     NO YEAR passed to engine.
     Lenient filters — empty language/quality = keep file.
+    ⭐ Dedupes: only ONE file per (season, episode, quality).
     """
     try:
         from media_search.engine import engine
@@ -292,8 +320,6 @@ async def _engine_search(title: str,
             if language:
                 lang_lower = language.lower()
                 h_lower = [l.lower() for l in h_langs]
-                # If we don't know the language → keep the file
-                # If we do know, do a flexible match
                 if h_lower and not any(
                         lang_lower in l or l in lang_lower
                         for l in h_lower):
@@ -315,9 +341,15 @@ async def _engine_search(title: str,
                 "languages": h_langs,
                 "title": getattr(h, "title", "") or "",
                 "series_title": getattr(h, "series_title", None) or "",
+                "chat_id": getattr(h, "chat_id", None),
+                "message_id": getattr(h, "message_id", None) or
+                              getattr(h, "msg_id", None),
             })
 
-        logger.info(f"[SG] after filters: {len(all_files)} files")
+        # ⭐ FIX #2 — dedupe before returning
+        before = len(all_files)
+        all_files = _dedupe_by_episode(all_files)
+        logger.info(f"[SG] after filters: {before} → dedupe: {len(all_files)}")
 
     except Exception as e:
         logger.exception(f"[SG] engine search failed: {e}")
@@ -637,7 +669,7 @@ async def _safe_edit(target, text: str, kb=None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GROUP SEARCH
+# ⭐ FIX #1 — GROUP SEARCH WITH stop_propagation
 # ═══════════════════════════════════════════════════════════════════════════
 if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
     @Client.on_message(
@@ -650,6 +682,13 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if len(txt) < 2 or len(txt) > 80: return
             if not message.from_user: return
             if "http" in txt.lower(): return
+
+            # ⭐ FIX #1 — Stop other plugins (auto_filter, group_search)
+            # from also responding to this same message.
+            try:
+                message.stop_propagation()
+            except Exception:
+                pass
 
             logger.info(f"[SG] search: {txt!r}")
 
@@ -899,6 +938,9 @@ async def cb_qual(client: Client, q: CallbackQuery):
         files = [f for f in (c.get("files_by_season") or [])
                  if (f.get("quality") or "").upper() == quality.upper()
                  or (f.get("quality") == "UNKNOWN")]
+
+        # ⭐ FIX #2 safety — dedupe again right before sending
+        files = _dedupe_by_episode(files)
         files.sort(key=lambda x: (x.get("episode") or 0))
 
         if not files:
@@ -1048,6 +1090,7 @@ async def _deliver_episodes(client: Client, user_id: int,
                 logger.debug(f"[SG] deliver one: {e}")
                 failed += 1
 
+        # ⭐ FIX #3 — Prettier final message with quality + language
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1056,7 +1099,9 @@ async def _deliver_episodes(client: Client, user_id: int,
                     f"✅ <b>{fb('DONE')}</b>",
                     DIV, "",
                     f"🎬 <b>{_esc(chosen.get('title'))}</b>",
-                    f"📺 Season {chosen.get('selected_season'):02d}",
+                    f"📺 <b>Season {chosen.get('selected_season'):02d}</b>",
+                    f"🎯 <code>{chosen.get('selected_quality')}</code> · "
+                    f"🌍 <code>{chosen.get('selected_language')}</code>",
                     "",
                     f"✅ {sc('sent')} · <code>{sent}</code>",
                     f"❌ {sc('failed')} · <code>{failed}</code>",
@@ -1566,7 +1611,7 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP v5 — NO YEAR — LOADED ✅                     ║")
+logger.info("║  🎬 SERIES GROUP v6 — DEDUPE + NO CONFLICT — LOADED ✅         ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
 logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO — set SERIES_GROUP_ENABLED=true':<50}║")
