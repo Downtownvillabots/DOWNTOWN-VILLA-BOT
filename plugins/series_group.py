@@ -1,14 +1,6 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (v4 — engine-backed)
-
-Uses media_search.engine for search AND media_search.delivery for sending.
-Same behavior as group_search + adds language/season/quality pickers.
-
-Set env:
-  SERIES_GROUP_ID=-100xxx           (required)
-  SERIES_GROUP_ENABLED=true         (required — prevents conflict)
-  TMDB_API_KEY=xxx                  (required)
+🎬 DOWNTOWN VILLA — SERIES GROUP (v5 — no year, lenient filters)
 """
 import asyncio
 import logging
@@ -54,7 +46,6 @@ SERIES_GROUP_ENABLED = os.getenv("SERIES_GROUP_ENABLED", "false").lower() in \
 
 SESSION_TTL = 900
 DELIVER_BATCH_DELAY = 0.6
-MAX_EPISODES = 100
 
 DIV = "━" * 26
 DIV2 = "─" * 26
@@ -76,7 +67,6 @@ DEFAULT_EPISODE_CAPTION = (
     "⚡ <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>"
 )
 
-# Fancy fonts
 _M_BOLD = {
     **{chr(ord('A') + i): "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"[i] for i in range(26)},
     **{chr(ord('a') + i): "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"[i] for i in range(26)},
@@ -245,15 +235,16 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ SEARCH — via media_search.engine (SAME as working group_search)
+# ⭐ ENGINE SEARCH — NO YEAR, LENIENT FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
-async def _engine_search_series(title: str, year: Optional[str] = None,
-                                 season: Optional[int] = None,
-                                 language: Optional[str] = None,
-                                 quality: Optional[str] = None) -> List[Dict[str, Any]]:
+async def _engine_search(title: str,
+                         season: Optional[int] = None,
+                         language: Optional[str] = None,
+                         quality: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Search using media_search engine.
-    Returns list of dicts with a `file_hit` key carrying the original FileHit.
+    Search via media_search.engine.
+    NO YEAR passed to engine.
+    Lenient filters — empty language/quality = keep file.
     """
     try:
         from media_search.engine import engine
@@ -266,21 +257,19 @@ async def _engine_search_series(title: str, year: Optional[str] = None,
 
     try:
         norm = normalize(title)
-        logger.info(f"[SG] engine.search_series({norm!r}, year={year})")
+        logger.info(f"[SG] engine.search_series({norm!r}) — NO YEAR")
 
-        # Try series first
-        result = await engine.search_series(norm, year=year)
+        # ⭐ NO YEAR PASSED
+        result = await engine.search_series(norm)
         hits = result.hits
 
-        # Fallback to generic
         if not hits:
-            logger.info(f"[SG] engine.search_any({norm!r})")
-            result = await engine.search_any(norm, year=year)
+            logger.info(f"[SG] engine.search_any({norm!r}) — NO YEAR")
+            result = await engine.search_any(norm)
             hits = result.hits
 
         logger.info(f"[SG] engine returned {len(hits)} hits")
 
-        # Try to parse season/episode from FileHit or filename
         for h in hits:
             h_season = getattr(h, "season", None)
             h_episode = getattr(h, "episode", None)
@@ -296,16 +285,26 @@ async def _engine_search_series(title: str, year: Optional[str] = None,
                 if not h_quality: h_quality = p.get("quality")
                 if not h_langs: h_langs = p.get("languages") or []
 
-            # Filters
+            # ── FILTERS (LENIENT) ──
             if season is not None and h_season != season:
                 continue
-            if language and language not in h_langs:
-                continue
-            if quality and (h_quality or "UNKNOWN") != quality:
-                continue
+
+            if language:
+                lang_lower = language.lower()
+                h_lower = [l.lower() for l in h_langs]
+                # If we don't know the language → keep the file
+                # If we do know, do a flexible match
+                if h_lower and not any(
+                        lang_lower in l or l in lang_lower
+                        for l in h_lower):
+                    continue
+
+            if quality and h_quality:
+                if h_quality.upper() != quality.upper():
+                    continue
 
             all_files.append({
-                "file_hit": h,   # ⭐ keep original for delivery
+                "file_hit": h,
                 "file_id": getattr(h, "file_id", "") or "",
                 "file_unique_id": getattr(h, "file_unique_id", None),
                 "file_name": file_name,
@@ -327,7 +326,7 @@ async def _engine_search_series(title: str, year: Optional[str] = None,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LIGHT PARSER (for FileHit fallback — no DB needed)
+# LIGHT PARSER
 # ═══════════════════════════════════════════════════════════════════════════
 _SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -360,9 +359,7 @@ _LANG_ALIASES = {
 
 
 def _parse_filename_light(filename: str) -> Dict[str, Any]:
-    """Minimal parser — season, episode, quality, languages."""
-    out = {"season": None, "episode": None,
-           "quality": None, "languages": []}
+    out = {"season": None, "episode": None, "quality": None, "languages": []}
     if not filename: return out
 
     name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
@@ -370,7 +367,6 @@ def _parse_filename_light(filename: str) -> Dict[str, Any]:
                   name, flags=re.I)
     wl = name.lower()
 
-    # Season / Episode
     for pat in _SE_PATTERNS:
         m = pat.search(name)
         if m:
@@ -387,12 +383,10 @@ def _parse_filename_light(filename: str) -> Dict[str, Any]:
                 try: out["season"] = int(m.group(1)); break
                 except Exception: continue
 
-    # Quality
     for marker, label in _QUALITY_MARKERS:
         if re.search(r"\b" + re.escape(marker) + r"\b", wl):
             out["quality"] = label; break
 
-    # Languages
     langs = []
     for ln, aliases in _LANG_ALIASES.items():
         for a in aliases:
@@ -404,7 +398,7 @@ def _parse_filename_light(filename: str) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TMDB API
+# TMDB
 # ═══════════════════════════════════════════════════════════════════════════
 async def _tmdb_get(path: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
     if not TMDB_API_KEY: return None
@@ -419,7 +413,7 @@ async def _tmdb_get(path: str, params: Dict[str, Any] = None) -> Optional[Dict[s
                 if r.status != 200: return None
                 return await r.json()
     except Exception as e:
-        logger.debug(f"[SG] tmdb {path}: {e}"); return None
+        logger.debug(f"[SG] tmdb: {e}"); return None
 
 
 async def _tmdb_search_series(query: str) -> List[Dict[str, Any]]:
@@ -437,7 +431,6 @@ async def _tmdb_search_series(query: str) -> List[Dict[str, Any]]:
             "year": (date or "")[:4],
             "rating": it.get("vote_average", 0),
             "poster": it.get("poster_path"),
-            "overview": (it.get("overview") or "")[:200],
         })
     return out
 
@@ -486,7 +479,7 @@ def _poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SUMMARIZE FILES
+# SUMMARIZE
 # ═══════════════════════════════════════════════════════════════════════════
 def _summarize(files: List[Dict[str, Any]]) -> Dict[str, Any]:
     qualities: Set[str] = set()
@@ -598,7 +591,7 @@ def _view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _view_languages(title: str, year: str, langs: List[str]) -> str:
+def _view_languages(title: str, year: str) -> str:
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{_esc(title)}</b> ({year})",
@@ -644,7 +637,7 @@ async def _safe_edit(target, text: str, kb=None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⚠️ GROUP SEARCH — ONLY if SERIES_GROUP_ENABLED=true
+# GROUP SEARCH
 # ═══════════════════════════════════════════════════════════════════════════
 if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
     @Client.on_message(
@@ -658,7 +651,7 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if not message.from_user: return
             if "http" in txt.lower(): return
 
-            logger.info(f"[SG] group search: {txt!r} from {message.from_user.id}")
+            logger.info(f"[SG] search: {txt!r}")
 
             try:
                 status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
@@ -689,11 +682,10 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             except Exception as e:
                 logger.warning(f"[SG] edit: {e}")
 
-            # DM the user a nudge
             try:
                 await client.send_message(
                     chat_id=message.from_user.id,
-                    text="📩 <b>ᴄʜᴇᴄᴋ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ</b> — ᴘɪᴄᴋ ʏᴏᴜʀ ꜱʜᴏᴡ!",
+                    text="📩 <b>ᴄʜᴇᴄᴋ ᴛʜᴇ ꜱᴇʀɪᴇꜱ ɢʀᴏᴜᴘ</b>!",
                     parse_mode=ParseMode.HTML)
             except Exception: pass
 
@@ -702,7 +694,7 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALLBACK: PICK SUGGESTION
+# PICK SUGGESTION
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:pick:(\d+)$"), group=-420)
 async def cb_pick(client: Client, q: CallbackQuery):
@@ -730,11 +722,13 @@ async def cb_pick(client: Client, q: CallbackQuery):
         tmdb_langs = _tmdb_languages(details)
         tmdb_seasons = _tmdb_seasons(details)
 
-        # Local scan via engine
-        local_files = await _engine_search_series(title, year=year or None)
+        # ⭐ NO YEAR
+        local_files = await _engine_search(title)
         summary = _summarize(local_files)
 
-        # Save chosen to session
+        logger.info(f"[SG] pick: {title!r} · local_files={len(local_files)} · "
+                    f"langs={summary['languages']}")
+
         s["data"]["chosen"] = {
             "tmdb_id": tmdb_id, "title": title, "year": year,
             "poster": chosen.get("poster"),
@@ -758,12 +752,11 @@ async def _show_languages(client: Client, q: CallbackQuery):
     tmdb_langs = c.get("tmdb_langs") or ["English"]
     local_langs = c.get("local_langs") or []
 
-    # Order: local first
     ordered = [l for l in tmdb_langs if l in local_langs] + \
               [l for l in tmdb_langs if l not in local_langs]
     c["ordered_langs"] = ordered
 
-    text = _view_languages(c.get("title"), c.get("year"), ordered)
+    text = _view_languages(c.get("title"), c.get("year"))
     kb = kb_languages(ordered, local_langs)
     poster = _poster_url(c.get("poster"), "w500")
 
@@ -784,7 +777,7 @@ async def _show_languages(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALLBACK: PICK LANGUAGE
+# PICK LANGUAGE
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:lang:(\d+)$"), group=-420)
 async def cb_lang(client: Client, q: CallbackQuery):
@@ -802,15 +795,15 @@ async def cb_lang(client: Client, q: CallbackQuery):
         c["selected_language"] = lang
         await q.answer(f"🌍 {lang}")
 
-        files = await _engine_search_series(
-            c.get("title") or "", year=c.get("year") or None,
-            language=lang)
+        # ⭐ NO YEAR
+        files = await _engine_search(c.get("title") or "", language=lang)
         c["files_by_lang"] = files
 
         summary = _summarize(files)
         c["seasons_for_lang"] = summary["seasons"]
 
-        # Show seasons
+        logger.info(f"[SG] lang {lang}: {len(files)} files")
+
         seasons = c.get("tmdb_seasons") or []
         text = _view_seasons(c.get("title"), c.get("year"))
         kb = kb_seasons(seasons, summary["seasons"])
@@ -823,7 +816,7 @@ async def cb_lang(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALLBACK: PICK SEASON
+# PICK SEASON
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:seas:(\d+)$"), group=-420)
 async def cb_seas(client: Client, q: CallbackQuery):
@@ -842,16 +835,16 @@ async def cb_seas(client: Client, q: CallbackQuery):
         await q.answer(f"📺 Season {season:02d}")
 
         lang = c.get("selected_language")
-        files = await _engine_search_series(
-            c.get("title") or "", year=c.get("year") or None,
-            language=lang, season=season)
+        files = await _engine_search(c.get("title") or "",
+                                      language=lang, season=season)
         c["files_by_season"] = files
+
+        logger.info(f"[SG] S{season} ({lang}): {len(files)} files")
 
         qualities = sorted({f["quality"] for f in files
                              if f.get("quality") not in (None, "UNKNOWN")},
                             key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
 
-        # Admin prefs override
         slug = re.sub(r"[^a-z0-9]+", "_",
                        (c.get("title") or "").lower()).strip("_")
         pref = await _get_series_pref(slug)
@@ -865,11 +858,17 @@ async def cb_seas(client: Client, q: CallbackQuery):
         c["available_qualities"] = final_quals
 
         if not final_quals:
-            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇᴀꜱᴏɴ",
-                                   show_alert=True)
+            # Show all qualities found in this season regardless
+            fallback = sorted({f["quality"] for f in files
+                               if f.get("quality")}, reverse=True)
+            if fallback:
+                c["available_qualities"] = fallback
+            else:
+                return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ꜱᴇᴀꜱᴏɴ",
+                                       show_alert=True)
 
         text = _view_qualities(c.get("title"), season)
-        kb = kb_qualities(final_quals)
+        kb = kb_qualities(c["available_qualities"])
         await _safe_edit(q, text, kb)
     except Exception as e:
         logger.exception(f"[SG] seas: {e}")
@@ -878,7 +877,7 @@ async def cb_seas(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALLBACK: PICK QUALITY → DELIVER
+# PICK QUALITY → DELIVER
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-420)
 async def cb_qual(client: Client, q: CallbackQuery):
@@ -896,14 +895,15 @@ async def cb_qual(client: Client, q: CallbackQuery):
         c["selected_quality"] = quality
         await q.answer(f"🎯 {quality}")
 
+        # Filter files for this quality (lenient if UNKNOWN)
         files = [f for f in (c.get("files_by_season") or [])
-                 if f.get("quality") == quality]
+                 if (f.get("quality") or "").upper() == quality.upper()
+                 or (f.get("quality") == "UNKNOWN")]
         files.sort(key=lambda x: (x.get("episode") or 0))
 
         if not files:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
 
-        # Update message → "delivering"
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
             f"📤 <b>{fb('SENDING EPISODES')}</b>",
@@ -919,7 +919,6 @@ async def cb_qual(client: Client, q: CallbackQuery):
         await _safe_edit(q, text, InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")]]))
 
-        # Deliver in background
         asyncio.create_task(_deliver_episodes(client, q.from_user.id, c, files))
     except Exception as e:
         logger.exception(f"[SG] qual: {e}")
@@ -928,22 +927,19 @@ async def cb_qual(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELIVER — via media_search.delivery (SAME as working search)
+# DELIVER
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client: Client, user_id: int,
                              chosen: Dict[str, Any],
                              files: List[Dict[str, Any]]):
-    """Send each episode to user PM. Uses media_search.delivery for reliability."""
     try:
-        # Try to load delivery helper
         delivery = None
         try:
             from media_search.delivery import delivery as _d
             delivery = _d
         except Exception as e:
-            logger.debug(f"[SG] delivery import: {e}")
+            logger.debug(f"[SG] delivery: {e}")
 
-        # Intro
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -963,7 +959,6 @@ async def _deliver_episodes(client: Client, user_id: int,
             return
         except Exception: pass
 
-        # Get caption + extra buttons
         template = await _get_caption()
         extra_buttons = await _get_buttons()
         extra_kb = _build_extra_kb(extra_buttons)
@@ -975,7 +970,6 @@ async def _deliver_episodes(client: Client, user_id: int,
             try:
                 ep = f.get("episode")
                 size = _fmt_size(f.get("file_size", 0))
-
                 try:
                     caption = template.format(
                         series=chosen.get("title") or "",
@@ -991,7 +985,7 @@ async def _deliver_episodes(client: Client, user_id: int,
 
                 file_hit = f.get("file_hit")
 
-                # ⭐ PRIMARY: media_search.delivery
+                # Primary: media_search.delivery
                 if delivery is not None and file_hit is not None:
                     try:
                         ok_d, err = await delivery.send_file(
@@ -1001,9 +995,9 @@ async def _deliver_episodes(client: Client, user_id: int,
                             await asyncio.sleep(DELIVER_BATCH_DELAY)
                             continue
                     except Exception as e:
-                        logger.debug(f"[SG] delivery.send_file: {e}")
+                        logger.debug(f"[SG] delivery: {e}")
 
-                # FALLBACK: copy_message by chat+msg
+                # Fallback: copy_message
                 src_chat = f.get("chat_id")
                 src_msg = f.get("message_id")
                 if src_chat and src_msg:
@@ -1035,7 +1029,7 @@ async def _deliver_episodes(client: Client, user_id: int,
                     except Exception as e:
                         logger.debug(f"[SG] copy: {e}")
 
-                # FALLBACK: send by file_id
+                # Fallback: file_id
                 fid = f.get("file_id")
                 if fid:
                     try:
@@ -1050,12 +1044,10 @@ async def _deliver_episodes(client: Client, user_id: int,
                         logger.debug(f"[SG] cached: {e}")
 
                 failed += 1
-
             except Exception as e:
                 logger.debug(f"[SG] deliver one: {e}")
                 failed += 1
 
-        # Final summary
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1075,7 +1067,6 @@ async def _deliver_episodes(client: Client, user_id: int,
         except Exception: pass
 
         logger.info(f"[SG] delivered {sent}/{len(files)} to {user_id}")
-
     except Exception as e:
         logger.exception(f"[SG] deliver: {e}")
 
@@ -1168,12 +1159,6 @@ async def _view_admin_main():
         f"<code>{'custom' if caption != DEFAULT_EPISODE_CAPTION else 'default'}</code>",
         f"🔘 {sc('buttons')} · <code>{len(buttons)}</code>",
         f"🎯 {sc('series prefs')} · <code>{len(prefs)}</code>",
-        "",
-        DIV2, "",
-        f"📌 {sc('user types a name in the group')}",
-        f"📌 {sc('bot suggests from tmdb')}",
-        f"📌 {sc('user picks language → season → quality')}",
-        f"📌 {sc('bot delivers all episodes to pm')}",
     ])
 
     kb = InlineKeyboardMarkup([
@@ -1367,11 +1352,10 @@ async def cb_a_stats(client: Client, q: CallbackQuery):
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📊 <b>{fb('STATS')}</b>",
         DIV, "",
-        f"🎯 {sc('series prefs')} · <code>{len(prefs)}</code>",
+        f"🎯 {sc('prefs')} · <code>{len(prefs)}</code>",
         f"🔘 {sc('buttons')} · <code>{len(buttons)}</code>",
-        f"📢 {sc('group id')} · <code>{SERIES_GROUP_ID or '—'}</code>",
-        f"⚙️ {sc('enabled')} · "
-        f"{'🟢' if SERIES_GROUP_ENABLED else '🔴'}",
+        f"📢 {sc('group')} · <code>{SERIES_GROUP_ID or '—'}</code>",
+        f"⚙️ {sc('enabled')} · {'🟢' if SERIES_GROUP_ENABLED else '🔴'}",
         f"🕒 <code>{_now_ist()}</code>",
     ])
     kb = InlineKeyboardMarkup([
@@ -1394,7 +1378,6 @@ async def cb_a_test(client: Client, q: CallbackQuery):
                 f"🎬 <b>{fb('SERIES SEARCH READY')}</b>",
                 DIV, "",
                 f"📌 {sc('type any series name')}",
-                f"📌 {sc('example')} · <code>breaking bad</code>",
             ]),
             parse_mode=ParseMode.HTML)
         await q.answer("✅ ꜱᴇɴᴛ")
@@ -1424,16 +1407,14 @@ async def sg_admin_input(client: Client, message: Message):
 
     text = (message.text or "").strip()
 
-    # EDIT CAPTION
     if action == "edit_caption":
         if len(text) < 10:
             return await message.reply_text("❌ ᴛᴏᴏ ꜱʜᴏʀᴛ.")
         ok = await _set_caption(text)
         _clear_session(message.from_user.id)
-        await message.reply_text("✅ ᴄᴀᴘᴛɪᴏɴ ꜱᴀᴠᴇᴅ." if ok else "❌ ꜰᴀɪʟᴇᴅ.")
+        await message.reply_text("✅ ꜱᴀᴠᴇᴅ." if ok else "❌ ꜰᴀɪʟᴇᴅ.")
         return
 
-    # ADD BUTTON
     if action == "add_button":
         if "|" not in text:
             return await message.reply_text(
@@ -1458,10 +1439,10 @@ async def sg_admin_input(client: Client, message: Message):
                                   parse_mode=ParseMode.HTML)
         return
 
-    # SERIES PREFS — STEP 1: NAME
     if action == "pref_add_name":
         loading = await message.reply_text("🔍 ꜱᴄᴀɴɴɪɴɢ ᴅʙ...")
-        files = await _engine_search_series(text)
+        # ⭐ NO YEAR
+        files = await _engine_search(text)
         if not files:
             _clear_session(message.from_user.id)
             try:
@@ -1481,7 +1462,7 @@ async def sg_admin_input(client: Client, message: Message):
             try:
                 await client.edit_message_text(
                     chat_id=message.chat.id, message_id=loading.id,
-                    text="⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ ꜰᴏᴜɴᴅ.",
+                    text="⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ.",
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
@@ -1497,7 +1478,6 @@ async def sg_admin_input(client: Client, message: Message):
 
 
 async def _show_pref_picker(client: Client, chat_id: int, msg_id: int):
-    """Render quality picker for the current admin."""
     uid = None
     for u, s in _SESSIONS.items():
         d = s.get("data") or {}
@@ -1569,7 +1549,7 @@ async def cb_a_pref_save(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CLEANUP + BOOT LOG
+# CLEANUP + LOG
 # ═══════════════════════════════════════════════════════════════════════════
 async def _cleanup_loop():
     while True:
@@ -1586,16 +1566,8 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP v4 (engine-backed) LOADED ✅                  ║")
+logger.info("║  🎬 SERIES GROUP v5 — NO YEAR — LOADED ✅                     ║")
 logger.info("║                                                                ║")
-logger.info("║  Env vars:                                                     ║")
-logger.info("║    SERIES_GROUP_ID=-100xxx         (required)                  ║")
-logger.info("║    SERIES_GROUP_ENABLED=true       (required to activate)      ║")
-logger.info("║    TMDB_API_KEY=xxx                (required)                  ║")
-logger.info("║                                                                ║")
-logger.info("║  Uses media_search.engine for search                           ║")
-logger.info("║  Uses media_search.delivery for sending                        ║")
-logger.info("║                                                                ║")
-logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<48}║")
-logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO (set env)':<48}║")
+logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
+logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO — set SERIES_GROUP_ENABLED=true':<50}║")
 logger.info("╚════════════════════════════════════════════════════════════════╝")
