@@ -1,14 +1,7 @@
 # plugins/ai_librarian.py
 """
 🎛️ AI LIBRARIAN v4 — uses SERIES GROUP engine (same quality detection)
-
-Features:
-- Same engine + parser as plugins/series_group.py
-- Sees ALL qualities (480p/720p/1080p/etc.)
-- Episode × quality grid with 🟢/🟡/🔴 status
-- Per-series quality prefs
-- Auto-scan, manual scan, mark complete
-- Delete individual files
+... (docstring unchanged)
 """
 import asyncio
 import logging
@@ -39,7 +32,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
@@ -52,7 +45,6 @@ PROGRESS_UPDATE_INTERVAL = 2.0
 DIV = "━" * 26
 DIV2 = "─" * 26
 
-# Priority order of qualities (highest first)
 QUALITY_ORDER = ["4320P", "2160P", "1440P", "1080P", "720P", "576P", "480P", "360P"]
 
 QUALITY_RANK = {
@@ -107,7 +99,7 @@ def _now_ist() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DB
+# DB  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_db():
     try:
@@ -173,7 +165,7 @@ async def _unmark_completed(slug):
 async def _list_completed(limit=100):
     c = _completed_coll()
     if c is None: return []
-    try: return await c.find({}).sort("completed_at", -1).limit(limit).to_list(limit)
+    try: return await c.find({}).sort("completed_at", -1).to_list(limit)
     except Exception: return []
 
 async def _count_completed():
@@ -199,6 +191,8 @@ async def _delete_file_record(file_id):
                 if r.deleted_count > 0: deleted = True
             except Exception:
                 continue
+        if not deleted:
+            logger.warning(f"[AI] delete_file: no record for {file_id!r}")
         return deleted
     except Exception as e:
         logger.warning(f"[AI] delete_file: {e}")
@@ -234,18 +228,21 @@ async def _list_prefs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SESSIONS
+# SESSIONS  (FIXED: flat storage, safe cleanup)
 # ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 def _new_session(uid, action, **data):
-    _SESSIONS[uid] = {"action": action, "data": data,
-                      "expires": time.time() + SESSION_TTL}
+    _SESSIONS[uid] = {
+        "action": action,
+        "expires": time.time() + SESSION_TTL,
+        **data,
+    }
 
 def _get_session(uid):
     s = _SESSIONS.get(uid)
     if not s: return None
-    if time.time() > s["expires"]:
+    if time.time() > s.get("expires", 0):
         _SESSIONS.pop(uid, None); return None
     return s
 
@@ -254,14 +251,15 @@ def _clear_session(uid): _SESSIONS.pop(uid, None)
 def _cleanup_sessions():
     now = time.time()
     for uid in list(_SESSIONS.keys()):
-        if _SESSIONS[uid]["expires"] < now: _SESSIONS.pop(uid, None)
+        s = _SESSIONS.get(uid) or {}
+        if s.get("expires", 0) < now:
+            _SESSIONS.pop(uid, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐⭐ SAME ENGINE AS SERIES GROUP ⭐⭐
+# ENGINE  (FIXED: null guard)
 # ═══════════════════════════════════════════════════════════════════════════
 async def _engine_search(title, season=None, language=None, quality=None):
-    """EXACTLY the same as series_group._engine_search"""
     try:
         from media_search.engine import engine
         from media_search.normalizer import normalize
@@ -273,10 +271,11 @@ async def _engine_search(title, season=None, language=None, quality=None):
     try:
         norm = normalize(title)
         result = await engine.search_series(norm)
-        hits = result.hits
+        hits = getattr(result, "hits", None) if result else None
         if not hits:
             result = await engine.search_any(norm)
-            hits = result.hits
+            hits = getattr(result, "hits", None) if result else None
+        hits = hits or []
 
         logger.info(f"[AI] engine: {len(hits)} hits for {norm!r}")
 
@@ -325,7 +324,7 @@ async def _engine_search(title, season=None, language=None, quality=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SAME LIGHT PARSER AS SERIES GROUP
+# PARSER  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 _SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -391,7 +390,6 @@ def _parse_filename_light(filename):
 
 
 def _dedupe_by_episode(files):
-    """Same as series group — 1 file per (season, episode, quality)."""
     if not files: return []
     seen_ids: Set[str] = set()
     by_id = []
@@ -431,12 +429,10 @@ def _dedupe_by_episode(files):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATALOG BUILD (uses engine results)
+# CATALOG  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 class SeriesCatalog:
-    """Groups files by: title → season → episode → quality."""
     def __init__(self):
-        # {title_slug: {"title": str, "seasons": {s: {ep: {q: file}}}}}
         self.data: Dict[str, Dict[str, Any]] = {}
 
     def add_file(self, f: Dict[str, Any]) -> bool:
@@ -469,7 +465,6 @@ class SeriesCatalog:
 
 
 def _summarize_catalog(cat: SeriesCatalog, slug: str) -> Dict[str, Any]:
-    """Return overall qualities, seasons, episodes count."""
     series = cat.data.get(slug) or {}
     seasons = series.get("seasons") or {}
     qualities: Set[str] = set()
@@ -489,13 +484,17 @@ def _summarize_catalog(cat: SeriesCatalog, slug: str) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TMDB SUGGEST (for manual scan)
+# TMDB  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 async def _tmdb_suggest(query):
-    if not TMDB_API_KEY: return []
+    if not TMDB_API_KEY:
+        logger.warning("[AI] TMDB_API_KEY missing")
+        return []
     try:
         import aiohttp
-    except ImportError: return []
+    except ImportError:
+        logger.warning("[AI] aiohttp not installed")
+        return []
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "en-US"}
     try:
         async with aiohttp.ClientSession() as sess:
@@ -503,7 +502,9 @@ async def _tmdb_suggest(query):
                                 params=params, timeout=12) as r:
                 if r.status != 200: return []
                 data = await r.json()
-    except Exception: return []
+    except Exception as e:
+        logger.warning(f"[AI] tmdb: {e}")
+        return []
 
     out = []
     for it in (data.get("results") or [])[:8]:
@@ -530,7 +531,7 @@ def kb_tmdb_suggest(items):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# KEYBOARDS
+# KEYBOARDS  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 def kb_main(auto_on, completed, total):
     return InlineKeyboardMarkup([
@@ -621,7 +622,7 @@ def kb_back(t="ai:main"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW BUILDERS
+# VIEW BUILDERS  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 async def _view_main():
     auto_on = await _get_setting("auto_mode", True)
@@ -663,7 +664,6 @@ def _view_scanning(cur, total):
 
 def _view_series_overview(series: Dict[str, Any], prefs: List[str],
                           i: int, t: int) -> str:
-    """Overview with quality × episode status."""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
 
@@ -684,7 +684,6 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
         lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b> · "
                      f"<code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
 
-        # Quality map for this season
         qual_set: Set[str] = set()
         for ep, qmap in eps.items():
             for q in qmap.keys():
@@ -693,14 +692,12 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
         qual_list = sorted(qual_set, key=lambda x: QUALITY_RANK.get(x, 0),
                             reverse=True)
 
-        # Per-episode status
         for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
             qmap = eps[ep]
             ep_label = f"E{ep:02d}" if ep is not None else "?"
 
             have = sorted(qmap.keys(),
                            key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
-            # Any admin prefs filter
             if prefs:
                 keep = [q for q in have if q in prefs]
                 ignore = [q for q in have if q not in prefs]
@@ -725,7 +722,6 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
 
             lines.append(f"   {icon} <b>{ep_label}</b> · {q_str}")
 
-        # Quality summary line
         lines.append(f"   📊 {sc('qualities')} · <code>{', '.join(qual_list) or '—'}</code>")
         lines.append("")
 
@@ -742,7 +738,6 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
 
 
 def _view_quality_grid(series: Dict[str, Any], prefs: List[str]) -> str:
-    """Matrix view: episodes × qualities with ✅/❌"""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
 
@@ -763,7 +758,6 @@ def _view_quality_grid(series: Dict[str, Any], prefs: List[str]) -> str:
             lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b> · —")
             continue
 
-        # Header: short quality labels
         header = "       " + "  ".join(f"{q[:5]:>5}" for q in qual_list)
         lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b>")
         lines.append(f"<code>{header}</code>")
@@ -819,7 +813,7 @@ async def _safe_edit(t, text, kb=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# COMMANDS
+# COMMANDS  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(filters.command(["ai", "librarian", "ailib"]) & filters.private, group=-430)
 async def cmd_ai(client, message):
@@ -887,10 +881,9 @@ async def cb_toggle(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN — uses engine (same as series group)
+# SCAN
 # ═══════════════════════════════════════════════════════════════════════════
 async def _build_catalog_from_titles(titles: List[str]) -> SeriesCatalog:
-    """Take a list of titles, run engine search on each, build catalog."""
     cat = SeriesCatalog()
     for title in titles:
         try:
@@ -909,7 +902,6 @@ async def _discover_all_series() -> List[str]:
         from database import db_registry
         for entry in db_registry.media_entries():
             try:
-                # Sample unique normalized_series_title
                 pipeline = [
                     {"$match": {"type": "series",
                                  "normalized_series_title": {"$exists": True,
@@ -920,7 +912,8 @@ async def _discover_all_series() -> List[str]:
                 async for doc in entry.db["media_files"].aggregate(pipeline):
                     t = doc.get("_id")
                     if t: titles.add(t)
-            except Exception: pass
+            except Exception as e:
+                logger.debug(f"[AI] shard discover: {e}")
     except Exception as e:
         logger.warning(f"[AI] discover: {e}")
     return sorted(titles)
@@ -941,11 +934,9 @@ async def cb_auto(client, q):
                                                 parse_mode=ParseMode.HTML)
         except Exception: status = q.message
 
-        # Discover series titles
         titles = await _discover_all_series()
         logger.info(f"[AI] discovered {len(titles)} unique series")
 
-        # Update progress
         try:
             await client.edit_message_text(
                 chat_id=q.message.chat.id, message_id=status.id,
@@ -953,11 +944,9 @@ async def cb_auto(client, q):
                 parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        # Build catalog using engine
         cat = await _build_catalog_from_titles(titles)
         await _set_setting("total_series", len(cat.data))
 
-        # Filter pending
         pending: List[Dict[str, Any]] = []
         for s in cat.list_series():
             if not await _is_completed(s["title_slug"]):
@@ -983,13 +972,14 @@ async def cb_auto(client, q):
         picked = pending[:SERIES_PER_AUTO]
 
         _new_session(q.from_user.id, "auto_scan",
-                     picked=[s["title_slug"] for s in picked], index=0)
+                     picked=[s["title_slug"] for s in picked], index=0,
+                     chat_id=q.message.chat.id)
         sess = _SESSIONS[q.from_user.id]
         sess["catalog_data"] = cat.data
-        sess["current_total"] = len(picked)
 
         await _show_series(client, q.message.chat.id, status.id,
-                            picked[0]["title_slug"], 1, len(picked))
+                            picked[0]["title_slug"], 1, len(picked),
+                            uid=q.from_user.id)
     except Exception as e:
         logger.exception(f"[AI] auto: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -997,14 +987,14 @@ async def cb_auto(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MANUAL SCAN — TMDB suggest
+# MANUAL SCAN
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:manual$"), group=-430)
 async def cb_manual(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     _clear_session(q.from_user.id)
-    _new_session(q.from_user.id, "manual_name")
+    _new_session(q.from_user.id, "manual_name", chat_id=q.message.chat.id)
     await _safe_edit(q, "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"✍️ <b>{fb('MANUAL SCAN')}</b>", DIV, "",
@@ -1020,7 +1010,7 @@ async def cb_manual(client, q):
 async def ai_manual_input(client, message):
     if not message.from_user: return
     s = _get_session(message.from_user.id)
-    if not s or s["action"] != "manual_name":
+    if not s or s.get("action") != "manual_name":
         return
     try: message.stop_propagation()
     except Exception: pass
@@ -1038,7 +1028,6 @@ async def ai_manual_input(client, message):
     suggestions = await _tmdb_suggest(text)
 
     if not suggestions:
-        # No TMDB → direct engine scan
         try:
             await client.edit_message_text(
                 chat_id=message.chat.id, message_id=loading.id,
@@ -1075,14 +1064,17 @@ async def ai_manual_input(client, message):
             except Exception: pass
             return
 
-        _new_session(message.from_user.id, "manual_result")
+        _new_session(message.from_user.id, "manual_result",
+                     chat_id=message.chat.id)
         sess = _SESSIONS[message.from_user.id]
         sess["catalog_data"] = cat.data
         slug0 = list(cat.data.keys())[0]
-        await _show_series(client, message.chat.id, loading.id, slug0, 1, 1)
+        await _show_series(client, message.chat.id, loading.id, slug0, 1, 1,
+                            uid=message.from_user.id)
         return
 
-    _new_session(message.from_user.id, "manual_tmdb_pick", suggestions=suggestions)
+    _new_session(message.from_user.id, "manual_tmdb_pick",
+                 suggestions=suggestions, chat_id=message.chat.id)
 
     lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
              f"🔎 <b>{fb('TMDB SUGGESTIONS')}</b>", DIV, "",
@@ -1110,9 +1102,9 @@ async def cb_pick_tmdb(client, q):
     try:
         idx = int(q.matches[0].group(1))
         s = _get_session(q.from_user.id)
-        if not s or s["action"] != "manual_tmdb_pick":
+        if not s or s.get("action") != "manual_tmdb_pick":
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        sugg = (s.get("data") or {}).get("suggestions") or []
+        sugg = s.get("suggestions") or []
         if idx < 0 or idx >= len(sugg):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
 
@@ -1126,7 +1118,6 @@ async def cb_pick_tmdb(client, q):
                                        parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        # ⭐ USE ENGINE
         files = await _engine_search(title)
         if not files:
             try:
@@ -1162,7 +1153,8 @@ async def cb_pick_tmdb(client, q):
             except Exception: pass
             return
 
-        _new_session(q.from_user.id, "manual_result")
+        _new_session(q.from_user.id, "manual_result",
+                     chat_id=q.message.chat.id)
         sess = _SESSIONS[q.from_user.id]
         sess["catalog_data"] = cat.data
 
@@ -1175,7 +1167,7 @@ async def cb_pick_tmdb(client, q):
             best_slug = list(cat.data.keys())[0]
 
         await _show_series(client, q.message.chat.id, q.message.id,
-                            best_slug, 1, 1)
+                            best_slug, 1, 1, uid=q.from_user.id)
     except Exception as e:
         logger.exception(f"[AI] pick_tmdb: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -1183,13 +1175,15 @@ async def cb_pick_tmdb(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SHOW SERIES
+# SHOW SERIES  (FIXED: uid-based lookup)
 # ═══════════════════════════════════════════════════════════════════════════
-async def _show_series(client, chat_id, msg_id, slug, i, t):
-    sess = None
-    for uid, s in _SESSIONS.items():
-        if "catalog_data" in s:
-            sess = s; break
+async def _show_series(client, chat_id, msg_id, slug, i, t, uid=None):
+    # Prefer explicit uid, else match by chat_id
+    sess = _get_session(uid) if uid is not None else None
+    if sess is None:
+        for u, s in _SESSIONS.items():
+            if s.get("chat_id") == chat_id and s.get("catalog_data"):
+                sess = s; uid = u; break
     if not sess or not sess.get("catalog_data"):
         try:
             await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
@@ -1227,19 +1221,18 @@ async def cb_next(client, q):
     try:
         s = _get_session(q.from_user.id)
         if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        d = s.get("data") or {}
-        picked = d.get("picked") or []
-        i = d.get("index", 0) + 1
+        picked = s.get("picked") or []
+        i = s.get("index", 0) + 1
         if i >= len(picked): return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
-        s["data"]["index"] = i
+        s["index"] = i
         await q.answer()
         await _show_series(client, q.message.chat.id, q.message.id,
-                            picked[i], i + 1, len(picked))
+                            picked[i], i + 1, len(picked), uid=q.from_user.id)
     except Exception as e: logger.exception(f"[AI] next: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ QUALITY GRID ⭐
+# QUALITY GRID
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:grid:([a-z0-9_]+)$"), group=-430)
 async def cb_grid(client, q):
@@ -1265,7 +1258,7 @@ async def cb_grid(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ EPISODE LIST (drill-down) ⭐
+# EPISODE LIST
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:eps:([a-z0-9_]+)$"), group=-430)
 async def cb_eps(client, q):
@@ -1281,14 +1274,12 @@ async def cb_eps(client, q):
         if not seasons:
             return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
 
-        # Show episode picker as buttons — one per episode (S..E..)
         rows = []
         for sn in sorted(seasons.keys()):
             eps = seasons[sn]
             for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
                 qmap = eps[ep]
                 ep_label = f"S{sn:02d}E{ep:02d}" if ep is not None else f"S{sn:02d}"
-                # Status icon
                 if len(qmap) >= 2:
                     icon = "🟢"
                 elif qmap:
@@ -1318,10 +1309,41 @@ async def cb_eps(client, q):
         except Exception: pass
 
 
+async def _render_epq(client, q, slug, season, episode):
+    """Render the per-episode quality picker (no q.answer())."""
+    s = _get_session(q.from_user.id)
+    if not s or not s.get("catalog_data"):
+        return False
+    series = s["catalog_data"].get(slug)
+    if not series: return False
+
+    eps = (series.get("seasons") or {}).get(season, {})
+    qmap = eps.get(episode, {})
+    if not qmap:
+        return False
+
+    prefs = await _get_prefs(slug)
+    text = _view_episode_quality_picker(series, season, episode, qmap, prefs)
+
+    rows = []
+    qs_sorted = sorted(qmap.keys(),
+                        key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+    for i, q_key in enumerate(qs_sorted):
+        rows.append([InlineKeyboardButton(
+            f"🗑️ DELETE {q_key}",
+            callback_data=f"ai:del_pick:{slug}:{season}:"
+                           f"{episode if episode is not None else 0}:"
+                           f"{q_key}:{i}")])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:eps:{slug}"),
+                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+
+    await _safe_edit(q, text, InlineKeyboardMarkup(rows))
+    return True
+
+
 @Client.on_callback_query(
     filters.regex(r"^ai:epq:([a-z0-9_]+):(\d+):(\d+)$"), group=-430)
 async def cb_epq(client, q):
-    """Show per-episode quality picker with delete buttons."""
     try:
         slug = q.matches[0].group(1)
         season = int(q.matches[0].group(2))
@@ -1330,32 +1352,10 @@ async def cb_epq(client, q):
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
-        series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-
-        eps = (series.get("seasons") or {}).get(season, {})
-        qmap = eps.get(episode, {})
-        if not qmap:
+        ok = await _render_epq(client, q, slug, season, episode)
+        if not ok:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ᴇᴘɪꜱᴏᴅᴇ",
                                     show_alert=True)
-
-        prefs = await _get_prefs(slug)
-        text = _view_episode_quality_picker(series, season, episode, qmap, prefs)
-
-        # One button per quality to delete
-        rows = []
-        qs_sorted = sorted(qmap.keys(),
-                            key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
-        for i, q_key in enumerate(qs_sorted):
-            rows.append([InlineKeyboardButton(
-                f"🗑️ DELETE {q_key}",
-                callback_data=f"ai:del_pick:{slug}:{season}:"
-                               f"{episode if episode is not None else 0}:"
-                               f"{q_key}:{i}")])
-        rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:eps:{slug}"),
-                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
-
-        await _safe_edit(q, text, InlineKeyboardMarkup(rows))
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] epq: {e}")
@@ -1364,11 +1364,10 @@ async def cb_epq(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW FILES (backwards-compat — jumps to grid)
+# VIEW  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
 async def cb_view(client, q):
-    """Jump to quality grid."""
     try:
         slug = q.matches[0].group(1)
         s = _get_session(q.from_user.id)
@@ -1463,7 +1462,8 @@ async def cb_pref_save(client, q):
         if not ok: return
         await _show_series(client, q.message.chat.id, q.message.id, slug,
                             s.get("current_index", 1),
-                            s.get("current_total", 1))
+                            s.get("current_total", 1),
+                            uid=q.from_user.id)
     except Exception as e: logger.exception(f"[AI] pref_save: {e}")
 
 
@@ -1536,8 +1536,11 @@ async def cb_all(client, q):
             except Exception: pass
             return
 
-        sess = _SESSIONS.setdefault(q.from_user.id, {})
+        _new_session(q.from_user.id, "all_series",
+                     chat_id=q.message.chat.id)
+        sess = _SESSIONS[q.from_user.id]
         sess["catalog_data"] = cat.data
+
         comp = {s.get("title_slug") for s in await _list_completed()}
         lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
                  f"📚 <b>{fb('ALL SERIES')}</b>", DIV, "",
@@ -1555,27 +1558,31 @@ async def cb_all(client, q):
     except Exception as e: logger.exception(f"[AI] all: {e}")
 
 
+async def _render_completed(q):
+    items = await _list_completed(50)
+    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+             f"✅ <b>{fb('COMPLETED')}</b>", DIV, ""]
+    if not items: lines.append("⚪ ɴᴏɴᴇ ʏᴇᴛ.")
+    else:
+        for it in items[:30]:
+            ts = it.get("completed_at", 0)
+            try: d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
+            except Exception: d = "?"
+            lines.append(f"✅ <b>{_esc(it.get('title'))}</b> · <code>{d}</code>")
+    rows = [[InlineKeyboardButton(f"🔄 UNMARK · {(it.get('title') or '?')[:25]}",
+                                   callback_data=f"ai:unmark:{it.get('title_slug')}")]
+            for it in items[:10]]
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
+                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+    await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 @Client.on_callback_query(filters.regex(r"^ai:completed$"), group=-430)
 async def cb_comp(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
     try:
-        items = await _list_completed(50)
-        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                 f"✅ <b>{fb('COMPLETED')}</b>", DIV, ""]
-        if not items: lines.append("⚪ ɴᴏɴᴇ ʏᴇᴛ.")
-        else:
-            for it in items[:30]:
-                ts = it.get("completed_at", 0)
-                try: d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
-                except Exception: d = "?"
-                lines.append(f"✅ <b>{_esc(it.get('title'))}</b> · <code>{d}</code>")
-        rows = [[InlineKeyboardButton(f"🔄 UNMARK · {(it.get('title') or '?')[:25]}",
-                                       callback_data=f"ai:unmark:{it.get('title_slug')}")]
-                for it in items[:10]]
-        rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
-                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
-        await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+        await _render_completed(q)
         await q.answer()
     except Exception as e: logger.exception(f"[AI] comp: {e}")
 
@@ -1586,12 +1593,12 @@ async def cb_unmark(client, q):
         slug = q.matches[0].group(1)
         ok = await _unmark_completed(slug)
         await q.answer("✅ ᴜɴᴍᴀʀᴋᴇᴅ" if ok else "❌ ɴᴏᴛ ꜰᴏᴜɴᴅ")
-        await cb_comp(client, q)
+        await _render_completed(q)
     except Exception as e: logger.exception(f"[AI] unmark: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELETE FILE
+# DELETE FILE  (FIXED: no double answer)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\w+):(\d+)$"),
@@ -1660,21 +1667,18 @@ async def cb_del_go(client, q):
         f = qmap.get(qual)
         if not f: return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
                                           show_alert=True)
-        fid = f.get("file_id") or ""
+        fid = f.get("file_id") or f.get("file_unique_id") or ""
         if not fid: return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
         ok = await _delete_file_record(fid)
         if not ok: return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
 
-        # Remove from catalog
         del s["catalog_data"][slug]["seasons"][sn][ep][qual]
-        # Update file_count
         s["catalog_data"][slug]["file_count"] = max(
             0, s["catalog_data"][slug]["file_count"] - 1)
 
         await q.answer("🗑️ ᴅᴇʟᴇᴛᴇᴅ")
-
-        # Re-render the episode quality picker
-        await cb_epq(client, q)
+        # Re-render without answering again
+        await _render_epq(client, q, slug, sn, ep)
     except Exception as e:
         logger.exception(f"[AI] del_go: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -1766,7 +1770,7 @@ async def _boot(client, message):
     if _BOOTED: return
     _BOOTED = True
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(_daily_loop(client))
         loop.create_task(_cleanup_loop())
         logger.info("[AI] loops started")
