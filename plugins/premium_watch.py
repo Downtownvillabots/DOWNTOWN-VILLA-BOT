@@ -1,8 +1,13 @@
 # plugins/premium_watch.py
 """
-PREMIUM WATCH COMPANION v3
-Beautiful PM-based premium watch experience
-Auto-redirect premium users from group to PM
+💎 PREMIUM WATCH COMPANION v4 — ULTIMATE
+- Premium-only PM-based watch experience
+- Persistent poster with live progress bars
+- Per-file [WATCHED] button
+- Watch Order for franchises
+- Expiry reminders (10d/5d/1d/expiry)
+- 6-month inactivity cleanup
+- 30-day grace period
 """
 import asyncio
 import logging
@@ -33,14 +38,15 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 # CONFIG
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
 
 GRACE_PERIOD_DAYS = 30
 INACTIVITY_DAYS = 180
 REMINDER_HOUR = 10
+REPORT_HOUR = 11
 
 PLAN_OPTIONS = [
     ("1 MONTH",   1),
@@ -50,8 +56,8 @@ PLAN_OPTIONS = [
     ("12 MONTHS", 12),
 ]
 
-DIV  = "─" * 24
-DIV2 = "━" * 24
+DIV  = "━" * 24
+DIV2 = "─" * 24
 DIV3 = "•" * 24
 
 EMO = {
@@ -84,56 +90,56 @@ EMO = {
     "back":   "◀️",
     "gear":   "⚙️",
     "lock":   "🔒",
+    "send":   "📥",
+    "done":   "☑️",
+    "lang":   "🌍",
+    "progress": "📈",
 }
 
 
-# ---------------------------------------------------------------------------
-# BEAUTIFUL UNICODE FONT MAPPING
-# Mathematical Bold Serif letters (works inside <b> too but nicer plain)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# UNICODE FONTS
+# ═══════════════════════════════════════════════════════════════════════════
 _BOLD_MAP = {}
 for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-    _BOLD_MAP[c] = chr(0x1D400 + i)          # 𝐀-𝐙
+    _BOLD_MAP[c] = chr(0x1D400 + i)
 for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
-    _BOLD_MAP[c] = chr(0x1D41A + i)          # 𝐚-𝐳
+    _BOLD_MAP[c] = chr(0x1D41A + i)
 for i, c in enumerate("0123456789"):
-    _BOLD_MAP[c] = chr(0x1D7CE + i)          # 𝟎-𝟗
+    _BOLD_MAP[c] = chr(0x1D7CE + i)
 
-
-_ITALIC_MAP = {}
+_SANS_MAP = {}
 for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-    _ITALIC_MAP[c] = chr(0x1D434 + i)        # 𝐴-𝑍
+    _SANS_MAP[c] = chr(0x1D5A0 + i)
 for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
-    _ITALIC_MAP[c] = chr(0x1D44E + i)        # 𝑎-𝑧
-
+    _SANS_MAP[c] = chr(0x1D5BA + i)
+for i, c in enumerate("0123456789"):
+    _SANS_MAP[c] = chr(0x1D7E2 + i)
 
 _MONO_MAP = {}
 for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-    _MONO_MAP[c] = chr(0x1D670 + i)          # 𝙰-𝚉
+    _MONO_MAP[c] = chr(0x1D670 + i)
 for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
-    _MONO_MAP[c] = chr(0x1D68A + i)          # 𝚊-𝚣
+    _MONO_MAP[c] = chr(0x1D68A + i)
 for i, c in enumerate("0123456789"):
-    _MONO_MAP[c] = chr(0x1D7F6 + i)          # 𝟶-𝟿
+    _MONO_MAP[c] = chr(0x1D7F6 + i)
 
 
 def fb(s) -> str:
-    """Fancy bold serif."""
     return "".join(_BOLD_MAP.get(c, c) for c in str(s))
 
 
-def fi(s) -> str:
-    """Fancy italic serif."""
-    return "".join(_ITALIC_MAP.get(c, c) for c in str(s))
+def fs(s) -> str:
+    return "".join(_SANS_MAP.get(c, c) for c in str(s))
 
 
 def fm(s) -> str:
-    """Fancy monospace."""
     return "".join(_MONO_MAP.get(c, c) for c in str(s))
 
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 # FORMATTING HELPERS
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 def _fmt_int(n) -> str:
     try:
         return f"{int(n):,}"
@@ -209,10 +215,10 @@ def _status_badge(days: int) -> str:
 
 
 def render_progress_bar(pct: float, width: int = 12) -> str:
-    """Block-character progress bar."""
+    """████████░░░░ style progress bar."""
     pct = max(0.0, min(100.0, float(pct)))
     filled = int(round(width * pct / 100))
-    return "▰" * filled + "▱" * (width - filled)
+    return "█" * filled + "░" * (width - filled)
 
 
 def render_stars(rating: float) -> str:
@@ -226,13 +232,26 @@ def render_stars(rating: float) -> str:
     return "★" * full + ("⯨" if half else "") + "☆" * empty
 
 
-# ---------------------------------------------------------------------------
+def _hours_left_label(total_eps: int, watched: int) -> str:
+    remaining = max(0, total_eps - watched)
+    if remaining <= 0:
+        return "done"
+    hours = remaining * 22 / 60
+    if hours < 1:
+        return "<1h"
+    return f"~{int(hours)}h"
+
+
+logger.info("[PREM] Part 1 loaded — config, fonts, helpers")
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DATABASE ACCESS
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 def _get_db():
     """Best-effort DB handle."""
     try:
-        for name in ("get_user_db", "get_system_db", "get_media_db", "get_db"):
+        for name in ("get_user_db", "get_system_db",
+                     "get_media_db", "get_db"):
             fn = getattr(db_manager, name, None)
             if callable(fn):
                 try:
@@ -273,12 +292,9 @@ def _ratings_coll():
     return d["watch_ratings"] if d is not None else None
 
 
-logger.info("[PREM] Part 1 loaded — fonts + config + db helpers")
-
-# ===========================================================================
-# PART 2 — PREMIUM USER CRUD
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# PREMIUM USER CRUD
+# ═══════════════════════════════════════════════════════════════════════════
 async def add_premium_user(user_id: int, username: str, months: int,
                             added_by: int, notes: str = "") -> bool:
     c = _premium_coll()
@@ -334,6 +350,19 @@ async def is_premium(user_id: int) -> bool:
     return doc.get("expires_at", 0) > time.time()
 
 
+async def is_premium_or_grace(user_id: int) -> bool:
+    doc = await get_premium_user(user_id)
+    if not doc:
+        return False
+    if doc.get("status") == "active":
+        return True
+    expires_at = doc.get("expires_at", 0)
+    if not expires_at:
+        return False
+    grace_end = expires_at + (GRACE_PERIOD_DAYS * 86400)
+    return grace_end > time.time()
+
+
 async def remove_premium_user(user_id: int) -> bool:
     c = _premium_coll()
     if c is None:
@@ -378,8 +407,7 @@ async def count_premium_users() -> Dict[str, int]:
         exp1 = await c.count_documents(
             {"status": "active",
              "expires_at": {"$gt": now, "$lte": d1}})
-        expired = await c.count_documents(
-            {"expires_at": {"$lte": now}})
+        expired = await c.count_documents({"expires_at": {"$lte": now}})
 
         return {"active": active, "expiring_10d": exp10,
                 "expiring_5d": exp5, "expiring_1d": exp1,
@@ -423,9 +451,66 @@ async def find_premium_by_username(username: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-# ===========================================================================
-# PART 2 — WATCH SESSIONS
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCH SESSION CRUD
+# ═══════════════════════════════════════════════════════════════════════════
+async def create_session(user_id: int, series_slug: str,
+                          series_title: str, poster: Optional[str],
+                          tmdb_id: Optional[int],
+                          tmdb_seasons: List[Dict[str, Any]],
+                          hits: List[Dict[str, Any]] = None,
+                          language: str = "") -> bool:
+    c = _sessions_coll()
+    if c is None:
+        return False
+    try:
+        now = time.time()
+        seasons_doc: Dict[str, Dict[str, Any]] = {}
+
+        for s in (tmdb_seasons or []):
+            sn = s.get("season")
+            if sn is None:
+                continue
+            seasons_doc[str(sn)] = {
+                "total_eps": int(s.get("episodes", 0) or 0),
+                "watched": [],
+                "current_ep": 1,
+            }
+
+        if not seasons_doc:
+            seasons_doc["1"] = {
+                "total_eps": 0, "watched": [], "current_ep": 1,
+            }
+
+        await c.update_one(
+            {"user_id": int(user_id), "series_slug": series_slug},
+            {"$set": {
+                "user_id": int(user_id),
+                "series_slug": series_slug,
+                "series_title": series_title,
+                "poster": poster,
+                "tmdb_id": tmdb_id,
+                "language": language or "",
+                "seasons": seasons_doc,
+                "hits": hits or [],
+                "started_at": now,
+                "last_activity_at": now,
+                "status": "watching",
+                "completed_at": None,
+                "poster_chat_id": int(user_id),
+                "poster_msg_id": None,
+                "current_file_msg_id": None,
+                "current_season": 1,
+                "current_episode": 1,
+            }},
+            upsert=True,
+        )
+        logger.info(f"[PREM] session created u={user_id} s={series_slug}")
+        return True
+    except Exception as e:
+        logger.exception(f"[PREM] create session: {e}")
+        return False
+
 
 async def get_session(user_id: int,
                        series_slug: str) -> Optional[Dict[str, Any]]:
@@ -464,6 +549,18 @@ async def mark_watched(user_id: int, series_slug: str,
             {"$addToSet": {key: int(episode)},
              "$set": {"last_activity_at": time.time()}},
         )
+
+        sess = await get_session(user_id, series_slug)
+        if sess:
+            s_data = (sess.get("seasons") or {}).get(str(season)) or {}
+            total = int(s_data.get("total_eps", 0) or 0)
+            next_ep = int(episode) + 1
+            if total and next_ep > total:
+                next_ep = total
+            await c.update_one(
+                {"user_id": int(user_id), "series_slug": series_slug},
+                {"$set": {f"seasons.{season}.current_ep": next_ep}},
+            )
         return True
     except Exception as e:
         logger.exception(f"[PREM] mark watched: {e}")
@@ -517,6 +614,22 @@ async def set_current_position(user_id: int, series_slug: str,
         return False
 
 
+async def set_language(user_id: int, series_slug: str,
+                        language: str) -> bool:
+    c = _sessions_coll()
+    if c is None:
+        return False
+    try:
+        await c.update_one(
+            {"user_id": int(user_id), "series_slug": series_slug},
+            {"$set": {"language": language,
+                      "last_activity_at": time.time()}},
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def mark_session_completed(user_id: int, series_slug: str) -> bool:
     c = _sessions_coll()
     if c is None:
@@ -532,6 +645,18 @@ async def mark_session_completed(user_id: int, series_slug: str) -> bool:
         return False
 
 
+async def delete_session(user_id: int, series_slug: str) -> bool:
+    c = _sessions_coll()
+    if c is None:
+        return False
+    try:
+        r = await c.delete_one({"user_id": int(user_id),
+                                 "series_slug": series_slug})
+        return r.deleted_count > 0
+    except Exception:
+        return False
+
+
 async def count_sessions() -> int:
     c = _sessions_coll()
     if c is None:
@@ -542,10 +667,9 @@ async def count_sessions() -> int:
         return 0
 
 
-# ===========================================================================
-# PART 2 — SETTINGS
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
 async def get_setting(key: str, default=None):
     c = _settings_coll()
     if c is None:
@@ -576,10 +700,11 @@ async def get_contact_admin() -> str:
     return await get_setting("contact_admin", "") or ""
 
 
-# ===========================================================================
-# PART 2 — PROGRESS ENGINE
-# ===========================================================================
+logger.info("[PREM] Part 2 loaded — DB + premium CRUD + session CRUD")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PROGRESS ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
 def compute_progress(session: Dict[str, Any]) -> Dict[str, Any]:
     seasons_raw = session.get("seasons") or {}
     seasons_out: Dict[int, Dict[str, Any]] = {}
@@ -636,6 +761,19 @@ def is_series_complete(session: Dict[str, Any]) -> bool:
     return p["total_watched"] >= p["total_eps"]
 
 
+def is_season_complete(session: Dict[str, Any], season: int) -> bool:
+    seasons_raw = session.get("seasons") or {}
+    s_data = seasons_raw.get(str(season)) or {}
+    total = int(s_data.get("total_eps", 0) or 0)
+    if total == 0:
+        return False
+    watched = set(s_data.get("watched") or [])
+    return len(watched) >= total
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROGRESS TEXT BUILDER (the "📊 YOUR PROGRESS" block you want)
+# ═══════════════════════════════════════════════════════════════════════════
 def build_poster_text(session: Dict[str, Any], title: str,
                        year: str = "", rating: float = 0) -> str:
     p = compute_progress(session)
@@ -654,40 +792,44 @@ def build_poster_text(session: Dict[str, Any], title: str,
 
     if not seasons_ordered:
         lines.append(f"{EMO['spark']} <i>Pick a language to start</i>")
+    else:
+        for sn in seasons_ordered:
+            s_data = seasons_raw.get(str(sn)) or {}
+            watched = len(s_data.get("watched") or [])
+            total = int(s_data.get("total_eps", 0) or 0)
 
-    for sn in seasons_ordered:
-        s_data = seasons_raw.get(str(sn)) or {}
-        watched = len(s_data.get("watched") or [])
-        total = int(s_data.get("total_eps", 0) or 0)
-
-        if total == 0:
-            bar = render_progress_bar(0)
-            status = EMO["box"]
-        else:
-            pct = watched / total * 100
-            bar = render_progress_bar(pct)
-            if watched >= total:
-                status = EMO["trophy"]
-            elif watched > 0:
-                status = EMO["play"]
+            if total == 0:
+                bar = render_progress_bar(0)
+                icon = EMO["box"]
             else:
-                status = EMO["box"]
+                pct = watched / total * 100
+                bar = render_progress_bar(pct)
+                if watched >= total:
+                    icon = EMO["ok"]
+                elif watched > 0:
+                    icon = "🟡"
+                else:
+                    icon = EMO["box"]
 
-        lines.append(
-            f"{status} <b>S{sn:02d}</b>  {bar}  "
-            f"<code>{watched}/{total}</code>"
-        )
+            lines.append(
+                f"S{sn:02d} {bar} "
+                f"<code>{watched}/{total}</code>  {icon}"
+            )
 
     if seasons_ordered:
         lines += ["", DIV2, ""]
         lines.append(
-            f"{EMO['spark']} <b>{p['total_watched']}/{p['total_eps']}</b> "
+            f"{EMO['chart']} Delivered: "
+            f"<b>{p['total_watched']}/{p['total_eps']}</b> "
             f"<code>({p['pct']}%)</code>"
         )
         remaining = p["total_eps"] - p["total_watched"]
         if remaining > 0:
             hours_left = remaining * 22 / 60
-            lines.append(f"{EMO['clock']} <i>~{int(hours_left)}h left</i>")
+            lines.append(
+                f"{EMO['clock']} Time left: "
+                f"<code>~{int(hours_left)} hours</code>"
+            )
         else:
             lines.append(f"{EMO['party']} <b>ALL CAUGHT UP!</b>")
 
@@ -696,6 +838,7 @@ def build_poster_text(session: Dict[str, Any], title: str,
 
 
 def build_poster_kb(session: Dict[str, Any], slug: str):
+    """Poster action keyboard. First button is always WATCH NEXT if any."""
     next_ep = find_next_episode(session)
     complete = is_series_complete(session)
     has_lang = bool(session.get("language"))
@@ -714,27 +857,30 @@ def build_poster_kb(session: Dict[str, Any], slug: str):
     elif next_ep:
         sn, ep = next_ep
         rows.append([InlineKeyboardButton(
-            f"{EMO['play']} WATCH NEXT  S{sn:02d}E{ep:02d}",
+            f"{EMO['play']} Resume S{sn:02d}E{ep:02d}",
             callback_data=f"pw:play:{slug}:{sn}:{ep}",
         )])
 
     if has_seasons:
         rows.append([
             InlineKeyboardButton(
-                f"{EMO['tv']} SEASONS",
+                f"{EMO['tv']} Seasons",
                 callback_data=f"pw:seasons:{slug}"),
             InlineKeyboardButton(
-                f"{EMO['book']} WATCH ORDER",
+                f"{EMO['book']} Watch Order",
                 callback_data=f"pw:wo:{slug}"),
         ])
         rows.append([InlineKeyboardButton(
-            f"{EMO['pause']} PAUSE",
-            callback_data=f"pw:pause:{slug}",
+            f"{EMO['chart']} Missing episodes",
+            callback_data=f"pw:missing:{slug}",
         )])
 
     return InlineKeyboardMarkup(rows)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEASONS VIEW
+# ═══════════════════════════════════════════════════════════════════════════
 def build_seasons_view(session: Dict[str, Any], slug: str,
                         title: str) -> Tuple[str, InlineKeyboardMarkup]:
     seasons_raw = session.get("seasons") or {}
@@ -754,9 +900,9 @@ def build_seasons_view(session: Dict[str, Any], slug: str,
         total = int(s_data.get("total_eps", 0) or 0)
 
         if total > 0 and watched >= total:
-            icon = EMO["trophy"]
+            icon = EMO["ok"]
         elif watched > 0:
-            icon = EMO["play"]
+            icon = "🟡"
         else:
             icon = EMO["box"]
 
@@ -767,12 +913,15 @@ def build_seasons_view(session: Dict[str, Any], slug: str,
         )])
 
     rows.append([InlineKeyboardButton(
-        f"{EMO['back']} BACK",
+        f"{EMO['back']} Back",
         callback_data=f"pw:poster:{slug}",
     )])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EPISODES VIEW — with per-episode Send button + Send All
+# ═══════════════════════════════════════════════════════════════════════════
 def build_episodes_view(session: Dict[str, Any], slug: str,
                          title: str, season: int
                          ) -> Tuple[str, InlineKeyboardMarkup]:
@@ -789,14 +938,15 @@ def build_episodes_view(session: Dict[str, Any], slug: str,
         DIV, "",
         f"{bar}  <code>{len(watched)}/{total}</code>",
         "",
-        f"{EMO['spark']} <i>Pick an episode to watch</i>",
+        f"{EMO['spark']} <i>Tap an episode to receive it</i>",
+        f"{EMO['ok']} = already watched  •  {EMO['play']} = not yet",
         "",
     ]
 
     rows = []
     row = []
     for ep in range(1, total + 1):
-        mark = EMO["check"] if ep in watched else EMO["play"]
+        mark = EMO["ok"] if ep in watched else EMO["play"]
         row.append(InlineKeyboardButton(
             f"{mark} E{ep:02d}",
             callback_data=f"pw:play:{slug}:{season}:{ep}",
@@ -807,20 +957,26 @@ def build_episodes_view(session: Dict[str, Any], slug: str,
     if row:
         rows.append(row)
 
+    # Send-all + back
     rows.append([InlineKeyboardButton(
-        f"{EMO['back']} BACK",
-        callback_data=f"pw:seasons:{slug}",
+        f"{EMO['send']} SEND ALL {total} EPISODES",
+        callback_data=f"pw:sendall:{slug}:{season}",
     )])
+    rows.append([
+        InlineKeyboardButton(
+            f"{EMO['back']} Back",
+            callback_data=f"pw:seasons:{slug}"),
+        InlineKeyboardButton(
+            f"{EMO['chart']} Progress",
+            callback_data=f"pw:poster:{slug}"),
+    ])
+
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-logger.info("[PREM] Part 2 loaded — CRUD + sessions + progress")
-
-
-# ===========================================================================
-# PART 3 — REMINDER LOOP
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# REMINDER LOOP
+# ═══════════════════════════════════════════════════════════════════════════
 async def _reminder_loop(client: Client):
     await asyncio.sleep(90)
     last_run_date = None
@@ -898,15 +1054,15 @@ async def _send_reminder(client: Client, uid: int, user: Dict[str, Any],
             f"   {bar}  <code>{p['total_watched']}/{p['total_eps']}</code>"
         )
     series_block = ("\n".join(series_lines)
-                    if series_lines else f"{EMO['box']} <i>No active series</i>")
+                    if series_lines
+                    else f"{EMO['box']} <i>No active series</i>")
 
     if kind == "10d":
         header = f"{EMO['bell']} <b>PREMIUM EXPIRING SOON</b>"
         body = (
             f"Hi <b>{_esc(username)}</b>! {EMO['spark']}\n\n"
             f"Your premium expires in:\n"
-            f"{EMO['cal']} <b>{exp_date}</b> "
-            f"<code>(10 days)</code>"
+            f"{EMO['cal']} <b>{exp_date}</b> <code>(10 days)</code>"
         )
         footer = f"{EMO['crown']} Renew with: <b>{_esc(contact)}</b>"
     elif kind == "5d":
@@ -928,7 +1084,8 @@ async def _send_reminder(client: Client, uid: int, user: Dict[str, Any],
             f"{EMO['clock']} Your premium expires <b>tomorrow</b>\n"
             f"{EMO['cal']} <code>{exp_date}</code>\n\n"
             f"{EMO['ok']} Progress saved for <b>30 days</b> after expiry.\n"
-            f"{EMO['ok']} After 30 days, tracking removed — files stay with you."
+            f"{EMO['ok']} After 30 days, tracking removed — "
+            f"files stay with you."
         )
         footer = f"{EMO['crown']} Contact <b>{_esc(contact)}</b> to renew."
     else:
@@ -939,7 +1096,8 @@ async def _send_reminder(client: Client, uid: int, user: Dict[str, Any],
             f"{EMO['ok']} Files you received: <b>yours forever</b>\n"
             f"{EMO['pause']} Progress tracking: <b>paused</b>\n"
             f"{EMO['cross']} Watch companion: <b>disabled</b>\n\n"
-            f"{EMO['fire']} <b>Progress DELETED in 30 days if not renewed.</b>"
+            f"{EMO['fire']} <b>Progress DELETED in 30 days "
+            f"if not renewed.</b>"
         )
         footer = f"{EMO['crown']} Contact <b>{_esc(contact)}</b> to renew."
 
@@ -1040,10 +1198,9 @@ async def _send_admin_report(client: Client):
             pass
 
 
-# ===========================================================================
-# PART 3 — CLEANUP LOOP
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# CLEANUP LOOP
+# ═══════════════════════════════════════════════════════════════════════════
 async def _cleanup_loop(client: Client):
     await asyncio.sleep(180)
 
@@ -1094,15 +1251,18 @@ async def _cleanup_expired_sessions():
 
         r = await c.delete_many({"user_id": {"$in": expired_uids}})
         if r.deleted_count > 0:
-            logger.info(f"[PREM] cleanup: {r.deleted_count} expired sessions")
+            logger.info(
+                f"[PREM] cleanup: {r.deleted_count} expired sessions"
+            )
     except Exception as e:
         logger.warning(f"[PREM] cleanup expired: {e}")
 
 
-# ===========================================================================
-# PART 3 — BOOT LOOPS
-# ===========================================================================
+logger.info("[PREM] Part 3 loaded — progress + reminders + cleanup")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# BOOT — start background loops once
+# ═══════════════════════════════════════════════════════════════════════════
 _BOOT_LOCK = asyncio.Lock()
 _BOOTED = False
 
@@ -1123,12 +1283,11 @@ async def _ensure_loops(client: Client):
         _BOOTED = False
 
 
-# ===========================================================================
-# PART 3 — ADMIN SESSION (in-memory)
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN SESSION (in-memory state for multi-step admin flows)
+# ═══════════════════════════════════════════════════════════════════════════
 _ADMIN_SESSIONS: Dict[int, Dict[str, Any]] = {}
-_SESSION_TTL = 900
+_SESSION_TTL = 900  # 15 minutes
 
 
 def _new_admin_session(uid: int, action: str, **data):
@@ -1153,12 +1312,12 @@ def _clear_admin_session(uid: int):
     _ADMIN_SESSIONS.pop(int(uid), None)
 
 
-# ===========================================================================
-# PART 3 — SAFE EDIT HELPER
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# SAFE EDIT HELPER
+# ═══════════════════════════════════════════════════════════════════════════
 async def _pw_safe_edit(q_or_msg, text: str, kb=None,
                          is_caption: bool = False) -> bool:
+    """Edit text or caption, handling all edge cases gracefully."""
     try:
         m = getattr(q_or_msg, "message", q_or_msg)
 
@@ -1201,10 +1360,9 @@ async def _pw_safe_edit(q_or_msg, text: str, kb=None,
         return False
 
 
-# ===========================================================================
-# PART 3 — KEYBOARDS
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN PANEL KEYBOARDS
+# ═══════════════════════════════════════════════════════════════════════════
 def kb_pw_main():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{EMO['crown']} PREMIUM MEMBERS",
@@ -1271,10 +1429,9 @@ def kb_pw_member_actions(user_id: int):
     ])
 
 
-# ===========================================================================
-# PART 3 — VIEW BUILDERS
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN PANEL VIEW BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════
 async def _view_pw_main() -> Tuple[str, InlineKeyboardMarkup]:
     stats = await count_premium_users()
     sessions = await count_sessions()
@@ -1406,7 +1563,8 @@ async def _view_pw_member_detail(user_id: int
         bar = render_progress_bar(p["pct"])
         session_lines.append(
             f"   {EMO['tv']} <b>{_esc(title)}</b>\n"
-            f"      {bar}  <code>{p['total_watched']}/{p['total_eps']}</code>"
+            f"      {bar}  <code>{p['total_watched']}/"
+            f"{p['total_eps']}</code>"
         )
     sessions_block = ("\n".join(session_lines)
                       if session_lines
@@ -1521,11 +1679,15 @@ async def _view_pw_stats() -> Tuple[str, InlineKeyboardMarkup]:
         f"{EMO['cross']} Expired       - <code>{stats['expired']}</code>",
         f"{EMO['tv']} Watch sessions - <code>{sessions}</code>",
         "", DIV2, "",
-        f"{EMO['clock']} Expiring 10d - <code>{stats['expiring_10d']}</code>",
-        f"{EMO['warn']} Expiring 5d  - <code>{stats['expiring_5d']}</code>",
-        f"{EMO['fire']} Expiring 1d  - <code>{stats['expiring_1d']}</code>",
+        f"{EMO['clock']} Expiring 10d - "
+        f"<code>{stats['expiring_10d']}</code>",
+        f"{EMO['warn']} Expiring 5d  - "
+        f"<code>{stats['expiring_5d']}</code>",
+        f"{EMO['fire']} Expiring 1d  - "
+        f"<code>{stats['expiring_1d']}</code>",
         "", DIV2, "",
-        f"{EMO['crown']} Total months sold - <code>{total_months}</code>",
+        f"{EMO['crown']} Total months sold - "
+        f"<code>{total_months}</code>",
         f"{EMO['spark']} Avg plan          - <code>{avg_plan}mo</code>",
         "", DIV2,
         f"{EMO['clock']} <code>{_now_ist()}</code>",
@@ -1547,12 +1709,11 @@ async def _view_pw_find() -> Tuple[str, InlineKeyboardMarkup]:
     return text, kb_pw_back()
 
 
-logger.info("[PREM] Part 3 loaded — reminders + cleanup + views + keyboards")
+logger.info("[PREM] Part 4 loaded — boot, sessions, keyboards, admin views")
 
-# ===========================================================================
-# PART 4 — ENTRY COMMANDS
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN COMMAND
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(
     filters.command(["seriesgroupsettings", "premium", "pw"])
     & filters.private,
@@ -1577,6 +1738,9 @@ async def cmd_pw_main(client, message):
         logger.exception(f"[PREM] /premium: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN CALLBACKS
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^pw:main$"), group=-426)
 async def cb_pw_main(client, q):
     if not _is_admin(q.from_user.id):
@@ -1608,10 +1772,9 @@ async def cb_pw_close(client, q):
             pass
 
 
-# ===========================================================================
-# PART 4 — MEMBERS LIST / DETAIL
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# MEMBERS LIST / DETAIL
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^pw:members$"), group=-426)
 async def cb_pw_members(client, q):
     if not _is_admin(q.from_user.id):
@@ -1654,10 +1817,9 @@ async def cb_pw_member(client, q):
         logger.exception(f"[PREM] member detail: {e}")
 
 
-# ===========================================================================
-# PART 4 — ADD USER FLOW
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# ADD USER FLOW
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^pw:add$"), group=-426)
 async def cb_pw_add(client, q):
     if not _is_admin(q.from_user.id):
@@ -1692,6 +1854,7 @@ async def cb_pw_add(client, q):
     group=-425,
 )
 async def pw_admin_input(client, message):
+    """Handle text input for admin multi-step flows."""
     if not message.from_user:
         return
     if not _is_admin(message.from_user.id):
@@ -1740,7 +1903,8 @@ async def _handle_add_user_input(client, message, text: str):
             try:
                 u = await client.get_users(text)
                 uid_target = u.id
-                username = f"@{u.username}" if u.username else f"ID {u.id}"
+                username = (f"@{u.username}"
+                            if u.username else f"ID {u.id}")
             except Exception as e:
                 _clear_admin_session(message.from_user.id)
                 return await message.reply_text(
@@ -1753,11 +1917,13 @@ async def _handle_add_user_input(client, message, text: str):
         try:
             u = await client.get_users(text)
             uid_target = u.id
-            username = f"@{u.username}" if u.username else f"ID {u.id}"
+            username = (f"@{u.username}"
+                        if u.username else f"ID {u.id}")
         except Exception:
             _clear_admin_session(message.from_user.id)
             return await message.reply_text(
-                f"{EMO['cross']} Invalid. Send user id or @username.",
+                f"{EMO['cross']} Invalid. "
+                f"Send user id or @username.",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -1800,7 +1966,8 @@ async def _handle_add_user_input(client, message, text: str):
         u = await client.get_users(uid_target)
         display = (u.first_name or "") + \
                   (f" {u.last_name}" if u.last_name else "")
-        uname_display = f"@{u.username}" if u.username else f"ID {u.id}"
+        uname_display = (f"@{u.username}"
+                         if u.username else f"ID {u.id}")
     except Exception:
         display = str(uid_target)
         uname_display = username or str(uid_target)
@@ -1897,10 +2064,11 @@ async def _handle_set_contact_input(client, message, text: str):
         )
 
 
-# ===========================================================================
-# PART 4 — PLAN PICKER
-# ===========================================================================
+logger.info("[PREM] Part 5 loaded — commands + admin input flow")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN PICKER — final step of add/extend flow
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:plan:(\d+):(\d+)$"), group=-426,
 )
@@ -1945,7 +2113,8 @@ async def cb_pw_plan(client, q):
             f"<code>{_esc(target_username)}</code>",
             "",
             f"{EMO['crown']} Plan    - <code>{months} months</code>",
-            f"{EMO['clock']} Expires - <code>{_date_ist(expires)}</code>",
+            f"{EMO['clock']} Expires - "
+            f"<code>{_date_ist(expires)}</code>",
             "",
             f"{EMO['spark']} <code>{_now_ist()}</code>",
         ])
@@ -1969,7 +2138,8 @@ async def cb_pw_plan(client, q):
                 text="\n".join([
                     f"{EMO['party']} <b>PREMIUM ACTIVATED</b>",
                     DIV, "",
-                    f"Hi! Your premium has been activated {EMO['spark']}",
+                    f"Hi! Your premium has been activated "
+                    f"{EMO['spark']}",
                     "",
                     f"{EMO['crown']} Plan    - "
                     f"<code>{months} months</code>",
@@ -1991,10 +2161,9 @@ async def cb_pw_plan(client, q):
             pass
 
 
-# ===========================================================================
-# PART 4 — EXTEND / REMOVE / NOTES
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# EXTEND
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:extend:(\d+)$"), group=-426,
 )
@@ -2037,6 +2206,9 @@ async def cb_pw_extend(client, q):
         logger.exception(f"[PREM] extend: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# REMOVE
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:remove:(\d+)$"), group=-426,
 )
@@ -2095,6 +2267,9 @@ async def cb_pw_remove_go(client, q):
         logger.exception(f"[PREM] remove_go: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EDIT NOTES
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:notes:(\d+)$"), group=-426,
 )
@@ -2125,10 +2300,9 @@ async def cb_pw_notes(client, q):
         logger.exception(f"[PREM] notes: {e}")
 
 
-# ===========================================================================
-# PART 4 — FIND / EXPIRING / EXPIRED / STATS / CONTACT
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# FIND USER
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^pw:find$"), group=-426)
 async def cb_pw_find(client, q):
     if not _is_admin(q.from_user.id):
@@ -2142,6 +2316,9 @@ async def cb_pw_find(client, q):
         logger.exception(f"[PREM] find: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPIRING / EXPIRED / STATS / CONTACT
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^pw:expiring$"), group=-426)
 async def cb_pw_expiring(client, q):
     if not _is_admin(q.from_user.id):
@@ -2203,12 +2380,11 @@ async def cb_pw_contact(client, q):
         logger.exception(f"[PREM] contact: {e}")
 
 
-logger.info("[PREM] Part 4 loaded — admin commands + callbacks + input flow")
+logger.info("[PREM] Part 6 loaded — all admin callbacks ready")
 
-# ===========================================================================
-# PART 5 — GROUP SEARCH REDIRECT
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# GROUP → PM REDIRECT (called by series_group.py hook)
+# ═══════════════════════════════════════════════════════════════════════════
 async def handle_premium_group_search(
     client: Client,
     message,
@@ -2217,7 +2393,11 @@ async def handle_premium_group_search(
     db_result: Optional[Dict[str, Any]],
     tmdb_results: List[Dict[str, Any]],
 ) -> bool:
-    """Called by series_group plugin when a search happens in the group."""
+    """
+    Called from series_group.py when a search happens in the group.
+    If the user is premium AND we have DB hits → redirect to PM.
+    Returns True if handled, False to fall through to normal flow.
+    """
     try:
         if not message.from_user:
             return False
@@ -2333,7 +2513,9 @@ async def _premium_redirect_to_pm(
         except Exception as e:
             logger.warning(f"[PREM] group reply: {e}")
 
-        logger.info(f"[PREM] redirect user={uid} title={display_title!r}")
+        logger.info(
+            f"[PREM] redirect user={uid} title={display_title!r}"
+        )
 
         await _prepare_pm_session(client, uid, series_data)
         return True
@@ -2342,10 +2524,9 @@ async def _premium_redirect_to_pm(
         return False
 
 
-# ===========================================================================
-# PART 5 — PM SESSION PREP
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# PM SESSION PREP
+# ═══════════════════════════════════════════════════════════════════════════
 async def _prepare_pm_session(client: Client, uid: int,
                                series_data: Dict[str, Any]):
     try:
@@ -2361,7 +2542,9 @@ async def _prepare_pm_session(client: Client, uid: int,
             if poster_path.startswith("http"):
                 poster_url = poster_path
             else:
-                poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+                poster_url = (
+                    f"https://image.tmdb.org/t/p/w500{poster_path}"
+                )
 
         total_eps = sum(int(s.get("episodes", 0) or 0)
                         for s in tmdb_seasons)
@@ -2370,7 +2553,9 @@ async def _prepare_pm_session(client: Client, uid: int,
 
         rating_line = ""
         if rating:
-            rating_line = f"{render_stars(rating)} <code>{rating:.1f}</code>"
+            rating_line = (
+                f"{render_stars(rating)} <code>{rating:.1f}</code>"
+            )
 
         text = "\n".join([
             f"{EMO['film']} <b>{_esc(title)}</b>"
@@ -2386,7 +2571,8 @@ async def _prepare_pm_session(client: Client, uid: int,
         ])
 
         # Collect available languages
-        langs_default = ["English", "Hindi", "Tamil", "Telugu", "Malayalam"]
+        langs_default = ["English", "Hindi", "Tamil",
+                         "Telugu", "Malayalam"]
         available_langs: Set[str] = set()
         try:
             for h in hits[:50]:
@@ -2398,8 +2584,10 @@ async def _prepare_pm_session(client: Client, uid: int,
             pass
 
         if available_langs:
-            ordered = [l for l in langs_default if l in available_langs]
-            extra = sorted(l for l in available_langs if l not in ordered)
+            ordered = [l for l in langs_default
+                       if l in available_langs]
+            extra = sorted(l for l in available_langs
+                           if l not in ordered)
             langs = (ordered + extra)[:6]
         else:
             langs = ["English"]
@@ -2450,6 +2638,7 @@ async def _prepare_pm_session(client: Client, uid: int,
                 disable_web_page_preview=True,
             )
 
+        # Persist session
         c = _sessions_coll()
         if c is not None:
             await c.update_one(
@@ -2487,10 +2676,9 @@ async def _prepare_pm_session(client: Client, uid: int,
         logger.exception(f"[PREM] prepare PM: {e}")
 
 
-# ===========================================================================
-# PART 5 — LOCK HELPER
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# LOCK HELPER (prevent double-clicks)
+# ═══════════════════════════════════════════════════════════════════════════
 _PW_LOCKS: Dict[int, float] = {}
 
 
@@ -2503,11 +2691,11 @@ def _pw_acquire_lock(uid: int, secs: float = 3.0) -> bool:
     return True
 
 
-# ===========================================================================
-# PART 5 — POSTER RENDERING
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# POSTER RENDERING
+# ═══════════════════════════════════════════════════════════════════════════
 async def _render_poster(client: Client, session: Dict[str, Any]):
+    """Edit the persistent poster message with the latest progress."""
     try:
         uid = session.get("user_id")
         chat_id = session.get("poster_chat_id") or uid
@@ -2526,7 +2714,7 @@ async def _render_poster(client: Client, session: Dict[str, Any]):
         if kb is None:
             return False
 
-        # Try caption first (photo message)
+        # Try caption first
         try:
             await client.edit_message_caption(
                 chat_id=chat_id,
@@ -2565,10 +2753,11 @@ async def _render_poster(client: Client, session: Dict[str, Any]):
         return False
 
 
-# ===========================================================================
-# PART 5 — LANGUAGE PICKER
-# ===========================================================================
+logger.info("[PREM] Part 7 loaded — group redirect + PM prep + poster render")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# LANGUAGE PICKER
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:lang:([a-z0-9_]+):(\d+)$"), group=-420,
 )
@@ -2611,7 +2800,7 @@ async def cb_pw_lang(client, q):
             from plugins.series_group import _engine_search
             fresh_hits = await _engine_search(
                 title, language=chosen_lang,
-            )
+            ) or []
         except Exception as e:
             logger.warning(f"[PREM] lang search: {e}")
 
@@ -2648,7 +2837,7 @@ async def cb_pw_lang(client, q):
                     "current_ep": 1,
                 }
 
-        # Preserve existing watched progress
+        # Preserve existing watched
         old_seasons = session.get("seasons") or {}
         for sn_str, s_data in old_seasons.items():
             if sn_str in seasons_doc:
@@ -2691,7 +2880,7 @@ async def cb_pw_lang(client, q):
             )
 
         logger.info(
-            f"[PREM] lang picked: u={uid} s={slug} lang={chosen_lang}",
+            f"[PREM] lang picked: u={uid} s={slug} lang={chosen_lang}"
         )
     except Exception as e:
         logger.exception(f"[PREM] cb_pw_lang: {e}")
@@ -2701,10 +2890,9 @@ async def cb_pw_lang(client, q):
             pass
 
 
-# ===========================================================================
-# PART 5 — SEASONS / SEASON / EPISODES
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# SEASONS VIEW
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:seasons:([a-z0-9_]+)$"), group=-420,
 )
@@ -2742,6 +2930,9 @@ async def cb_pw_seasons(client, q):
         logger.exception(f"[PREM] seasons: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEASON EPISODES VIEW
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:season:([a-z0-9_]+):(\d+)$"), group=-420,
 )
@@ -2781,10 +2972,9 @@ async def cb_pw_season(client, q):
         logger.exception(f"[PREM] season: {e}")
 
 
-# ===========================================================================
-# PART 5 — POSTER BACK NAV
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# POSTER NAV (from any sub-view back to main poster)
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:poster:([a-z0-9_]+)$"), group=-420,
 )
@@ -2828,12 +3018,116 @@ async def cb_pw_poster(client, q):
         logger.exception(f"[PREM] poster: {e}")
 
 
-logger.info("[PREM] Part 5 loaded — redirect + PM prep + poster + lang/season views")
+# ═══════════════════════════════════════════════════════════════════════════
+# CANCEL (delete preview before starting)
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^pw:cancel:([a-z0-9_]+)$"), group=-420,
+)
+async def cb_pw_cancel(client, q):
+    try:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.answer(f"{EMO['cross']} Cancelled")
+    except Exception:
+        try:
+            await q.answer("OK")
+        except Exception:
+            pass
 
-# ===========================================================================
-# PART 6 — PLAY EPISODE
-# ===========================================================================
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MISSING EPISODES VIEW
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^pw:missing:([a-z0-9_]+)$"), group=-420,
+)
+async def cb_pw_missing(client, q):
+    try:
+        uid = q.from_user.id
+        if not await is_premium(uid):
+            return await q.answer(
+                f"{EMO['crown']} Premium only", show_alert=True,
+            )
+
+        slug = q.matches[0].group(1)
+        session = await get_session(uid, slug)
+        if not session:
+            return await q.answer(
+                f"{EMO['cross']} Not found", show_alert=True,
+            )
+
+        title = session.get("series_title") or "?"
+        seasons_raw = session.get("seasons") or {}
+        ordered = sorted(
+            int(k) for k in seasons_raw.keys() if k.isdigit()
+        )
+
+        lines = [
+            f"{EMO['chart']} <b>{_esc(title)}</b>",
+            f"{EMO['search']} <b>MISSING EPISODES</b>",
+            DIV, "",
+        ]
+
+        rows = []
+        total_missing = 0
+        for sn in ordered:
+            s_data = seasons_raw.get(str(sn)) or {}
+            total = int(s_data.get("total_eps", 0) or 0)
+            watched = set(s_data.get("watched") or [])
+            missing = [ep for ep in range(1, total + 1)
+                       if ep not in watched]
+
+            if not missing:
+                continue
+
+            total_missing += len(missing)
+            short = ", ".join(f"E{e:02d}" for e in missing[:8])
+            if len(missing) > 8:
+                short += f" +{len(missing) - 8} more"
+
+            lines.append(f"{EMO['tv']} <b>S{sn:02d}</b> — "
+                         f"<code>{short}</code>")
+            rows.append([InlineKeyboardButton(
+                f"{EMO['send']} Send missing S{sn:02d} "
+                f"({len(missing)})",
+                callback_data=f"pw:sendmissing:{slug}:{sn}",
+            )])
+
+        if total_missing == 0:
+            lines.append(f"{EMO['party']} <b>All caught up!</b>")
+
+        lines += ["", DIV2, "", f"<code>{_now_ist()}</code>"]
+        rows.append([InlineKeyboardButton(
+            f"{EMO['back']} Back",
+            callback_data=f"pw:poster:{slug}",
+        )])
+
+        try:
+            await q.message.edit_caption(
+                caption="\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await q.message.edit_text(
+                text="\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[PREM] missing: {e}")
+
+
+logger.info("[PREM] Part 8 loaded — lang/seasons/episodes/poster nav callbacks")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY ONE EPISODE
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:play:([a-z0-9_]+):(\d+):(\d+)$"), group=-420,
 )
@@ -2874,6 +3168,146 @@ async def cb_pw_play(client, q):
             pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEND ALL EPISODES IN A SEASON
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^pw:sendall:([a-z0-9_]+):(\d+)$"), group=-420,
+)
+async def cb_pw_sendall(client, q):
+    try:
+        uid = q.from_user.id
+
+        if not _pw_acquire_lock(uid, 5.0):
+            return await q.answer(f"{EMO['clock']} Wait")
+
+        if not await is_premium(uid):
+            return await q.answer(
+                f"{EMO['crown']} Premium only", show_alert=True,
+            )
+
+        slug = q.matches[0].group(1)
+        season = int(q.matches[0].group(2))
+
+        session = await get_session(uid, slug)
+        if not session:
+            return await q.answer(
+                f"{EMO['cross']} Session not found", show_alert=True,
+            )
+
+        s_data = (session.get("seasons") or {}).get(str(season)) or {}
+        total = int(s_data.get("total_eps", 0) or 0)
+        if total == 0:
+            return await q.answer(
+                f"{EMO['cross']} No episodes", show_alert=True,
+            )
+
+        await q.answer(
+            f"{EMO['rocket']} Sending {total} episodes..."
+        )
+
+        await _send_season_batch(client, uid, session, season, total)
+
+        fresh = await get_session(uid, slug)
+        if fresh:
+            await _render_poster(client, fresh)
+    except Exception as e:
+        logger.exception(f"[PREM] sendall: {e}")
+        try:
+            await q.answer(f"{EMO['cross']} Error", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SEND MISSING EPISODES IN A SEASON
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^pw:sendmissing:([a-z0-9_]+):(\d+)$"), group=-420,
+)
+async def cb_pw_sendmissing(client, q):
+    try:
+        uid = q.from_user.id
+
+        if not _pw_acquire_lock(uid, 5.0):
+            return await q.answer(f"{EMO['clock']} Wait")
+
+        if not await is_premium(uid):
+            return await q.answer(
+                f"{EMO['crown']} Premium only", show_alert=True,
+            )
+
+        slug = q.matches[0].group(1)
+        season = int(q.matches[0].group(2))
+
+        session = await get_session(uid, slug)
+        if not session:
+            return await q.answer(
+                f"{EMO['cross']} Session not found", show_alert=True,
+            )
+
+        s_data = (session.get("seasons") or {}).get(str(season)) or {}
+        total = int(s_data.get("total_eps", 0) or 0)
+        watched = set(s_data.get("watched") or [])
+        missing = [ep for ep in range(1, total + 1)
+                   if ep not in watched]
+
+        if not missing:
+            return await q.answer(
+                f"{EMO['ok']} Nothing missing", show_alert=True,
+            )
+
+        await q.answer(
+            f"{EMO['rocket']} Sending {len(missing)} missing..."
+        )
+
+        for ep in missing:
+            try:
+                await _send_episode_file(
+                    client, uid, session, season, ep,
+                )
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"[PREM] send missing ep {ep}: {e}")
+
+        fresh = await get_session(uid, slug)
+        if fresh:
+            await _render_poster(client, fresh)
+    except Exception as e:
+        logger.exception(f"[PREM] sendmissing: {e}")
+        try:
+            await q.answer(f"{EMO['cross']} Error", show_alert=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH SENDER
+# ═══════════════════════════════════════════════════════════════════════════
+async def _send_season_batch(client: Client, uid: int,
+                              session: Dict[str, Any],
+                              season: int, total: int):
+    for ep in range(1, total + 1):
+        try:
+            await _send_episode_file(
+                client, uid, session, season, ep,
+            )
+            await asyncio.sleep(0.6)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            try:
+                await _send_episode_file(
+                    client, uid, session, season, ep,
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[PREM] batch send S{season}E{ep}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SINGLE EPISODE FILE SENDER
+# ═══════════════════════════════════════════════════════════════════════════
 async def _send_episode_file(client: Client, uid: int,
                               session: Dict[str, Any],
                               season: int, episode: int) -> bool:
@@ -2891,9 +3325,6 @@ async def _send_episode_file(client: Client, uid: int,
                 break
 
         if not chosen_file:
-            logger.warning(
-                f"[PREM] no file for {slug} S{season}E{episode}"
-            )
             try:
                 await client.send_message(
                     chat_id=uid,
@@ -2902,8 +3333,8 @@ async def _send_episode_file(client: Client, uid: int,
                         DIV, "",
                         f"{EMO['film']} S{season:02d}E{episode:02d}",
                         "",
-                        f"{EMO['warn']} <i>This episode isn't available "
-                        f"in the selected language yet.</i>",
+                        f"{EMO['warn']} <i>This episode isn't "
+                        f"available in the selected language yet.</i>",
                     ]),
                     parse_mode=ParseMode.HTML,
                 )
@@ -2968,20 +3399,6 @@ async def _send_episode_file(client: Client, uid: int,
 
         if not sent_msg:
             logger.warning(f"[PREM] failed to send file u={uid}")
-            try:
-                await client.send_message(
-                    chat_id=uid,
-                    text="\n".join([
-                        f"{EMO['cross']} <b>Delivery failed</b>",
-                        DIV, "",
-                        f"{EMO['warn']} <i>The file could not be "
-                        f"delivered. Please try again or contact "
-                        f"support.</i>",
-                    ]),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
             return False
 
         # Attach action buttons
@@ -3017,12 +3434,13 @@ async def _send_episode_file(client: Client, uid: int,
         return False
 
 
-# ===========================================================================
-# PART 6 — MARK AS WATCHED
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# MARK AS WATCHED — the CORE action
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
-    filters.regex(r"^pw:watched:([a-z0-9_]+):(\d+):(\d+):(\d+)$"),
+    filters.regex(
+        r"^pw:watched:([a-z0-9_]+):(\d+):(\d+):(\d+)$"
+    ),
     group=-420,
 )
 async def cb_pw_watched(client, q):
@@ -3051,7 +3469,7 @@ async def cb_pw_watched(client, q):
         await mark_watched(uid, slug, season, episode)
         await set_current_position(uid, slug, season, episode)
 
-        # Update button on file message
+        # Update the file message button → show ✅ WATCHED (no action)
         try:
             await client.edit_message_reply_markup(
                 chat_id=uid,
@@ -3069,21 +3487,19 @@ async def cb_pw_watched(client, q):
         except Exception as e:
             logger.debug(f"[PREM] file edit: {e}")
 
+        # Live update the poster
         fresh = await get_session(uid, slug)
         if fresh:
             await _render_poster(client, fresh)
 
         # Check season complete
-        s_data = (fresh.get("seasons") or {}).get(str(season)) or {}
-        watched_count = len(s_data.get("watched") or [])
-        total = int(s_data.get("total_eps", 0) or 0)
-
-        if total > 0 and watched_count >= total:
+        if fresh and is_season_complete(fresh, season):
             await _season_complete_notify(
                 client, uid, fresh, season,
             )
 
-        if is_series_complete(fresh):
+        # Check series complete
+        if fresh and is_series_complete(fresh):
             await _series_complete_notify(client, uid, fresh)
 
         await q.answer(f"{EMO['ok']} Watched")
@@ -3100,7 +3516,9 @@ async def cb_pw_watched(client, q):
 
 
 @Client.on_callback_query(
-    filters.regex(r"^pw:already_watched:([a-z0-9_]+):(\d+):(\d+)$"),
+    filters.regex(
+        r"^pw:already_watched:([a-z0-9_]+):(\d+):(\d+)$"
+    ),
     group=-420,
 )
 async def cb_pw_already_watched(client, q):
@@ -3110,10 +3528,9 @@ async def cb_pw_already_watched(client, q):
         pass
 
 
-# ===========================================================================
-# PART 6 — WATCH NEXT
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCH NEXT (auto-advance)
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:next:([a-z0-9_]+):(\d+):(\d+)$"), group=-420,
 )
@@ -3192,10 +3609,11 @@ async def cb_pw_next(client, q):
             pass
 
 
-# ===========================================================================
-# PART 6 — SEASON COMPLETE NOTIFY
-# ===========================================================================
+logger.info("[PREM] Part 9 loaded — play/sendall/watched/next")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEASON COMPLETE NOTIFICATION
+# ═══════════════════════════════════════════════════════════════════════════
 async def _season_complete_notify(client: Client, uid: int,
                                     session: Dict[str, Any],
                                     season: int):
@@ -3259,10 +3677,9 @@ async def _season_complete_notify(client: Client, uid: int,
         logger.debug(f"[PREM] season notify: {e}")
 
 
-# ===========================================================================
-# PART 6 — SERIES COMPLETE NOTIFY
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# SERIES COMPLETE NOTIFICATION
+# ═══════════════════════════════════════════════════════════════════════════
 async def _series_complete_notify(client: Client, uid: int,
                                     session: Dict[str, Any]):
     try:
@@ -3318,10 +3735,9 @@ async def _series_complete_notify(client: Client, uid: int,
         logger.debug(f"[PREM] series notify: {e}")
 
 
-# ===========================================================================
-# PART 6 — RATING
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# RATE SERIES
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:rate:([a-z0-9_]+):(\d)$"), group=-420,
 )
@@ -3375,10 +3791,9 @@ async def cb_pw_rate(client, q):
         logger.debug(f"[PREM] rate: {e}")
 
 
-# ===========================================================================
-# PART 6 — MARK COMPLETE
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# MARK COMPLETE
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:complete:([a-z0-9_]+)$"), group=-420,
 )
@@ -3441,12 +3856,9 @@ async def cb_pw_complete(client, q):
         logger.exception(f"[PREM] complete: {e}")
 
 
-logger.info("[PREM] Part 6 loaded — play + watched + next + complete + rating")
-
-# ===========================================================================
-# PART 7 — PAUSE SESSION
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# PAUSE WATCHING
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:pause:([a-z0-9_]+)$"), group=-420,
 )
@@ -3500,10 +3912,9 @@ async def cb_pw_pause(client, q):
         logger.debug(f"[PREM] pause: {e}")
 
 
-# ===========================================================================
-# PART 7 — RESUME SESSION
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# RESUME
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:resume:([a-z0-9_]+)$"), group=-420,
 )
@@ -3559,10 +3970,9 @@ async def cb_pw_resume(client, q):
         logger.exception(f"[PREM] resume: {e}")
 
 
-# ===========================================================================
-# PART 7 — MY SESSIONS LIST
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# MY SESSIONS
+# ═══════════════════════════════════════════════════════════════════════════
 async def _show_session_list(client: Client, chat_id: int, uid: int):
     sessions = await list_user_sessions(uid)
 
@@ -3574,8 +3984,8 @@ async def _show_session_list(client: Client, chat_id: int, uid: int):
                 DIV, "",
                 f"{EMO['box']} <i>No active sessions</i>",
                 "",
-                f"{EMO['search']} <i>Search a series in the group "
-                f"to start watching</i>",
+                f"{EMO['search']} <i>Search a series in the "
+                f"group to start watching</i>",
             ]),
             parse_mode=ParseMode.HTML,
         )
@@ -3597,8 +4007,7 @@ async def _show_session_list(client: Client, chat_id: int, uid: int):
         lines.append(f"{EMO['film']} <b>{_esc(title)}</b>")
         lines.append(
             f"   {bar}  <code>{p['total_watched']}/"
-            f"{p['total_eps']}</code>  "
-            f"<code>({p['pct']}%)</code>"
+            f"{p['total_eps']}</code>  <code>({p['pct']}%)</code>"
         )
         lines.append("")
 
@@ -3658,10 +4067,9 @@ async def cb_pw_my_sessions(client, q):
         logger.debug(f"[PREM] my_sessions: {e}")
 
 
-# ===========================================================================
-# PART 7 — DISMISS REMINDER
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# DISMISS REMINDER
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:dismiss_reminder$"), group=-422,
 )
@@ -3676,31 +4084,9 @@ async def cb_pw_dismiss(client, q):
         pass
 
 
-# ===========================================================================
-# PART 7 — CANCEL SEARCH
-# ===========================================================================
-
-@Client.on_callback_query(
-    filters.regex(r"^pw:cancel:([a-z0-9_]+)$"), group=-420,
-)
-async def cb_pw_cancel(client, q):
-    try:
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        await q.answer(f"{EMO['cross']} Cancelled")
-    except Exception:
-        try:
-            await q.answer("OK")
-        except Exception:
-            pass
-
-
-# ===========================================================================
-# PART 7 — CLOSE SESSION MESSAGE
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# CLOSE SESSION MESSAGE
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:close_session$"), group=-420,
 )
@@ -3715,69 +4101,98 @@ async def cb_pw_close_session(client, q):
         pass
 
 
-logger.info("[PREM] Part 7 loaded — pause + resume + sessions + dismiss + close")
+logger.info("[PREM] Part 10 loaded — completion + rating + pause + sessions")
 
-# ===========================================================================
-# PART 8 — FRANCHISE DATABASE
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# FRANCHISE DATABASE
+# ═══════════════════════════════════════════════════════════════════════════
 FRANCHISES: Dict[str, Dict[str, Any]] = {
     "breaking_bad_universe": {
         "name": "Breaking Bad Universe",
         "items": [
             {"title": "Breaking Bad", "year": "2008", "type": "series"},
             {"title": "El Camino", "year": "2019", "type": "movie"},
-            {"title": "Better Call Saul", "year": "2015", "type": "series"},
+            {"title": "Better Call Saul", "year": "2015",
+             "type": "series"},
         ],
     },
     "mcu": {
         "name": "Marvel Cinematic Universe",
         "items": [
             {"title": "Iron Man", "year": "2008", "type": "movie"},
-            {"title": "The Incredible Hulk", "year": "2008", "type": "movie"},
+            {"title": "The Incredible Hulk", "year": "2008",
+             "type": "movie"},
             {"title": "Iron Man 2", "year": "2010", "type": "movie"},
             {"title": "Thor", "year": "2011", "type": "movie"},
-            {"title": "Captain America: The First Avenger", "year": "2011", "type": "movie"},
+            {"title": "Captain America: The First Avenger",
+             "year": "2011", "type": "movie"},
             {"title": "The Avengers", "year": "2012", "type": "movie"},
             {"title": "Iron Man 3", "year": "2013", "type": "movie"},
-            {"title": "Thor: The Dark World", "year": "2013", "type": "movie"},
-            {"title": "Captain America: The Winter Soldier", "year": "2014", "type": "movie"},
-            {"title": "Guardians of the Galaxy", "year": "2014", "type": "movie"},
-            {"title": "Avengers: Age of Ultron", "year": "2015", "type": "movie"},
+            {"title": "Thor: The Dark World", "year": "2013",
+             "type": "movie"},
+            {"title": "Captain America: The Winter Soldier",
+             "year": "2014", "type": "movie"},
+            {"title": "Guardians of the Galaxy", "year": "2014",
+             "type": "movie"},
+            {"title": "Avengers: Age of Ultron", "year": "2015",
+             "type": "movie"},
             {"title": "Ant-Man", "year": "2015", "type": "movie"},
-            {"title": "Captain America: Civil War", "year": "2016", "type": "movie"},
-            {"title": "Doctor Strange", "year": "2016", "type": "movie"},
-            {"title": "Spider-Man: Homecoming", "year": "2017", "type": "movie"},
-            {"title": "Thor: Ragnarok", "year": "2017", "type": "movie"},
-            {"title": "Black Panther", "year": "2018", "type": "movie"},
-            {"title": "Avengers: Infinity War", "year": "2018", "type": "movie"},
-            {"title": "Captain Marvel", "year": "2019", "type": "movie"},
-            {"title": "Avengers: Endgame", "year": "2019", "type": "movie"},
-            {"title": "Spider-Man: Far From Home", "year": "2019", "type": "movie"},
+            {"title": "Captain America: Civil War", "year": "2016",
+             "type": "movie"},
+            {"title": "Doctor Strange", "year": "2016",
+             "type": "movie"},
+            {"title": "Spider-Man: Homecoming", "year": "2017",
+             "type": "movie"},
+            {"title": "Thor: Ragnarok", "year": "2017",
+             "type": "movie"},
+            {"title": "Black Panther", "year": "2018",
+             "type": "movie"},
+            {"title": "Avengers: Infinity War", "year": "2018",
+             "type": "movie"},
+            {"title": "Captain Marvel", "year": "2019",
+             "type": "movie"},
+            {"title": "Avengers: Endgame", "year": "2019",
+             "type": "movie"},
+            {"title": "Spider-Man: Far From Home", "year": "2019",
+             "type": "movie"},
         ],
     },
     "star_wars": {
         "name": "Star Wars Skywalker Saga",
         "items": [
-            {"title": "Star Wars: Episode I - The Phantom Menace", "year": "1999", "type": "movie"},
-            {"title": "Star Wars: Episode II - Attack of the Clones", "year": "2002", "type": "movie"},
-            {"title": "Star Wars: Episode III - Revenge of the Sith", "year": "2005", "type": "movie"},
-            {"title": "Rogue One: A Star Wars Story", "year": "2016", "type": "movie"},
-            {"title": "Star Wars: Episode IV - A New Hope", "year": "1977", "type": "movie"},
-            {"title": "Star Wars: Episode V - The Empire Strikes Back", "year": "1980", "type": "movie"},
-            {"title": "Star Wars: Episode VI - Return of the Jedi", "year": "1983", "type": "movie"},
-            {"title": "Star Wars: Episode VII - The Force Awakens", "year": "2015", "type": "movie"},
-            {"title": "Star Wars: Episode VIII - The Last Jedi", "year": "2017", "type": "movie"},
-            {"title": "Star Wars: Episode IX - The Rise of Skywalker", "year": "2019", "type": "movie"},
+            {"title": "Star Wars: Episode I - The Phantom Menace",
+             "year": "1999", "type": "movie"},
+            {"title": "Star Wars: Episode II - Attack of the Clones",
+             "year": "2002", "type": "movie"},
+            {"title": "Star Wars: Episode III - Revenge of the Sith",
+             "year": "2005", "type": "movie"},
+            {"title": "Rogue One: A Star Wars Story",
+             "year": "2016", "type": "movie"},
+            {"title": "Star Wars: Episode IV - A New Hope",
+             "year": "1977", "type": "movie"},
+            {"title": "Star Wars: Episode V - The Empire Strikes Back",
+             "year": "1980", "type": "movie"},
+            {"title": "Star Wars: Episode VI - Return of the Jedi",
+             "year": "1983", "type": "movie"},
+            {"title": "Star Wars: Episode VII - The Force Awakens",
+             "year": "2015", "type": "movie"},
+            {"title": "Star Wars: Episode VIII - The Last Jedi",
+             "year": "2017", "type": "movie"},
+            {"title": "Star Wars: Episode IX - The Rise of Skywalker",
+             "year": "2019", "type": "movie"},
         ],
     },
     "dc_universe": {
         "name": "DC Extended Universe",
         "items": [
-            {"title": "Man of Steel", "year": "2013", "type": "movie"},
-            {"title": "Batman v Superman: Dawn of Justice", "year": "2016", "type": "movie"},
-            {"title": "Wonder Woman", "year": "2017", "type": "movie"},
-            {"title": "Justice League", "year": "2017", "type": "movie"},
+            {"title": "Man of Steel", "year": "2013",
+             "type": "movie"},
+            {"title": "Batman v Superman: Dawn of Justice",
+             "year": "2016", "type": "movie"},
+            {"title": "Wonder Woman", "year": "2017",
+             "type": "movie"},
+            {"title": "Justice League", "year": "2017",
+             "type": "movie"},
             {"title": "Aquaman", "year": "2018", "type": "movie"},
             {"title": "Shazam!", "year": "2019", "type": "movie"},
         ],
@@ -3793,22 +4208,31 @@ FRANCHISES: Dict[str, Dict[str, Any]] = {
         "name": "John Wick",
         "items": [
             {"title": "John Wick", "year": "2014", "type": "movie"},
-            {"title": "John Wick: Chapter 2", "year": "2017", "type": "movie"},
-            {"title": "John Wick: Chapter 3 - Parabellum", "year": "2019", "type": "movie"},
-            {"title": "John Wick: Chapter 4", "year": "2023", "type": "movie"},
+            {"title": "John Wick: Chapter 2", "year": "2017",
+             "type": "movie"},
+            {"title": "John Wick: Chapter 3 - Parabellum",
+             "year": "2019", "type": "movie"},
+            {"title": "John Wick: Chapter 4", "year": "2023",
+             "type": "movie"},
         ],
     },
     "fast_furious": {
         "name": "Fast and Furious",
         "items": [
-            {"title": "The Fast and the Furious", "year": "2001", "type": "movie"},
-            {"title": "2 Fast 2 Furious", "year": "2003", "type": "movie"},
-            {"title": "The Fast and the Furious: Tokyo Drift", "year": "2006", "type": "movie"},
-            {"title": "Fast and Furious", "year": "2009", "type": "movie"},
+            {"title": "The Fast and the Furious", "year": "2001",
+             "type": "movie"},
+            {"title": "2 Fast 2 Furious", "year": "2003",
+             "type": "movie"},
+            {"title": "The Fast and the Furious: Tokyo Drift",
+             "year": "2006", "type": "movie"},
+            {"title": "Fast and Furious", "year": "2009",
+             "type": "movie"},
             {"title": "Fast Five", "year": "2011", "type": "movie"},
-            {"title": "Fast and Furious 6", "year": "2013", "type": "movie"},
+            {"title": "Fast and Furious 6", "year": "2013",
+             "type": "movie"},
             {"title": "Furious 7", "year": "2015", "type": "movie"},
-            {"title": "The Fate of the Furious", "year": "2017", "type": "movie"},
+            {"title": "The Fate of the Furious", "year": "2017",
+             "type": "movie"},
             {"title": "F9", "year": "2021", "type": "movie"},
             {"title": "Fast X", "year": "2023", "type": "movie"},
         ],
@@ -3816,67 +4240,101 @@ FRANCHISES: Dict[str, Dict[str, Any]] = {
     "lotr": {
         "name": "Middle-earth",
         "items": [
-            {"title": "The Hobbit: An Unexpected Journey", "year": "2012", "type": "movie"},
-            {"title": "The Hobbit: The Desolation of Smaug", "year": "2013", "type": "movie"},
-            {"title": "The Hobbit: The Battle of the Five Armies", "year": "2014", "type": "movie"},
-            {"title": "The Lord of the Rings: The Fellowship of the Ring", "year": "2001", "type": "movie"},
-            {"title": "The Lord of the Rings: The Two Towers", "year": "2002", "type": "movie"},
-            {"title": "The Lord of the Rings: The Return of the King", "year": "2003", "type": "movie"},
+            {"title": "The Hobbit: An Unexpected Journey",
+             "year": "2012", "type": "movie"},
+            {"title": "The Hobbit: The Desolation of Smaug",
+             "year": "2013", "type": "movie"},
+            {"title": "The Hobbit: The Battle of the Five Armies",
+             "year": "2014", "type": "movie"},
+            {"title": "The Lord of the Rings: The Fellowship of "
+                      "the Ring", "year": "2001", "type": "movie"},
+            {"title": "The Lord of the Rings: The Two Towers",
+             "year": "2002", "type": "movie"},
+            {"title": "The Lord of the Rings: The Return of the "
+                      "King", "year": "2003", "type": "movie"},
         ],
     },
     "harry_potter": {
         "name": "Wizarding World",
         "items": [
-            {"title": "Harry Potter and the Sorcerer's Stone", "year": "2001", "type": "movie"},
-            {"title": "Harry Potter and the Chamber of Secrets", "year": "2002", "type": "movie"},
-            {"title": "Harry Potter and the Prisoner of Azkaban", "year": "2004", "type": "movie"},
-            {"title": "Harry Potter and the Goblet of Fire", "year": "2005", "type": "movie"},
-            {"title": "Harry Potter and the Order of the Phoenix", "year": "2007", "type": "movie"},
-            {"title": "Harry Potter and the Half-Blood Prince", "year": "2009", "type": "movie"},
-            {"title": "Harry Potter and the Deathly Hallows Part 1", "year": "2010", "type": "movie"},
-            {"title": "Harry Potter and the Deathly Hallows Part 2", "year": "2011", "type": "movie"},
+            {"title": "Harry Potter and the Sorcerer's Stone",
+             "year": "2001", "type": "movie"},
+            {"title": "Harry Potter and the Chamber of Secrets",
+             "year": "2002", "type": "movie"},
+            {"title": "Harry Potter and the Prisoner of Azkaban",
+             "year": "2004", "type": "movie"},
+            {"title": "Harry Potter and the Goblet of Fire",
+             "year": "2005", "type": "movie"},
+            {"title": "Harry Potter and the Order of the Phoenix",
+             "year": "2007", "type": "movie"},
+            {"title": "Harry Potter and the Half-Blood Prince",
+             "year": "2009", "type": "movie"},
+            {"title": "Harry Potter and the Deathly Hallows Part 1",
+             "year": "2010", "type": "movie"},
+            {"title": "Harry Potter and the Deathly Hallows Part 2",
+             "year": "2011", "type": "movie"},
         ],
     },
     "mission_impossible": {
         "name": "Mission: Impossible",
         "items": [
-            {"title": "Mission: Impossible", "year": "1996", "type": "movie"},
-            {"title": "Mission: Impossible II", "year": "2000", "type": "movie"},
-            {"title": "Mission: Impossible III", "year": "2006", "type": "movie"},
-            {"title": "Mission: Impossible - Ghost Protocol", "year": "2011", "type": "movie"},
-            {"title": "Mission: Impossible - Rogue Nation", "year": "2015", "type": "movie"},
-            {"title": "Mission: Impossible - Fallout", "year": "2018", "type": "movie"},
-            {"title": "Mission: Impossible - Dead Reckoning", "year": "2023", "type": "movie"},
+            {"title": "Mission: Impossible", "year": "1996",
+             "type": "movie"},
+            {"title": "Mission: Impossible II", "year": "2000",
+             "type": "movie"},
+            {"title": "Mission: Impossible III", "year": "2006",
+             "type": "movie"},
+            {"title": "Mission: Impossible - Ghost Protocol",
+             "year": "2011", "type": "movie"},
+            {"title": "Mission: Impossible - Rogue Nation",
+             "year": "2015", "type": "movie"},
+            {"title": "Mission: Impossible - Fallout",
+             "year": "2018", "type": "movie"},
+            {"title": "Mission: Impossible - Dead Reckoning",
+             "year": "2023", "type": "movie"},
         ],
     },
     "conjuring_universe": {
         "name": "The Conjuring Universe",
         "items": [
-            {"title": "The Conjuring", "year": "2013", "type": "movie"},
+            {"title": "The Conjuring", "year": "2013",
+             "type": "movie"},
             {"title": "Annabelle", "year": "2014", "type": "movie"},
-            {"title": "The Conjuring 2", "year": "2016", "type": "movie"},
-            {"title": "Annabelle: Creation", "year": "2017", "type": "movie"},
+            {"title": "The Conjuring 2", "year": "2016",
+             "type": "movie"},
+            {"title": "Annabelle: Creation", "year": "2017",
+             "type": "movie"},
             {"title": "The Nun", "year": "2018", "type": "movie"},
-            {"title": "Annabelle Comes Home", "year": "2019", "type": "movie"},
-            {"title": "The Conjuring: The Devil Made Me Do It", "year": "2021", "type": "movie"},
+            {"title": "Annabelle Comes Home", "year": "2019",
+             "type": "movie"},
+            {"title": "The Conjuring: The Devil Made Me Do It",
+             "year": "2021", "type": "movie"},
         ],
     },
     "planet_of_apes": {
         "name": "Planet of the Apes",
         "items": [
-            {"title": "Rise of the Planet of the Apes", "year": "2011", "type": "movie"},
-            {"title": "Dawn of the Planet of the Apes", "year": "2014", "type": "movie"},
-            {"title": "War for the Planet of the Apes", "year": "2017", "type": "movie"},
-            {"title": "Kingdom of the Planet of the Apes", "year": "2024", "type": "movie"},
+            {"title": "Rise of the Planet of the Apes",
+             "year": "2011", "type": "movie"},
+            {"title": "Dawn of the Planet of the Apes",
+             "year": "2014", "type": "movie"},
+            {"title": "War for the Planet of the Apes",
+             "year": "2017", "type": "movie"},
+            {"title": "Kingdom of the Planet of the Apes",
+             "year": "2024", "type": "movie"},
         ],
     },
     "matrix": {
         "name": "The Matrix",
         "items": [
-            {"title": "The Matrix", "year": "1999", "type": "movie"},
-            {"title": "The Matrix Reloaded", "year": "2003", "type": "movie"},
-            {"title": "The Matrix Revolutions", "year": "2003", "type": "movie"},
-            {"title": "The Matrix Resurrections", "year": "2021", "type": "movie"},
+            {"title": "The Matrix", "year": "1999",
+             "type": "movie"},
+            {"title": "The Matrix Reloaded", "year": "2003",
+             "type": "movie"},
+            {"title": "The Matrix Revolutions", "year": "2003",
+             "type": "movie"},
+            {"title": "The Matrix Resurrections", "year": "2021",
+             "type": "movie"},
         ],
     },
     "alien_predator": {
@@ -3885,29 +4343,37 @@ FRANCHISES: Dict[str, Dict[str, Any]] = {
             {"title": "Alien", "year": "1979", "type": "movie"},
             {"title": "Aliens", "year": "1986", "type": "movie"},
             {"title": "Alien 3", "year": "1992", "type": "movie"},
-            {"title": "Alien Resurrection", "year": "1997", "type": "movie"},
-            {"title": "Prometheus", "year": "2012", "type": "movie"},
-            {"title": "Alien: Covenant", "year": "2017", "type": "movie"},
+            {"title": "Alien Resurrection", "year": "1997",
+             "type": "movie"},
+            {"title": "Prometheus", "year": "2012",
+             "type": "movie"},
+            {"title": "Alien: Covenant", "year": "2017",
+             "type": "movie"},
         ],
     },
     "terminator": {
         "name": "Terminator",
         "items": [
-            {"title": "The Terminator", "year": "1984", "type": "movie"},
-            {"title": "Terminator 2: Judgment Day", "year": "1991", "type": "movie"},
-            {"title": "Terminator 3: Rise of the Machines", "year": "2003", "type": "movie"},
-            {"title": "Terminator Salvation", "year": "2009", "type": "movie"},
-            {"title": "Terminator Genisys", "year": "2015", "type": "movie"},
-            {"title": "Terminator: Dark Fate", "year": "2019", "type": "movie"},
+            {"title": "The Terminator", "year": "1984",
+             "type": "movie"},
+            {"title": "Terminator 2: Judgment Day",
+             "year": "1991", "type": "movie"},
+            {"title": "Terminator 3: Rise of the Machines",
+             "year": "2003", "type": "movie"},
+            {"title": "Terminator Salvation", "year": "2009",
+             "type": "movie"},
+            {"title": "Terminator Genisys", "year": "2015",
+             "type": "movie"},
+            {"title": "Terminator: Dark Fate", "year": "2019",
+             "type": "movie"},
         ],
     },
 }
 
 
-# ===========================================================================
-# PART 8 — FRANCHISE LOOKUP
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# FRANCHISE LOOKUP
+# ═══════════════════════════════════════════════════════════════════════════
 def _find_franchise_by_title(title: str) -> Optional[Dict[str, Any]]:
     if not title:
         return None
@@ -3931,10 +4397,9 @@ def _find_franchise_by_title(title: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-# ===========================================================================
-# PART 8 — WATCH ORDER VIEW
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCH ORDER VIEW
+# ═══════════════════════════════════════════════════════════════════════════
 async def _build_watch_order_view(
     uid: int,
     franchise: Dict[str, Any],
@@ -3964,7 +4429,7 @@ async def _build_watch_order_view(
             p = compute_progress(session)
             if p["total_eps"] > 0 and \
                     p["total_watched"] >= p["total_eps"]:
-                icon = EMO["trophy"]
+                icon = EMO["ok"]
                 progress_str = "COMPLETE"
             else:
                 icon = EMO["play"]
@@ -3996,10 +4461,9 @@ async def _build_watch_order_view(
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-# ===========================================================================
-# PART 8 — WATCH ORDER CALLBACK
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCH ORDER CALLBACK
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:wo:([a-z0-9_]+)$"), group=-420,
 )
@@ -4053,10 +4517,9 @@ async def cb_pw_watch_order(client, q):
             pass
 
 
-# ===========================================================================
-# PART 8 — WATCH ORDER OPEN ITEM
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCH ORDER OPEN ITEM
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^pw:wo_open:([a-z0-9_]+):(\d+)$"), group=-420,
 )
@@ -4146,15 +4609,11 @@ async def cb_pw_wo_open(client, q):
             pass
 
 
-logger.info("[PREM] Part 8 loaded — franchises + watch order views")
+logger.info("[PREM] Part 11 loaded — franchises + watch order")
 
-# ===========================================================================
-# PART 9 — FINAL BOOT HANDLER
-# ===========================================================================
-
-# Single boot trigger — runs when the first private message arrives.
-# Ensures reminder + cleanup loops start exactly once.
-
+# ═══════════════════════════════════════════════════════════════════════════
+# FINAL BOOT HOOK — starts loops on any private message
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(filters.private, group=-419)
 async def _pw_final_boot(client, message):
     try:
@@ -4163,79 +4622,84 @@ async def _pw_final_boot(client, message):
         logger.debug(f"[PREM] final boot: {e}")
 
 
-# ===========================================================================
-# PART 9 — EXPORTED API (for other plugins)
-# ===========================================================================
-
+# ═══════════════════════════════════════════════════════════════════════════
+# PUBLIC EXPORTS — for use by other plugins (e.g. series_group.py)
+# ═══════════════════════════════════════════════════════════════════════════
 __all__ = [
-    # user CRUD
+    # User CRUD
     "add_premium_user",
     "get_premium_user",
     "is_premium",
+    "is_premium_or_grace",
     "remove_premium_user",
     "list_premium_users",
     "count_premium_users",
     "find_premium_by_username",
-    # sessions
+    # Sessions
+    "create_session",
     "get_session",
     "list_user_sessions",
     "mark_watched",
     "set_current_position",
+    "set_language",
     "mark_session_completed",
+    "delete_session",
     "count_sessions",
     "update_poster_msg",
     "update_current_file_msg",
-    # settings
+    # Settings
     "get_setting",
     "set_setting",
     "get_contact_admin",
-    # progress helpers
+    # Progress helpers
     "compute_progress",
     "render_progress_bar",
     "find_next_episode",
     "is_series_complete",
-    # group-search hook (called from series_group plugin)
+    "is_season_complete",
+    # Main hook — called from series_group.py
     "handle_premium_group_search",
-    # reminders
+    # Reminders
     "mark_reminder_sent",
     "was_reminder_sent",
 ]
 
 
-# ===========================================================================
-# PART 9 — VERSION BANNER
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════
+# VERSION + BANNER
+# ═══════════════════════════════════════════════════════════════════════════
+__version__ = "4.0.0"
 
-__version__ = "3.0.0"
+logger.info("=" * 68)
+logger.info(f"  {EMO['crown']}  PREMIUM WATCH COMPANION  v{__version__}")
+logger.info("=" * 68)
+logger.info(f"  {EMO['ok']}  Part 1  — config, fonts, helpers")
+logger.info(f"  {EMO['ok']}  Part 2  — DB layer + premium CRUD + sessions")
+logger.info(f"  {EMO['ok']}  Part 3  — progress engine + reminders + cleanup")
+logger.info(f"  {EMO['ok']}  Part 4  — boot + admin session + keyboards")
+logger.info(f"  {EMO['ok']}  Part 5  — admin commands + input flow")
+logger.info(f"  {EMO['ok']}  Part 6  — plan picker + extend + remove")
+logger.info(f"  {EMO['ok']}  Part 7  — group→PM redirect + PM prep")
+logger.info(f"  {EMO['ok']}  Part 8  — lang/seasons/episodes callbacks")
+logger.info(f"  {EMO['ok']}  Part 9  — play + sendall + watched + next")
+logger.info(f"  {EMO['ok']}  Part 10 — complete + rate + pause + sessions")
+logger.info(f"  {EMO['ok']}  Part 11 — franchises + watch order")
+logger.info(f"  {EMO['ok']}  Part 12 — exports + banner")
+logger.info("-" * 68)
+logger.info(f"  {EMO['gear']}  Admin panel : /premium  /pw  /seriesgroupsettings")
+logger.info(f"  {EMO['tv']}  User panel  : /my  /myseries")
+logger.info(f"  {EMO['rocket']}  Auto group→PM redirect for premium users")
+logger.info(f"  {EMO['bell']}  Expiry reminders: 10d / 5d / 1d / expired")
+logger.info(f"  {EMO['book']}  Watch Order for 14+ franchises")
+logger.info(f"  {EMO['clock']}  Cleanup: 30d grace  •  180d inactive")
+logger.info("=" * 68)
 
-logger.info("=" * 64)
-logger.info(f"{EMO['crown']}  PREMIUM WATCH COMPANION  v{__version__}")
-logger.info("=" * 64)
-logger.info(f"{EMO['ok']}  Part 1 — fonts, config, db helpers")
-logger.info(f"{EMO['ok']}  Part 2 — CRUD, sessions, progress engine")
-logger.info(f"{EMO['ok']}  Part 3 — reminders, cleanup, admin views")
-logger.info(f"{EMO['ok']}  Part 4 — admin panel commands + input flow")
-logger.info(f"{EMO['ok']}  Part 5 — group→PM redirect + poster")
-logger.info(f"{EMO['ok']}  Part 6 — play, watched, next, complete")
-logger.info(f"{EMO['ok']}  Part 7 — pause, resume, my sessions")
-logger.info(f"{EMO['ok']}  Part 8 — franchises + watch order")
-logger.info(f"{EMO['ok']}  Part 9 — final boot + exports")
-logger.info("-" * 64)
-logger.info(f"{EMO['gear']}  Admin panel: /premium  /pw  /seriesgroupsettings")
-logger.info(f"{EMO['tv']}  User panel:  /my  /myseries")
-logger.info(f"{EMO['rocket']}  Auto group→PM redirect for premium users")
-logger.info(f"{EMO['bell']}  Expiry reminders: 10d / 5d / 1d / expired")
-logger.info(f"{EMO['book']}  Watch Order for 14+ franchises")
-logger.info(f"{EMO['clock']}  Cleanup: 30d grace  •  180d inactive")
-logger.info("=" * 64)
 
-
-# ===========================================================================
-# PART 9 — SELF-CHECK (non-fatal)
-# ===========================================================================
-
-async def _self_check():
-    """Warn if DB collections are missing; do not crash."""
+# ═══════════════════════════════════════════════════════════════════════════
+# SELF-CHECK
+# ═══════════════════════════════════════════════════════════════════════════
+async def _pw_self_check():
+    """Non-fatal DB probe — warns if collections are missing."""
     try:
         p = _premium_coll()
         s = _sessions_coll()
@@ -4260,9 +4724,10 @@ async def _self_check():
 try:
     _loop = asyncio.get_event_loop()
     if _loop.is_running():
-        _loop.create_task(_self_check())
+        _loop.create_task(_pw_self_check())
 except Exception:
     pass
 
 
-logger.info(f"{EMO['spark']}  [PREM] Module ready — v{__version__}")
+logger.info(f"  {EMO['spark']}  [PREM] Module ready — v{__version__}")
+logger.info("=" * 68)
