@@ -1,3 +1,4 @@
+
 # plugins/ai_librarian.py
 """
 🎛️ AI LIBRARIAN v4 — uses SERIES GROUP engine (same quality detection)
@@ -336,6 +337,9 @@ async def _engine_search(title, season=None, language=None, quality=None):
             })
     except Exception as e:
         logger.exception(f"[AI] engine search failed: {e}")
+
+    return _dedupe_by_episode(all_files)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LIGHT PARSER (same as series group)
@@ -1508,7 +1512,8 @@ async def cb_view(client, q):
     except Exception as e:
         logger.exception(f"[AI] view: {e}")
 
-    # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PREFS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
@@ -2060,10 +2065,3 @@ async def _boot(client, message):
 
 
 logger.info("🎛️ AI LIBRARIAN v4 LOADED — same engine as series group")
-    
-    
-
-
-
-    
-    return _dedupe_by_episode(all_files)
