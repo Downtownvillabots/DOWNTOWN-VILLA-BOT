@@ -67,7 +67,10 @@ def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
     except (TypeError, ValueError):
         return default
 
-DATABASE_CHANNEL_ID: Optional[int] = _env_int("DATABASE_CHANNEL_ID")
+DATABASE_CHANNEL_IDS: List[int] = [
+    int(x) for x in os.getenv("DATABASE_CHANNEL_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
+] or ([_env_int("DATABASE_CHANNEL_ID")] if _env_int("DATABASE_CHANNEL_ID") else [])
+DATABASE_CHANNEL_ID: Optional[int] = DATABASE_CHANNEL_IDS[0] if DATABASE_CHANNEL_IDS else None
 AUTO_INDEXING_ENABLED = os.getenv("AUTO_INDEXING_ENABLED", "True").lower() in ("1", "true", "yes", "on")
 
 # ═══════════════════════ HELPERS ═══════════════════════
@@ -226,7 +229,7 @@ def kb_main() -> InlineKeyboardMarkup:
 
 async def _build_main() -> str:
     auto_status = "🟢 ᴀᴄᴛɪᴠᴇ" if (DATABASE_CHANNEL_ID and AUTO_INDEXING_ENABLED) else "🔴 ᴏꜰꜰ"
-    ch = f"<code>{DATABASE_CHANNEL_ID}</code>" if DATABASE_CHANNEL_ID else "—"
+    ch = ", ".join(f"<code>{cid}</code>" for cid in DATABASE_CHANNEL_IDS) if DATABASE_CHANNEL_IDS else "—"
     total = await media_files_repo.count_all()
     routing = await media_router.status()
     active = sum(1 for r in routing if r["ok"])
@@ -321,7 +324,7 @@ async def cb_start(client: Client, q: CallbackQuery):
 async def cb_auto(client: Client, q: CallbackQuery):
     if not is_admin(q.from_user.id):
         await q.answer("⛔", show_alert=True); return
-    ch = f"<code>{DATABASE_CHANNEL_ID}</code>" if DATABASE_CHANNEL_ID else "ᴜɴꜱᴇᴛ"
+    ch = ", ".join(f"<code>{cid}</code>" for cid in DATABASE_CHANNEL_IDS) if DATABASE_CHANNEL_IDS else "ᴜɴꜱᴇᴛ"
     en = "🟢 ᴇɴᴀʙʟᴇᴅ" if AUTO_INDEXING_ENABLED else "🔴 ᴅɪꜱᴀʙʟᴇᴅ"
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -1129,8 +1132,8 @@ async def cmd_index_reset(client: Client, message: Message):
                              parse_mode=ParseMode.HTML)
 
 # ═══════════════════════ AUTO INDEXING ═══════════════════════
-if DATABASE_CHANNEL_ID:
-    @Client.on_message(filters.chat(DATABASE_CHANNEL_ID) & ~filters.service)
+if DATABASE_CHANNEL_IDS:
+    @Client.on_message(filters.chat(DATABASE_CHANNEL_IDS) & ~filters.service, group=-300)
     async def auto_index_handler(client: Client, message: Message):
         """Silent auto-indexing. No progress spam."""
         if not AUTO_INDEXING_ENABLED:
