@@ -805,18 +805,22 @@ async def _render(client, chat_id, msg_id, text, kb, poster=None):
 # ═══════════════════════════════════════════════════════════════════════════
 # KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
-def kb_suggestions(items):
-    rows = []
-    for i, it in enumerate(items):
+def _view_suggestions(raw, items):
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🎬 <b>{fb('SERIES SUGGESTIONS')}</b>",
+        DIV, "",
+        f"🔍 {sc('you searched')} · <code>{_esc(raw)}</code>",
+        "", f"📌 {sc('pick the series you meant')}",
+        "", DIV2, "",
+    ]
+    for i, it in enumerate(items, 1):
         title = (it.get("title") or "?").strip().upper()
-        if len(title) > 44:
-            title = title[:43] + "…"
-        rows.append([InlineKeyboardButton(title, callback_data=f"sg:pick:{i}")])
-    rows.append([InlineKeyboardButton("📩 REQUEST TO ADMIN",
-                                       callback_data="sg:request")])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")])
-    return InlineKeyboardMarkup(rows)
-
+        rating = it.get("rating", 0)
+        lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> · ⭐ {rating:.1f}")
+    lines += ["", DIV2,
+              f"💡 {sc('not what you wanted?')} · ᴛᴀᴘ ʀᴇǫᴜᴇꜱᴛ ʙᴜᴛᴛᴏɴ"]
+    return "\n".join(lines)
 
 def kb_languages(langs, local_langs):
     rows = []; row = []
