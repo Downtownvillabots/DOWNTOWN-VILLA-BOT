@@ -1,7 +1,7 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE v11)
-Uses media_search.delivery · Auto-delete · Request search · Force-sub
+🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE v12)
+Quality click → auto-redirect to bot PM → delivery
 """
 import asyncio
 import base64
@@ -61,9 +61,9 @@ SERIES_GROUP_ENABLED = os.getenv("SERIES_GROUP_ENABLED", "false").lower() in \
                        ("1", "true", "yes", "on")
 
 SESSION_TTL = 900
+PENDING_TTL = 600            # 10 min pending delivery window
 DELIVER_BATCH_DELAY = 0.6
 
-# Auto-delete presets (minutes)
 DELETE_PRESETS = [
     (0,    "♾️ NEVER"),
     (5,    "⏱️ 5 MIN"),
@@ -182,7 +182,6 @@ def _req_coll():
     return d["search_requests"] if d is not None else None
 
 
-# ─── Caption ───
 async def _get_caption() -> str:
     c = _sgroup_coll()
     if c is None: return DEFAULT_EPISODE_CAPTION
@@ -204,7 +203,6 @@ async def _set_caption(template: str) -> bool:
     except Exception: return False
 
 
-# ─── Buttons ───
 async def _get_buttons() -> List[Dict[str, Any]]:
     c = _sgroup_coll()
     if c is None: return []
@@ -226,9 +224,7 @@ async def _set_buttons(buttons: List[Dict[str, Any]]) -> bool:
     except Exception: return False
 
 
-# ─── Auto-delete time ───
 async def _get_delete_minutes() -> int:
-    """Return configured auto-delete minutes. 0 = disabled."""
     c = _sgroup_coll()
     if c is None: return 10
     try:
@@ -249,7 +245,6 @@ async def _set_delete_minutes(minutes: int) -> bool:
     except Exception: return False
 
 
-# ─── Force sub toggle ───
 async def _get_fsub_enabled() -> bool:
     c = _sgroup_coll()
     if c is None: return False
@@ -271,7 +266,6 @@ async def _set_fsub_enabled(enabled: bool) -> bool:
     except Exception: return False
 
 
-# ─── Series prefs ───
 async def _get_series_pref(slug: str) -> Dict[str, Any]:
     c = _sgroup_coll()
     if c is None: return {}
@@ -392,6 +386,42 @@ async def _post_to_request_channel(client, user_id, title,
         return token
     except Exception as e:
         logger.warning(f"[SG-REQ] post failed: {e}"); return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ PENDING DELIVERIES — for PM redirect
+# ═══════════════════════════════════════════════════════════════════════════
+_PENDING: Dict[str, Dict[str, Any]] = {}
+
+
+def _pending_put(uid: int, chosen: Dict, files: List[Dict]) -> str:
+    """Save a pending delivery. Returns token."""
+    token = secrets.token_urlsafe(10)
+    _PENDING[token] = {
+        "user_id": uid,
+        "chosen": dict(chosen),
+        "files": list(files),
+        "created": time.time(),
+        "expires": time.time() + PENDING_TTL,
+    }
+    logger.info(f"[SG-PENDING] created {token} for user {uid} "
+                f"({len(files)} files)")
+    return token
+
+
+def _pending_get(token: str) -> Optional[Dict[str, Any]]:
+    p = _PENDING.get(token)
+    if not p: return None
+    if time.time() > p["expires"]:
+        _PENDING.pop(token, None); return None
+    return p
+
+
+def _pending_cleanup():
+    now = time.time()
+    for t in list(_PENDING.keys()):
+        if _PENDING[t]["expires"] < now:
+            _PENDING.pop(t, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -778,13 +808,10 @@ async def _render(client, chat_id, msg_id, text, kb, poster=None):
 def kb_suggestions(items):
     rows = []
     for i, it in enumerate(items):
-        title = (it.get("title") or "?")[:36]
-        year = it.get("year") or ""
-        rating = it.get("rating", 0)
-        label = f"🎬 {title}"
-        if year: label += f" ({year})"
-        if rating: label += f" ⭐{rating:.1f}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"sg:pick:{i}")])
+        title = (it.get("title") or "?").strip().upper()
+        if len(title) > 44:
+            title = title[:43] + "…"
+        rows.append([InlineKeyboardButton(title, callback_data=f"sg:pick:{i}")])
     rows.append([InlineKeyboardButton("📩 REQUEST TO ADMIN",
                                        callback_data="sg:request")])
     rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")])
@@ -885,19 +912,17 @@ def _view_qualities(title, season, count):
     ])
 
 
-def _view_sending(title, season, quality, language, count, delete_min):
-    delete_line = "♾️ ꜰɪʟᴇꜱ ᴡɪʟʟ sᴛᴀʏ ꜰᴏʀᴇᴠᴇʀ" if delete_min == 0 else \
-                  f"⏱️ ꜰɪʟᴇꜱ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <b>{delete_min} ᴍɪɴᴜᴛᴇꜱ</b>"
+def _view_redirecting(title, season, quality, count):
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"📤 <b>{fb('SENDING TO YOUR PM')}</b>",
+        f"🚀 <b>{fb('REDIRECTING TO PM')}</b>",
         DIV, "",
         f"🎬 <b>{_esc(title)}</b>",
         f"📺 <b>Season {season:02d}</b>",
-        f"🎯 <code>{quality}</code> · 🌍 <code>{language}</code>",
+        f"🎯 <code>{quality}</code>",
         "", f"📁 <code>{count}</code> ᴇᴘɪꜱᴏᴅᴇꜱ",
-        "", f"⚠️ {delete_line}",
-        f"📌 {sc('check your bot pm')}",
+        "", f"📌 {sc('bot will open in pm')}",
+        f"📌 {sc('files will be delivered there')}",
     ])
 
 
@@ -905,10 +930,8 @@ def _view_sending(title, season, quality, language, count, delete_min):
 # FORCE SUB CHECK
 # ═══════════════════════════════════════════════════════════════════════════
 async def _check_fsub(client, user_id) -> Tuple[bool, List[int]]:
-    """Returns (is_subscribed, missing_channel_ids)."""
     if not await _get_fsub_enabled():
         return True, []
-
     try:
         from media_search.subscription import subscription
         ok, missing = await subscription.is_subscribed(client, user_id)
@@ -956,7 +979,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                 status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
             except Exception: return
 
-            # Smart DB-first
             db_match = await _smart_db_search(txt)
             if db_match:
                 matched_title = db_match["matched_title"]
@@ -1256,6 +1278,9 @@ async def cb_seas(client, q):
         except Exception: pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐⭐ QUALITY CLICK → REDIRECT TO PM ⭐⭐
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client, q):
     try:
@@ -1283,7 +1308,7 @@ async def cb_qual(client, q):
         if not files:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
 
-        # ⭐ FORCE SUB check
+        # ── FORCE SUB check ──
         ok_fsub, missing = await _check_fsub(client, uid)
         if not ok_fsub:
             await _render(client, q.message.chat.id, q.message.id,
@@ -1297,25 +1322,28 @@ async def cb_qual(client, q):
                 _kb_fsub(missing), None)
             return await q.answer("⚠️ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟꜱ ꜰɪʀꜱᴛ", show_alert=True)
 
-        await q.answer(f"📩 ꜱᴇɴᴅɪɴɢ {len(files)} ᴇᴘɪꜱᴏᴅᴇꜱ...")
+        # ⭐ Save pending delivery
+        token = _pending_put(uid, c, files)
 
-        delete_min = await _get_delete_minutes()
+        # ⭐ Build deep link to open bot PM
+        me = await client.get_me()
+        bot_username = me.username or "Downtown_Villa_The_Ultimate_Bot"
+        deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
+
+        # ⭐ Update group message → "redirecting"
         await _render(client, q.message.chat.id, q.message.id,
-                       _view_sending(c.get("title") or "?",
-                                      c.get("selected_season") or 0,
-                                      quality,
-                                      c.get("selected_language") or "?",
-                                      len(files), delete_min),
+                       _view_redirecting(c.get("title") or "?",
+                                          c.get("selected_season") or 0,
+                                          quality, len(files)),
                        InlineKeyboardMarkup([[
-                           InlineKeyboardButton("❌ CLOSE",
-                                                 callback_data="sg:close")]]), None)
+                           InlineKeyboardButton("🚀 OPEN BOT PM",
+                                                 url=deep_link)]]),
+                       None)
 
-        _spawn(_deliver_episodes(
-            client, uid, dict(c), list(files),
-            group_chat_id=q.message.chat.id,
-            group_msg_id=q.message.id,
-            delete_minutes=delete_min))
-        logger.info(f"[SG] spawned delivery task for {uid}")
+        # ⭐ Auto-redirect: q.answer(url=...) opens the bot PM
+        await q.answer(url=deep_link)
+        logger.info(f"[SG] redirected user {uid} to bot PM · token={token}")
+
     except Exception as e:
         logger.exception(f"[SG] qual: {e}")
         try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
@@ -1337,7 +1365,80 @@ async def cb_fsub_check(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐⭐ DELIVERY — Uses media_search.delivery + auto-delete ⭐⭐
+# ⭐⭐ PM /start HANDLER — handles deliver_TOKEN ⭐⭐
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_message(filters.command("start") & filters.private, group=-9999)
+async def pm_start_handler(client, message):
+    try:
+        uid = message.from_user.id if message.from_user else None
+        if not uid: return
+
+        logger.info(f"[SG-PM] /start from {uid} text={message.text!r}")
+
+        if len(message.command) < 2:
+            # Regular welcome
+            await message.reply_text(
+                "\n".join([
+                    f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                    DIV, "",
+                    f"📌 {sc('search for series in the series group')}",
+                    f"📌 {sc('files will arrive here in pm')}",
+                ]),
+                parse_mode=ParseMode.HTML)
+            return
+
+        payload = message.command[1]
+
+        if payload.startswith("deliver_"):
+            token = payload[8:]
+            pending = _pending_get(token)
+
+            if not pending:
+                await message.reply_text(
+                    "\n".join([
+                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                        f"⚠️ <b>{fb('SESSION EXPIRED')}</b>",
+                        DIV, "",
+                        f"📌 {sc('please search again in the group')}",
+                    ]),
+                    parse_mode=ParseMode.HTML)
+                return
+
+            if pending["user_id"] != uid:
+                await message.reply_text(
+                    "❌ ᴛʜɪꜱ ʟɪɴᴋ ɪꜱ ɴᴏᴛ ꜰᴏʀ ʏᴏᴜ.",
+                )
+                return
+
+            # Consume the pending
+            _PENDING.pop(token, None)
+
+            files = pending["files"]
+            chosen = pending["chosen"]
+            logger.info(f"[SG-PM] delivering {len(files)} files "
+                        f"for {chosen.get('title')!r} to {uid}")
+
+            # Spawn delivery
+            delete_min = await _get_delete_minutes()
+            _spawn(_deliver_episodes(client, uid, chosen, files,
+                                      delete_minutes=delete_min))
+            return
+
+        # Unknown payload → welcome
+        await message.reply_text(
+            "\n".join([
+                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                DIV, "",
+                f"📌 {sc('search for series in the series group')}",
+                f"📌 {sc('files will arrive here in pm')}",
+            ]),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception(f"[SG-PM] start: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DELIVERY
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client, user_id, chosen, files,
                              group_chat_id=None, group_msg_id=None,
@@ -1346,7 +1447,6 @@ async def _deliver_episodes(client, user_id, chosen, files,
         logger.info(f"[SG-DELIVER] ═══ START user={user_id} files={len(files)} "
                     f"delete={delete_minutes}min ═══")
 
-        # Try to load the delivery module
         delivery = None
         try:
             from media_search.delivery import delivery as _d
@@ -1385,23 +1485,6 @@ async def _deliver_episodes(client, user_id, chosen, files,
             logger.info(f"[SG-DELIVER] ✅ intro → {user_id}")
         except UserIsBlocked:
             logger.warning(f"[SG-DELIVER] ❌ user {user_id} blocked")
-            if group_chat_id and group_msg_id:
-                try:
-                    me = await client.get_me()
-                    await client.edit_message_text(
-                        chat_id=group_chat_id, message_id=group_msg_id,
-                        text="\n".join([
-                            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                            f"⚠️ <b>{fb('START THE BOT FIRST')}</b>",
-                            DIV, "",
-                            f"📌 {sc('open the bot in pm and tap start')}",
-                            f"📌 {sc('then try again here')}",
-                        ]),
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🚀 START BOT",
-                                url=f"https://t.me/{me.username}?start=start")]]),
-                        parse_mode=ParseMode.HTML)
-                except Exception: pass
             return
         except Exception as e:
             logger.exception(f"[SG-DELIVER] ❌ intro failed: {e}")
@@ -1418,7 +1501,6 @@ async def _deliver_episodes(client, user_id, chosen, files,
             ep = f.get("episode")
             size = _fmt_size(f.get("file_size", 0))
 
-            # Build caption
             try:
                 caption = template.format(
                     series=chosen.get("title") or "",
@@ -1448,29 +1530,26 @@ async def _deliver_episodes(client, user_id, chosen, files,
 
             logger.info(f"[SG-DELIVER] [{i+1}/{len(files)}] ep={ep} "
                         f"fid={'Y' if fid else 'N'} "
-                        f"src={'Y' if (src_chat and src_msg) else 'N'} "
-                        f"hit={'Y' if fh else 'N'}")
+                        f"src={'Y' if (src_chat and src_msg) else 'N'}")
 
             sent_msg = None
             success = False
 
-            # ═══ METHOD 1: media_search.delivery.send_file with original FileHit ═══
+            # METHOD 1: media_search.delivery.send_file
             if not success and delivery and fh:
                 try:
                     ok_d, err = await delivery.send_file(client, user_id, fh)
                     if ok_d:
                         success = True; sent += 1
-                        logger.info(f"[SG-DELIVER] ✅ M1 (delivery.send_file) ep={ep}")
-                        # delivery already handles its own auto-delete
+                        logger.info(f"[SG-DELIVER] ✅ M1 (delivery) ep={ep}")
                         await asyncio.sleep(DELIVER_BATCH_DELAY)
                         continue
                     else:
                         logger.warning(f"[SG-DELIVER] M1 fail ep={ep}: {err}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M1 exc ep={ep}: "
-                                   f"{type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M1 exc: {type(e).__name__}: {e}")
 
-            # ═══ METHOD 2: send_cached_media with file_id ═══
+            # METHOD 2: send_cached_media
             if not success and fid:
                 try:
                     sent_msg = await client.send_cached_media(
@@ -1481,24 +1560,10 @@ async def _deliver_episodes(client, user_id, chosen, files,
                     if sent_msg and sent_msg.id:
                         sent_ids.append(sent_msg.id)
                     logger.info(f"[SG-DELIVER] ✅ M2 (cached) ep={ep}")
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 2)
-                    try:
-                        sent_msg = await client.send_cached_media(
-                            chat_id=user_id, file_id=fid,
-                            caption=caption, reply_markup=extra_kb,
-                            parse_mode=ParseMode.HTML)
-                        success = True; sent += 1
-                        if sent_msg and sent_msg.id:
-                            sent_ids.append(sent_msg.id)
-                        logger.info(f"[SG-DELIVER] ✅ M2 after wait ep={ep}")
-                    except Exception as e2:
-                        logger.warning(f"[SG-DELIVER] M2 retry fail: {e2}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M2 fail ep={ep}: "
-                                   f"{type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M2 fail: {type(e).__name__}: {e}")
 
-            # ═══ METHOD 3: copy_message from source ═══
+            # METHOD 3: copy_message
             if not success and src_chat and src_msg:
                 try:
                     sent_msg = await client.copy_message(
@@ -1511,10 +1576,9 @@ async def _deliver_episodes(client, user_id, chosen, files,
                         sent_ids.append(sent_msg.id)
                     logger.info(f"[SG-DELIVER] ✅ M3 (copy) ep={ep}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M3 fail ep={ep}: "
-                                   f"{type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M3 fail: {type(e).__name__}: {e}")
 
-            # ═══ METHOD 4: rebuild FileHit + delivery.send_file ═══
+            # METHOD 4: rebuild FileHit + delivery
             if not success and delivery and FileHit and fid:
                 try:
                     hit = FileHit(
@@ -1539,20 +1603,17 @@ async def _deliver_episodes(client, user_id, chosen, files,
                     ok_d, err = await delivery.send_file(client, user_id, hit)
                     if ok_d:
                         success = True; sent += 1
-                        logger.info(f"[SG-DELIVER] ✅ M4 (rebuild+delivery) ep={ep}")
-                    else:
-                        logger.warning(f"[SG-DELIVER] M4 fail: {err}")
+                        logger.info(f"[SG-DELIVER] ✅ M4 (rebuild) ep={ep}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M4 exc ep={ep}: "
-                                   f"{type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M4 exc: {type(e).__name__}: {e}")
 
             if not success:
                 failed += 1
-                logger.error(f"[SG-DELIVER] ❌ ALL METHODS FAILED ep={ep}")
+                logger.error(f"[SG-DELIVER] ❌ ALL FAILED ep={ep}")
 
             await asyncio.sleep(DELIVER_BATCH_DELAY)
 
-        # ── Auto-delete with warning ──
+        # Auto-delete with warning
         if delete_minutes > 0 and sent_ids:
             try:
                 warn = await client.send_message(
@@ -1567,7 +1628,7 @@ async def _deliver_episodes(client, user_id, chosen, files,
             _spawn(_auto_delete_batch(client, user_id, sent_ids,
                                        delete_minutes * 60))
 
-        # ── Final summary ──
+        # Final
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1586,42 +1647,19 @@ async def _deliver_episodes(client, user_id, chosen, files,
                 parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        # ── Update group message ──
-        if group_chat_id and group_msg_id:
-            try:
-                await client.edit_message_text(
-                    chat_id=group_chat_id, message_id=group_msg_id,
-                    text="\n".join([
-                        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                        f"✅ <b>{fb('DELIVERED TO PM')}</b>",
-                        DIV, "",
-                        f"🎬 <b>{_esc(chosen.get('title'))}</b>",
-                        f"📺 Season {chosen.get('selected_season'):02d}",
-                        f"🎯 <code>{chosen.get('selected_quality')}</code>",
-                        "", f"✅ {sc('sent')} · <code>{sent}</code>",
-                        f"❌ {sc('failed')} · <code>{failed}</code>",
-                    ]),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ CLOSE",
-                                              callback_data="sg:close")]]),
-                    parse_mode=ParseMode.HTML)
-            except Exception as e:
-                logger.debug(f"[SG-DELIVER] group update: {e}")
-
         logger.info(f"[SG-DELIVER] ═══ DONE sent={sent}/{len(files)} → {user_id} ═══")
     except Exception as e:
         logger.exception(f"[SG-DELIVER] ═══ CRASHED: {e} ═══")
 
 
 async def _auto_delete_batch(client, chat_id, msg_ids, seconds):
-    """Delete a batch of messages after `seconds`."""
     try:
         await asyncio.sleep(seconds)
         for mid in msg_ids:
             try:
                 await client.delete_messages(chat_id, mid)
             except Exception: pass
-        logger.info(f"[SG-AUTODEL] deleted {len(msg_ids)} msgs in {chat_id}")
+        logger.info(f"[SG-AUTODEL] deleted {len(msg_ids)} msgs")
     except asyncio.CancelledError: pass
     except Exception as e:
         logger.debug(f"[SG-AUTODEL] {e}")
@@ -1639,7 +1677,7 @@ def _build_extra_kb(buttons):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# REQUEST CALLBACK — with search button for "updated"
+# REQUEST CALLBACK
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^gsreq:"), group=-9999)
 async def cb_gsreq(client, q):
@@ -1677,10 +1715,8 @@ async def cb_gsreq(client, q):
 
     if user_id:
         try:
-            # Build keyboard
             kb_rows = []
             if action == "updated" and title:
-                # Search button for this series
                 b64t = _b64e(title)
                 b64y = _b64e(str(year) if year else "")
                 kb_rows.append([InlineKeyboardButton(
@@ -1694,9 +1730,9 @@ async def cb_gsreq(client, q):
                 text=messages.get(action, "✅ ꜱᴛᴀᴛᴜꜱ ᴜᴘᴅᴀᴛᴇᴅ"),
                 reply_markup=InlineKeyboardMarkup(kb_rows),
                 parse_mode=ParseMode.HTML)
-            logger.info(f"[SG-REQ] notified {user_id} about {title!r}")
+            logger.info(f"[SG-REQ] notified {user_id}")
         except UserIsBlocked:
-            logger.info(f"[SG-REQ] user {user_id} blocked")
+            logger.info(f"[SG-REQ] user blocked")
         except Exception as e:
             logger.warning(f"[SG-REQ] DM fail: {e}")
 
@@ -1715,11 +1751,10 @@ async def cb_gsreq(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ SEARCH FROM REQUEST — user clicks SERIES UPDATED's search button
+# SEARCH FROM REQUEST
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^greqsearch:"), group=-9999)
 async def cb_greq_search(client, q):
-    """User clicked search button from request DM → runs search in DM."""
     try:
         parts = q.data.split(":", 2)
         if len(parts) < 3:
@@ -1731,11 +1766,10 @@ async def cb_greq_search(client, q):
             return await q.answer("❌ ᴇʀʀᴏʀ", show_alert=True)
 
         uid = q.from_user.id
-        logger.info(f"[SG-REQ-SEARCH] user={uid} title={title!r} year={year!r}")
+        logger.info(f"[SG-REQ-SEARCH] user={uid} title={title!r}")
 
         await q.answer("🔍 ꜱᴇᴀʀᴄʜɪɴɢ...")
 
-        # Run search
         local_files = await _engine_search(title)
         logger.info(f"[SG-REQ-SEARCH] {len(local_files)} files found")
 
@@ -1756,7 +1790,6 @@ async def cb_greq_search(client, q):
                 parse_mode=ParseMode.HTML)
             return
 
-        # TMDB for languages/seasons
         tmdb_results = await _tmdb_search_series(title)
         tmdb_langs = ["English"]; tmdb_seasons = []
         poster = None; year_disp = year; tmdb_id = None
@@ -1910,7 +1943,6 @@ async def cb_a_close(client, q):
     await q.answer("ᴄʟᴏꜱᴇᴅ")
 
 
-# ─── AUTO-DELETE MENU ───
 @Client.on_callback_query(filters.regex(r"^sg:a_del$"), group=-9998)
 async def cb_a_del(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -1948,7 +1980,6 @@ async def cb_a_del_set(client, q):
     await cb_a_del(client, q)
 
 
-# ─── FORCE SUB TOGGLE ───
 @Client.on_callback_query(filters.regex(r"^sg:a_fsub$"), group=-9998)
 async def cb_a_fsub(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -1960,7 +1991,6 @@ async def cb_a_fsub(client, q):
     await _render(client, q.message.chat.id, q.message.id, text, kb, None)
 
 
-# ─── CAPTION ───
 @Client.on_callback_query(filters.regex(r"^sg:a_caption$"), group=-9998)
 async def cb_a_caption(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -2024,7 +2054,6 @@ async def cb_a_cap_prev(client, q):
     await q.answer()
 
 
-# ─── BUTTONS ───
 @Client.on_callback_query(filters.regex(r"^sg:a_buttons$"), group=-9998)
 async def cb_a_buttons(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -2075,7 +2104,6 @@ async def cb_a_btn_rm(client, q):
     await cb_a_buttons(client, q)
 
 
-# ─── SERIES PREFS ───
 @Client.on_callback_query(filters.regex(r"^sg:a_prefs$"), group=-9998)
 async def cb_a_prefs(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -2114,7 +2142,6 @@ async def cb_a_pref_add(client, q):
     await q.answer()
 
 
-# ─── STATS / TEST ───
 @Client.on_callback_query(filters.regex(r"^sg:a_stats$"), group=-9998)
 async def cb_a_stats(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
@@ -2307,8 +2334,9 @@ async def cb_a_pref_save(client, q):
 async def _cleanup_loop():
     while True:
         try:
-            await asyncio.sleep(600)
+            await asyncio.sleep(300)
             _cleanup_sessions()
+            _pending_cleanup()
         except asyncio.CancelledError: break
         except Exception: pass
 
@@ -2319,13 +2347,12 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP ULTIMATE v11 — LOADED ✅                      ║")
+logger.info("║  🎬 SERIES GROUP ULTIMATE v12 — LOADED ✅                      ║")
 logger.info("║                                                                ║")
-logger.info("║  ✅ Uses media_search.delivery (your API)                      ║")
-logger.info("║  ✅ Auto-delete setting in /sgroup                             ║")
-logger.info("║  ✅ Force subscribe toggle in /sgroup                          ║")
-logger.info("║  ✅ Request 'SERIES UPDATED' → user gets search button         ║")
-logger.info("║  ✅ Warning msg before auto-delete                             ║")
+logger.info("║  ✅ Quality click → auto-redirect to bot PM                    ║")
+logger.info("║  ✅ Files delivered in PM with warning + auto-delete           ║")
+logger.info("║  ✅ Force subscribe check before delivery                      ║")
+logger.info("║  ✅ Request 'SERIES UPDATED' → PM search button                ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
 logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO':<50}║")
