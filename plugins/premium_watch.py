@@ -2388,38 +2388,40 @@ logger.info("[PREM] Part 6 loaded — all admin callbacks ready")
 async def handle_premium_group_search(
     client: Client,
     message,
-    status_msg,
     query: str,
     db_result: Optional[Dict[str, Any]],
     tmdb_results: List[Dict[str, Any]],
+    status_msg=None,
 ) -> bool:
     """
     Called from series_group.py when a search happens in the group.
-    If the user is premium AND we have DB hits → redirect to PM.
-    Returns True if handled, False to fall through to normal flow.
+    Signature matches how series_group.py calls it:
+        (client, message, query, db_result, tmdb_results)
+    `status_msg` is optional — series_group.py doesn't pass it, so we
+    try to discover it from the message if it exists.
     """
     try:
-        if not message.from_user:
+        if not message or not message.from_user:
             return False
         uid = message.from_user.id
 
         if not await is_premium(uid):
             return False
 
-        if db_result and db_result.get("hits"):
-            matched_title = db_result.get("matched_title") or query
-            ok = await _premium_redirect_to_pm(
-                client, message, status_msg, uid, matched_title,
-                db_result.get("hits") or [],
-                tmdb_results or [],
-            )
-            return ok
+        if not (db_result and db_result.get("hits")):
+            return False
 
-        return False
+        matched_title = db_result.get("matched_title") or query
+
+        ok = await _premium_redirect_to_pm(
+            client, message, status_msg, uid, matched_title,
+            db_result.get("hits") or [],
+            tmdb_results or [],
+        )
+        return ok
     except Exception as e:
         logger.exception(f"[PREM] group search hook: {e}")
         return False
-
 
 async def _premium_redirect_to_pm(
     client: Client,
