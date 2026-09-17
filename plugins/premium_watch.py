@@ -2640,9 +2640,29 @@ async def _prepare_pm_session(client: Client, uid: int,
                 disable_web_page_preview=True,
             )
 
-        # Persist session
+        # Persist session (strip FileHit objects — MongoDB can't store them)
         c = _sessions_coll()
         if c is not None:
+            clean_hits = []
+            for h in hits:
+                try:
+                    clean_hits.append({
+                        "file_id": h.get("file_id") or "",
+                        "file_unique_id": h.get("file_unique_id"),
+                        "file_name": h.get("file_name") or "",
+                        "file_size": h.get("file_size") or 0,
+                        "season": h.get("season"),
+                        "episode": h.get("episode"),
+                        "quality": h.get("quality") or "UNKNOWN",
+                        "languages": list(h.get("languages") or []),
+                        "title": h.get("title") or "",
+                        "series_title": h.get("series_title") or "",
+                        "chat_id": h.get("chat_id"),
+                        "message_id": h.get("message_id"),
+                    })
+                except Exception as e:
+                    logger.debug(f"[PREM] skip hit: {e}")
+
             await c.update_one(
                 {"user_id": uid, "series_slug": slug},
                 {"$set": {
@@ -2654,7 +2674,7 @@ async def _prepare_pm_session(client: Client, uid: int,
                     "rating": rating,
                     "tmdb_id": series_data.get("tmdb_id"),
                     "tmdb_seasons": tmdb_seasons,
-                    "hits": hits,
+                    "hits": clean_hits,  # ← CLEAN (no FileHit objects)
                     "available_langs": langs,
                     "poster_chat_id": uid,
                     "poster_msg_id": msg.id,
@@ -2672,7 +2692,6 @@ async def _prepare_pm_session(client: Client, uid: int,
                 }},
                 upsert=True,
             )
-
         logger.info(f"[PREM] PM poster sent to {uid} msg={msg.id}")
     except Exception as e:
         logger.exception(f"[PREM] prepare PM: {e}")
