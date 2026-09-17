@@ -1,7 +1,6 @@
 # plugins/series_group.py
 """
-🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE v12)
-Quality click → auto-redirect to bot PM → delivery
+🎬 DOWNTOWN VILLA — SERIES GROUP (ULTIMATE v13 — FINAL)
 """
 import asyncio
 import base64
@@ -61,7 +60,7 @@ SERIES_GROUP_ENABLED = os.getenv("SERIES_GROUP_ENABLED", "false").lower() in \
                        ("1", "true", "yes", "on")
 
 SESSION_TTL = 900
-PENDING_TTL = 600            # 10 min pending delivery window
+PENDING_TTL = 600
 DELIVER_BATCH_DELAY = 0.6
 
 DELETE_PRESETS = [
@@ -111,6 +110,18 @@ _M_SC = {
 }
 def fb(s): return "".join(_M_BOLD.get(c, c) for c in str(s))
 def sc(s): return "".join(_M_SC.get(c, c) for c in str(s))
+
+
+class _SafeDict(dict):
+    def __missing__(self, key): return ""
+
+
+def _safe_caption(template: str, ctx: Dict[str, Any], fallback: str) -> str:
+    """Format caption safely. Any missing placeholder → empty string."""
+    try:
+        return template.format_map(_SafeDict(ctx))
+    except Exception:
+        return fallback
 
 
 def _fmt_int(n) -> str:
@@ -389,23 +400,19 @@ async def _post_to_request_channel(client, user_id, title,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ PENDING DELIVERIES — for PM redirect
+# PENDING + TASKS + SESSIONS
 # ═══════════════════════════════════════════════════════════════════════════
 _PENDING: Dict[str, Dict[str, Any]] = {}
+_BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 
 def _pending_put(uid: int, chosen: Dict, files: List[Dict]) -> str:
-    """Save a pending delivery. Returns token."""
     token = secrets.token_urlsafe(10)
     _PENDING[token] = {
-        "user_id": uid,
-        "chosen": dict(chosen),
-        "files": list(files),
-        "created": time.time(),
-        "expires": time.time() + PENDING_TTL,
+        "user_id": uid, "chosen": dict(chosen), "files": list(files),
+        "created": time.time(), "expires": time.time() + PENDING_TTL,
     }
-    logger.info(f"[SG-PENDING] created {token} for user {uid} "
-                f"({len(files)} files)")
+    logger.info(f"[SG-PENDING] created {token} user={uid} files={len(files)}")
     return token
 
 
@@ -424,12 +431,6 @@ def _pending_cleanup():
             _PENDING.pop(t, None)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# BACKGROUND TASKS
-# ═══════════════════════════════════════════════════════════════════════════
-_BACKGROUND_TASKS: Set[asyncio.Task] = set()
-
-
 def _spawn(coro):
     task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
@@ -437,9 +438,6 @@ def _spawn(coro):
     return task
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SESSIONS
-# ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 
@@ -474,7 +472,6 @@ def _cleanup_sessions():
 # ═══════════════════════════════════════════════════════════════════════════
 def _dedupe_by_episode(files):
     if not files: return []
-
     seen_ids: Set[str] = set()
     by_id = []
     for f in files:
@@ -805,22 +802,23 @@ async def _render(client, chat_id, msg_id, text, kb, poster=None):
 # ═══════════════════════════════════════════════════════════════════════════
 # KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
-def _view_suggestions(raw, items):
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎬 <b>{fb('SERIES SUGGESTIONS')}</b>",
-        DIV, "",
-        f"🔍 {sc('you searched')} · <code>{_esc(raw)}</code>",
-        "", f"📌 {sc('pick the series you meant')}",
-        "", DIV2, "",
-    ]
-    for i, it in enumerate(items, 1):
+def kb_suggestions(items):
+    """Buttons: NAME IN CAPS + ⭐ rating."""
+    rows = []
+    for i, it in enumerate(items):
         title = (it.get("title") or "?").strip().upper()
         rating = it.get("rating", 0)
-        lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> · ⭐ {rating:.1f}")
-    lines += ["", DIV2,
-              f"💡 {sc('not what you wanted?')} · ᴛᴀᴘ ʀᴇǫᴜᴇꜱᴛ ʙᴜᴛᴛᴏɴ"]
-    return "\n".join(lines)
+        if len(title) > 42:
+            title = title[:41] + "…"
+        label = title
+        if rating:
+            label += f" ⭐{rating:.1f}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sg:pick:{i}")])
+    rows.append([InlineKeyboardButton("📩 REQUEST TO ADMIN",
+                                       callback_data="sg:request")])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")])
+    return InlineKeyboardMarkup(rows)
+
 
 def kb_languages(langs, local_langs):
     rows = []; row = []
@@ -869,6 +867,7 @@ def kb_qualities(qualities):
 # VIEWS
 # ═══════════════════════════════════════════════════════════════════════════
 def _view_suggestions(raw, items):
+    """Suggestions list: NAME IN CAPS + ⭐ rating."""
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{fb('SERIES SUGGESTIONS')}</b>",
@@ -878,10 +877,12 @@ def _view_suggestions(raw, items):
         "", DIV2, "",
     ]
     for i, it in enumerate(items, 1):
-        title = it.get("title") or "?"
-        year = it.get("year") or ""
+        title = (it.get("title") or "?").strip().upper()
         rating = it.get("rating", 0)
-        lines.append(f"<b>{i}.</b> <b>{_esc(title)}</b> ({year}) · ⭐ {rating:.1f}")
+        line = f"<b>{i}.</b> <b>{_esc(title)}</b>"
+        if rating:
+            line += f" · ⭐ {rating:.1f}"
+        lines.append(line)
     lines += ["", DIV2,
               f"💡 {sc('not what you wanted?')} · ᴛᴀᴘ ʀᴇǫᴜᴇꜱᴛ ʙᴜᴛᴛᴏɴ"]
     return "\n".join(lines)
@@ -1283,7 +1284,7 @@ async def cb_seas(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐⭐ QUALITY CLICK → REDIRECT TO PM ⭐⭐
+# QUALITY CLICK → REDIRECT TO PM
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client, q):
@@ -1312,7 +1313,6 @@ async def cb_qual(client, q):
         if not files:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ", show_alert=True)
 
-        # ── FORCE SUB check ──
         ok_fsub, missing = await _check_fsub(client, uid)
         if not ok_fsub:
             await _render(client, q.message.chat.id, q.message.id,
@@ -1326,15 +1326,12 @@ async def cb_qual(client, q):
                 _kb_fsub(missing), None)
             return await q.answer("⚠️ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟꜱ ꜰɪʀꜱᴛ", show_alert=True)
 
-        # ⭐ Save pending delivery
         token = _pending_put(uid, c, files)
 
-        # ⭐ Build deep link to open bot PM
         me = await client.get_me()
         bot_username = me.username or "Downtown_Villa_The_Ultimate_Bot"
         deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
 
-        # ⭐ Update group message → "redirecting"
         await _render(client, q.message.chat.id, q.message.id,
                        _view_redirecting(c.get("title") or "?",
                                           c.get("selected_season") or 0,
@@ -1344,9 +1341,8 @@ async def cb_qual(client, q):
                                                  url=deep_link)]]),
                        None)
 
-        # ⭐ Auto-redirect: q.answer(url=...) opens the bot PM
         await q.answer(url=deep_link)
-        logger.info(f"[SG] redirected user {uid} to bot PM · token={token}")
+        logger.info(f"[SG] redirected {uid} to PM · token={token}")
 
     except Exception as e:
         logger.exception(f"[SG] qual: {e}")
@@ -1369,7 +1365,7 @@ async def cb_fsub_check(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐⭐ PM /start HANDLER — handles deliver_TOKEN ⭐⭐
+# PM /start HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(filters.command("start") & filters.private, group=-9999)
 async def pm_start_handler(client, message):
@@ -1380,7 +1376,6 @@ async def pm_start_handler(client, message):
         logger.info(f"[SG-PM] /start from {uid} text={message.text!r}")
 
         if len(message.command) < 2:
-            # Regular welcome
             await message.reply_text(
                 "\n".join([
                     f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -1409,12 +1404,9 @@ async def pm_start_handler(client, message):
                 return
 
             if pending["user_id"] != uid:
-                await message.reply_text(
-                    "❌ ᴛʜɪꜱ ʟɪɴᴋ ɪꜱ ɴᴏᴛ ꜰᴏʀ ʏᴏᴜ.",
-                )
+                await message.reply_text("❌ ᴛʜɪꜱ ʟɪɴᴋ ɪꜱ ɴᴏᴛ ꜰᴏʀ ʏᴏᴜ.")
                 return
 
-            # Consume the pending
             _PENDING.pop(token, None)
 
             files = pending["files"]
@@ -1422,13 +1414,11 @@ async def pm_start_handler(client, message):
             logger.info(f"[SG-PM] delivering {len(files)} files "
                         f"for {chosen.get('title')!r} to {uid}")
 
-            # Spawn delivery
             delete_min = await _get_delete_minutes()
             _spawn(_deliver_episodes(client, uid, chosen, files,
                                       delete_minutes=delete_min))
             return
 
-        # Unknown payload → welcome
         await message.reply_text(
             "\n".join([
                 f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -1442,7 +1432,7 @@ async def pm_start_handler(client, message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELIVERY
+# ⭐⭐ DELIVERY — uses CUSTOM caption + CUSTOM buttons ⭐⭐
 # ═══════════════════════════════════════════════════════════════════════════
 async def _deliver_episodes(client, user_id, chosen, files,
                              group_chat_id=None, group_msg_id=None,
@@ -1451,27 +1441,7 @@ async def _deliver_episodes(client, user_id, chosen, files,
         logger.info(f"[SG-DELIVER] ═══ START user={user_id} files={len(files)} "
                     f"delete={delete_minutes}min ═══")
 
-        delivery = None
-        try:
-            from media_search.delivery import delivery as _d
-            delivery = _d
-            logger.info(f"[SG-DELIVER] ✅ media_search.delivery loaded")
-        except Exception as e:
-            logger.warning(f"[SG-DELIVER] ⚠️ no delivery module: {e}")
-
-        FileHit = None
-        try:
-            from media_search.models import FileHit as _FH
-            FileHit = _FH
-        except Exception: pass
-
-        normalize_fn = None
-        try:
-            from media_search.normalizer import normalize as _n
-            normalize_fn = _n
-        except Exception: pass
-
-        # Intro
+        # Intro to PM
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1489,14 +1459,34 @@ async def _deliver_episodes(client, user_id, chosen, files,
             logger.info(f"[SG-DELIVER] ✅ intro → {user_id}")
         except UserIsBlocked:
             logger.warning(f"[SG-DELIVER] ❌ user {user_id} blocked")
+            if group_chat_id and group_msg_id:
+                try:
+                    me = await client.get_me()
+                    await client.edit_message_text(
+                        chat_id=group_chat_id, message_id=group_msg_id,
+                        text="\n".join([
+                            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                            f"⚠️ <b>{fb('START THE BOT FIRST')}</b>",
+                            DIV, "",
+                            f"📌 {sc('open the bot in pm and tap start')}",
+                            f"📌 {sc('then try again here')}",
+                        ]),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🚀 START BOT",
+                                url=f"https://t.me/{me.username}?start=start")]]),
+                        parse_mode=ParseMode.HTML)
+                except Exception: pass
             return
         except Exception as e:
             logger.exception(f"[SG-DELIVER] ❌ intro failed: {e}")
             return
 
+        # Load CUSTOM caption + buttons
         template = await _get_caption()
-        extra_buttons = await _get_buttons()
-        extra_kb = _build_extra_kb(extra_buttons)
+        custom_buttons = await _get_buttons()
+        custom_kb = _build_extra_kb(custom_buttons)
+        logger.info(f"[SG-DELIVER] caption len={len(template)} "
+                    f"buttons={len(custom_buttons)}")
 
         sent_ids: List[int] = []
         sent = 0; failed = 0
@@ -1504,19 +1494,31 @@ async def _deliver_episodes(client, user_id, chosen, files,
         for i, f in enumerate(files):
             ep = f.get("episode")
             size = _fmt_size(f.get("file_size", 0))
+            title_str = chosen.get("title") or "?"
+            season_n = chosen.get("selected_season") or 0
+            quality_s = chosen.get("selected_quality") or ""
+            lang_s = chosen.get("selected_language") or ""
 
-            try:
-                caption = template.format(
-                    series=chosen.get("title") or "",
-                    season=chosen.get("selected_season") or 0,
-                    episode=ep or 0,
-                    quality=chosen.get("selected_quality") or "",
-                    language=chosen.get("selected_language") or "",
-                    size=size)
-            except Exception:
-                caption = (f"🎬 {chosen.get('title')} "
-                           f"S{chosen.get('selected_season'):02d}"
-                           f"E{ep or 0:02d}")
+            # ── BUILD CAPTION (custom template, safe format) ──
+            ctx = {
+                "series": title_str,
+                "title": title_str,
+                "season": season_n,
+                "episode": ep or 0,
+                "quality": quality_s,
+                "language": lang_s,
+                "lang": lang_s,
+                "size": size,
+                "file_size": size,
+                "file_name": f.get("file_name") or "",
+                "rating": "—",
+                "year": chosen.get("year") or "—",
+                "file_caption": title_str,
+            }
+            fallback = (f"🎬 <b>{_esc(title_str)}</b>\n"
+                        f"📺 S{season_n:02d}E{ep or 0:02d} · "
+                        f"<code>{quality_s}</code>")
+            caption = _safe_caption(template, ctx, fallback)
 
             fh = f.get("file_hit")
             fid = f.get("file_id")
@@ -1539,77 +1541,61 @@ async def _deliver_episodes(client, user_id, chosen, files,
             sent_msg = None
             success = False
 
-            # METHOD 1: media_search.delivery.send_file
-            if not success and delivery and fh:
-                try:
-                    ok_d, err = await delivery.send_file(client, user_id, fh)
-                    if ok_d:
-                        success = True; sent += 1
-                        logger.info(f"[SG-DELIVER] ✅ M1 (delivery) ep={ep}")
-                        await asyncio.sleep(DELIVER_BATCH_DELAY)
-                        continue
-                    else:
-                        logger.warning(f"[SG-DELIVER] M1 fail ep={ep}: {err}")
-                except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M1 exc: {type(e).__name__}: {e}")
-
-            # METHOD 2: send_cached_media
+            # ── METHOD 1: send_cached_media with OUR caption + OUR buttons ──
             if not success and fid:
                 try:
                     sent_msg = await client.send_cached_media(
                         chat_id=user_id, file_id=fid,
-                        caption=caption, reply_markup=extra_kb,
+                        caption=caption, reply_markup=custom_kb,
                         parse_mode=ParseMode.HTML)
                     success = True; sent += 1
                     if sent_msg and sent_msg.id:
                         sent_ids.append(sent_msg.id)
-                    logger.info(f"[SG-DELIVER] ✅ M2 (cached) ep={ep}")
+                    logger.info(f"[SG-DELIVER] ✅ M1 (cached) ep={ep}")
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 2)
+                    try:
+                        sent_msg = await client.send_cached_media(
+                            chat_id=user_id, file_id=fid,
+                            caption=caption, reply_markup=custom_kb,
+                            parse_mode=ParseMode.HTML)
+                        success = True; sent += 1
+                        if sent_msg and sent_msg.id:
+                            sent_ids.append(sent_msg.id)
+                        logger.info(f"[SG-DELIVER] ✅ M1 after wait ep={ep}")
+                    except Exception as e2:
+                        logger.warning(f"[SG-DELIVER] M1 retry fail: {e2}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M2 fail: {type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M1 fail: "
+                                   f"{type(e).__name__}: {e}")
 
-            # METHOD 3: copy_message
+            # ── METHOD 2: copy_message from source ──
             if not success and src_chat and src_msg:
                 try:
                     sent_msg = await client.copy_message(
                         chat_id=user_id,
                         from_chat_id=src_chat, message_id=src_msg,
-                        caption=caption, reply_markup=extra_kb,
+                        caption=caption, reply_markup=custom_kb,
                         parse_mode=ParseMode.HTML)
                     success = True; sent += 1
                     if sent_msg and sent_msg.id:
                         sent_ids.append(sent_msg.id)
-                    logger.info(f"[SG-DELIVER] ✅ M3 (copy) ep={ep}")
+                    logger.info(f"[SG-DELIVER] ✅ M2 (copy) ep={ep}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M3 fail: {type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M2 fail: "
+                                   f"{type(e).__name__}: {e}")
 
-            # METHOD 4: rebuild FileHit + delivery
-            if not success and delivery and FileHit and fid:
+            # ── METHOD 3: media_search.delivery (LAST RESORT — uses its own caption) ──
+            if not success and fh:
                 try:
-                    hit = FileHit(
-                        file_id=fid,
-                        file_unique_id=f.get("file_unique_id"),
-                        file_name=f.get("file_name") or "",
-                        file_size=f.get("file_size") or 0,
-                        title=f.get("title") or "",
-                        normalized_title=(normalize_fn(f.get("title") or "")
-                                          if normalize_fn else
-                                          (f.get("title") or "").lower()),
-                        year=None, type="series",
-                        quality=f.get("quality"),
-                        codec=None,
-                        audio_languages=list(f.get("languages") or []),
-                        subtitle_languages=[],
-                        has_subtitle=False,
-                        series_title=f.get("series_title") or "",
-                        season=f.get("season"),
-                        episode=f.get("episode"),
-                        caption=None)
-                    ok_d, err = await delivery.send_file(client, user_id, hit)
+                    from media_search.delivery import delivery as _d
+                    ok_d, err = await _d.send_file(client, user_id, fh)
                     if ok_d:
                         success = True; sent += 1
-                        logger.info(f"[SG-DELIVER] ✅ M4 (rebuild) ep={ep}")
+                        logger.info(f"[SG-DELIVER] ✅ M3 (delivery fallback) ep={ep}")
                 except Exception as e:
-                    logger.warning(f"[SG-DELIVER] M4 exc: {type(e).__name__}: {e}")
+                    logger.warning(f"[SG-DELIVER] M3 fail: "
+                                   f"{type(e).__name__}: {e}")
 
             if not success:
                 failed += 1
@@ -1632,7 +1618,7 @@ async def _deliver_episodes(client, user_id, chosen, files,
             _spawn(_auto_delete_batch(client, user_id, sent_ids,
                                        delete_minutes * 60))
 
-        # Final
+        # Final summary
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1673,10 +1659,15 @@ def _build_extra_kb(buttons):
     if not buttons: return None
     rows = []
     for b in buttons:
+        if not isinstance(b, dict): continue
         name = (b.get("name") or "").strip()
         url = (b.get("url") or "").strip()
-        if name and url:
-            rows.append([InlineKeyboardButton(name[:60], url=url)])
+        if not name or not url: continue
+        if url.startswith("@"): url = f"https://t.me/{url[1:]}"
+        if not (url.startswith("http://") or url.startswith("https://")
+                or url.startswith("tg://")):
+            continue
+        rows.append([InlineKeyboardButton(name[:60], url=url)])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -1754,9 +1745,6 @@ async def cb_gsreq(client, q):
     await q.answer(f"✅ {action}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SEARCH FROM REQUEST
-# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^greqsearch:"), group=-9999)
 async def cb_greq_search(client, q):
     try:
@@ -2006,6 +1994,7 @@ async def cb_a_caption(client, q):
         "", DIV2, f"📌 {sc('placeholders')}:",
         f"<code>{{series}}</code> <code>{{season}}</code> <code>{{episode}}</code>",
         f"<code>{{quality}}</code> <code>{{language}}</code> <code>{{size}}</code>",
+        f"<code>{{file_name}}</code> <code>{{year}}</code> <code>{{rating}}</code>",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ EDIT", callback_data="sg:a_cap_edit")],
@@ -2026,6 +2015,9 @@ async def cb_a_cap_edit(client, q):
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"✏️ <b>{fb('EDIT CAPTION')}</b>",
         DIV, "", f"📝 {sc('send the new caption template')}",
+        "", f"📌 {sc('placeholders')}:",
+        f"<code>{{series}}</code> <code>{{season}}</code> <code>{{episode}}</code>",
+        f"<code>{{quality}}</code> <code>{{language}}</code> <code>{{size}}</code>",
     ])
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ CANCEL", callback_data="sg:a_caption")]])
@@ -2045,11 +2037,15 @@ async def cb_a_cap_reset(client, q):
 async def cb_a_cap_prev(client, q):
     if not _is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     template = await _get_caption()
-    try:
-        preview = template.format(series="Breaking Bad", season=1, episode=5,
-                                   quality="1080P", language="English",
-                                   size="1.45 GB")
-    except Exception: preview = template
+    preview = _safe_caption(template, {
+        "series": "Breaking Bad", "title": "Breaking Bad",
+        "season": 1, "episode": 5, "quality": "1080P",
+        "language": "English", "lang": "English",
+        "size": "1.45 GB", "file_size": "1.45 GB",
+        "file_name": "Breaking.Bad.S01E05.1080p.mkv",
+        "rating": "9.5", "year": "2008",
+        "file_caption": "Breaking Bad",
+    }, template)
     text = "\n".join([f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
                       f"👁️ <b>{fb('PREVIEW')}</b>", DIV, "", preview])
     kb = InlineKeyboardMarkup([[
@@ -2351,12 +2347,14 @@ except Exception: pass
 
 logger.info("")
 logger.info("╔════════════════════════════════════════════════════════════════╗")
-logger.info("║  🎬 SERIES GROUP ULTIMATE v12 — LOADED ✅                      ║")
+logger.info("║  🎬 SERIES GROUP ULTIMATE v13 — LOADED ✅                      ║")
 logger.info("║                                                                ║")
-logger.info("║  ✅ Quality click → auto-redirect to bot PM                    ║")
-logger.info("║  ✅ Files delivered in PM with warning + auto-delete           ║")
-logger.info("║  ✅ Force subscribe check before delivery                      ║")
-logger.info("║  ✅ Request 'SERIES UPDATED' → PM search button                ║")
+logger.info("║  ✅ kb_suggestions now defined (was missing!)                  ║")
+logger.info("║  ✅ Suggestions: NAME CAPS + ⭐ rating                         ║")
+logger.info("║  ✅ Custom caption works (safe formatting)                     ║")
+logger.info("║  ✅ Custom buttons work (cached_media first)                   ║")
+logger.info("║  ✅ Auto-delete + Force-sub                                    ║")
+logger.info("║  ✅ Quality click → auto-redirect to PM                        ║")
 logger.info("║                                                                ║")
 logger.info(f"║  Group ID: {SERIES_GROUP_ID or 'NOT SET':<50}║")
 logger.info(f"║  Enabled:  {'YES' if SERIES_GROUP_ENABLED else 'NO':<50}║")
