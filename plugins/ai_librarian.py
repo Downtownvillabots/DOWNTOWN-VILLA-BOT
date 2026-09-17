@@ -1,14 +1,20 @@
 # plugins/ai_librarian.py
 """
 🎛️ AI LIBRARIAN v4 — uses SERIES GROUP engine (same quality detection)
-... (docstring unchanged)
+
+Features:
+- Same engine + parser as plugins/series_group.py
+- Sees ALL qualities (480p/720p/1080p/etc.)
+- Episode × quality grid with 🟢/🟡/🔴 status
+- Per-series quality prefs
+- Auto-scan, manual scan, mark complete
+- Delete individual files
 """
 import asyncio
 import logging
 import os
 import random
 import re
-import secrets
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -16,7 +22,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -32,7 +38,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONFIG  (unchanged)
+# CONFIG
 # ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
@@ -40,11 +46,11 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 SESSION_TTL = 900
 DAILY_REPORT_HOUR = 9
 SERIES_PER_AUTO = 3
-PROGRESS_UPDATE_INTERVAL = 2.0
 
 DIV = "━" * 26
 DIV2 = "─" * 26
 
+# Priority order of qualities (highest first)
 QUALITY_ORDER = ["4320P", "2160P", "1440P", "1080P", "720P", "576P", "480P", "360P"]
 
 QUALITY_RANK = {
@@ -99,7 +105,7 @@ def _now_ist() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DB  (unchanged)
+# DB HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_db():
     try:
@@ -176,7 +182,10 @@ async def _count_completed():
 
 
 async def _delete_file_record(file_id):
-    """Delete by file_id across all media shards."""
+    """
+    Delete by file_id (and fallback to file_unique_id) across all media shards.
+    FIXED: logs when nothing was deleted.
+    """
     if not file_id: return False
     try:
         from database import db_registry
@@ -188,11 +197,13 @@ async def _delete_file_record(file_id):
                     deleted = True; continue
                 r = await entry.db["media_files"].delete_one(
                     {"file_unique_id": file_id})
-                if r.deleted_count > 0: deleted = True
-            except Exception:
+                if r.deleted_count > 0:
+                    deleted = True
+            except Exception as e:
+                logger.debug(f"[AI] shard delete err: {e}")
                 continue
         if not deleted:
-            logger.warning(f"[AI] delete_file: no record for {file_id!r}")
+            logger.warning(f"[AI] delete_file: no record found for {file_id!r}")
         return deleted
     except Exception as e:
         logger.warning(f"[AI] delete_file: {e}")
@@ -228,11 +239,12 @@ async def _list_prefs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SESSIONS  (FIXED: flat storage, safe cleanup)
+# SESSIONS  ⭐ FIXED: flat storage, safe cleanup, chat_id tracking
 # ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 def _new_session(uid, action, **data):
+    """Create a new session with FLAT storage (no nested 'data' key)."""
     _SESSIONS[uid] = {
         "action": action,
         "expires": time.time() + SESSION_TTL,
@@ -246,9 +258,11 @@ def _get_session(uid):
         _SESSIONS.pop(uid, None); return None
     return s
 
-def _clear_session(uid): _SESSIONS.pop(uid, None)
+def _clear_session(uid):
+    _SESSIONS.pop(uid, None)
 
 def _cleanup_sessions():
+    """FIXED: safe access to 'expires'."""
     now = time.time()
     for uid in list(_SESSIONS.keys()):
         s = _SESSIONS.get(uid) or {}
@@ -257,9 +271,10 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ENGINE  (FIXED: null guard)
+# ENGINE  ⭐ FIXED: null-guard on result.hits
 # ═══════════════════════════════════════════════════════════════════════════
 async def _engine_search(title, season=None, language=None, quality=None):
+    """Same engine as series_group._engine_search."""
     try:
         from media_search.engine import engine
         from media_search.normalizer import normalize
@@ -270,11 +285,13 @@ async def _engine_search(title, season=None, language=None, quality=None):
     all_files = []
     try:
         norm = normalize(title)
+
+        # FIXED: null-guard on result and hits
         result = await engine.search_series(norm)
-        hits = getattr(result, "hits", None) if result else None
+        hits = getattr(result, "hits", None) if result is not None else None
         if not hits:
             result = await engine.search_any(norm)
-            hits = getattr(result, "hits", None) if result else None
+            hits = getattr(result, "hits", None) if result is not None else None
         hits = hits or []
 
         logger.info(f"[AI] engine: {len(hits)} hits for {norm!r}")
@@ -320,11 +337,8 @@ async def _engine_search(title, season=None, language=None, quality=None):
     except Exception as e:
         logger.exception(f"[AI] engine search failed: {e}")
 
-    return _dedupe_by_episode(all_files)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# PARSER  (unchanged)
+# LIGHT PARSER (same as series group)
 # ═══════════════════════════════════════════════════════════════════════════
 _SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
@@ -355,6 +369,10 @@ _LANG_ALIASES = {
 
 
 def _parse_filename_light(filename):
+    """
+    FIXED: use lookarounds instead of \b so '4k' matches even inside
+    tokens like 'x264-4k' (word-boundary would fail if preceded by '_').
+    """
     out = {"season": None, "episode": None, "quality": None, "languages": []}
     if not filename: return out
     name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
@@ -375,14 +393,17 @@ def _parse_filename_light(filename):
                 try: out["season"] = int(m.group(1)); break
                 except Exception: continue
 
+    # FIXED: use (?<![a-z0-9]) ... (?![a-z0-9]) so 4k matches inside 'x264-4k'
     for marker, label in _QUALITY_MARKERS:
-        if re.search(r"\b" + re.escape(marker) + r"\b", wl):
+        pat = r"(?<![a-z0-9])" + re.escape(marker) + r"(?![a-z0-9])"
+        if re.search(pat, wl):
             out["quality"] = label; break
 
     langs = []
     for ln, aliases in _LANG_ALIASES.items():
         for a in aliases:
-            if re.search(r"\b" + re.escape(a) + r"\b", wl):
+            pat = r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])"
+            if re.search(pat, wl):
                 if ln not in langs: langs.append(ln)
                 break
     out["languages"] = langs
@@ -390,6 +411,10 @@ def _parse_filename_light(filename):
 
 
 def _dedupe_by_episode(files):
+    """
+    Same as series group — 1 file per (season, episode, quality).
+    FIXED: copies dicts before mutating to avoid side effects on caller.
+    """
     if not files: return []
     seen_ids: Set[str] = set()
     by_id = []
@@ -397,7 +422,7 @@ def _dedupe_by_episode(files):
         fid = str(f.get("file_id") or f.get("file_unique_id") or "")
         if fid and fid in seen_ids: continue
         if fid: seen_ids.add(fid)
-        by_id.append(f)
+        by_id.append(dict(f))  # FIXED: copy so we can safely mutate
 
     def _size(f):
         s = f.get("file_size") or 0
@@ -429,9 +454,10 @@ def _dedupe_by_episode(files):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATALOG  (unchanged)
+# CATALOG (groups files by title → season → episode → quality)
 # ═══════════════════════════════════════════════════════════════════════════
 class SeriesCatalog:
+    """Groups files by: title → season → episode → quality."""
     def __init__(self):
         self.data: Dict[str, Dict[str, Any]] = {}
 
@@ -464,46 +490,29 @@ class SeriesCatalog:
         return out
 
 
-def _summarize_catalog(cat: SeriesCatalog, slug: str) -> Dict[str, Any]:
-    series = cat.data.get(slug) or {}
-    seasons = series.get("seasons") or {}
-    qualities: Set[str] = set()
-    all_eps: Set[Tuple[int, Optional[int]]] = set()
-    for sn, eps in seasons.items():
-        for ep, qmap in eps.items():
-            all_eps.add((sn, ep))
-            for q in qmap.keys():
-                qualities.add(q)
-    return {
-        "qualities": sorted(qualities, key=lambda x: QUALITY_RANK.get(x, 0),
-                            reverse=True),
-        "season_count": len(seasons),
-        "episode_count": len(all_eps),
-        "file_count": series.get("file_count", 0),
-    }
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# TMDB  (unchanged)
+# TMDB SUGGEST  ⭐ FIXED: logs on missing key/aiohttp
 # ═══════════════════════════════════════════════════════════════════════════
 async def _tmdb_suggest(query):
     if not TMDB_API_KEY:
-        logger.warning("[AI] TMDB_API_KEY missing")
+        logger.warning("[AI] TMDB_API_KEY missing — skipping TMDB suggestions")
         return []
     try:
         import aiohttp
     except ImportError:
-        logger.warning("[AI] aiohttp not installed")
+        logger.warning("[AI] aiohttp not installed — skipping TMDB")
         return []
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "en-US"}
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get("https://api.themoviedb.org/3/search/tv",
                                 params=params, timeout=12) as r:
-                if r.status != 200: return []
+                if r.status != 200:
+                    logger.warning(f"[AI] TMDB HTTP {r.status}")
+                    return []
                 data = await r.json()
     except Exception as e:
-        logger.warning(f"[AI] tmdb: {e}")
+        logger.warning(f"[AI] TMDB error: {e}")
         return []
 
     out = []
@@ -531,7 +540,7 @@ def kb_tmdb_suggest(items):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# KEYBOARDS  (unchanged)
+# KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
 def kb_main(auto_on, completed, total):
     return InlineKeyboardMarkup([
@@ -580,27 +589,6 @@ def kb_series_list(lst):
     return InlineKeyboardMarkup(rows)
 
 
-def kb_episode_files(slug, season, episode, quality, files):
-    rows = []
-    for i, f in enumerate(files[:10]):
-        q = f.get("quality", "?")
-        langs = "+".join(f.get("languages", [])) or "?"
-        ep_i = episode if episode is not None else 0
-        rows.append([InlineKeyboardButton(f"🗑️ {i+1}. {q} · {langs}",
-            callback_data=f"ai:del_pick:{slug}:{season}:{ep_i}:{q}:{i}")])
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:grid:{slug}"),
-                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_confirm_delete(slug, season, episode, quality, idx):
-    ep_i = episode if episode is not None else 0
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ YES, DELETE",
-            callback_data=f"ai:del_go:{slug}:{season}:{ep_i}:{quality}:{idx}")],
-        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:grid:{slug}")]])
-
-
 def kb_quality_picker(slug, avail, cur):
     rows = []; row = []
     for q in avail:
@@ -609,7 +597,8 @@ def kb_quality_picker(slug, avail, cur):
             callback_data=f"ai:pref_tog:{slug}:{q}"))
         if len(row) == 3: rows.append(row); row = []
     if row: rows.append(row)
-    rows.append([InlineKeyboardButton("💾 SAVE", callback_data=f"ai:pref_save:{slug}")])
+    rows.append([InlineKeyboardButton("💾 SAVE",
+                                       callback_data=f"ai:pref_save:{slug}")])
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
@@ -622,7 +611,7 @@ def kb_back(t="ai:main"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW BUILDERS  (unchanged)
+# VIEW BUILDERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def _view_main():
     auto_on = await _get_setting("auto_mode", True)
@@ -664,6 +653,7 @@ def _view_scanning(cur, total):
 
 def _view_series_overview(series: Dict[str, Any], prefs: List[str],
                           i: int, t: int) -> str:
+    """Overview with quality × episode status."""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
 
@@ -702,14 +692,11 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
                 keep = [q for q in have if q in prefs]
                 ignore = [q for q in have if q not in prefs]
                 if keep:
-                    icon = "🟢"
-                    complete_eps += 1
+                    icon = "🟢"; complete_eps += 1
                 elif ignore:
-                    icon = "🟡"
-                    partial_eps += 1
+                    icon = "🟡"; partial_eps += 1
                 else:
-                    icon = "🔴"
-                    missing_eps += 1
+                    icon = "🔴"; missing_eps += 1
                 q_str = " ".join(f"{'✅' if q in prefs else '⏭️'}{q}" for q in have)
             else:
                 if len(have) >= 2:
@@ -722,7 +709,8 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
 
             lines.append(f"   {icon} <b>{ep_label}</b> · {q_str}")
 
-        lines.append(f"   📊 {sc('qualities')} · <code>{', '.join(qual_list) or '—'}</code>")
+        lines.append(f"   📊 {sc('qualities')} · "
+                     f"<code>{', '.join(qual_list) or '—'}</code>")
         lines.append("")
 
     lines.append(DIV2)
@@ -738,6 +726,7 @@ def _view_series_overview(series: Dict[str, Any], prefs: List[str],
 
 
 def _view_quality_grid(series: Dict[str, Any], prefs: List[str]) -> str:
+    """Matrix view: episodes × qualities with ✅/❌"""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
 
@@ -801,34 +790,57 @@ def _view_episode_quality_picker(series: Dict[str, Any], season: int,
     return "\n".join(lines)
 
 
+def _view_quality_picker(title, avail, cur):
+    """
+    FIXED: moved up here (was defined after cb_pref which used it — confusing).
+    """
+    return "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🎯 <b>{fb('QUALITY PREFS')}</b>",
+        DIV, "",
+        f"🎬 <b>{_esc(title)}</b>", "",
+        f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
+        f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>",
+    ])
+
+
 async def _safe_edit(t, text, kb=None):
+    """Safely edit a message; returns True on success (or no-op), False on error."""
     try:
         m = getattr(t, "message", t)
         await m.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                            disable_web_page_preview=True)
         return True
-    except MessageNotModified: return True
+    except MessageNotModified:
+        return True
     except Exception as e:
-        logger.exception(f"[AI] edit: {e}"); return False
-
+        logger.exception(f"[AI] edit failed: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════════════════
-# COMMANDS  (unchanged)
+# COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(filters.command(["ai", "librarian", "ailib"]) & filters.private, group=-430)
+@Client.on_message(
+    filters.command(["ai", "librarian", "ailib"]) & filters.private,
+    group=-430,
+)
 async def cmd_ai(client, message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
     try:
         _clear_session(message.from_user.id)
         text, kb = await _view_main()
-        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+        await message.reply_text(text, reply_markup=kb,
+                                  parse_mode=ParseMode.HTML,
                                   disable_web_page_preview=True)
     except Exception as e:
         logger.exception(f"[AI] /ai: {e}")
 
 
-@Client.on_message(filters.command(["aidb", "aishards"]) & filters.private, group=-430)
+@Client.on_message(
+    filters.command(["aidb", "aishards"]) & filters.private,
+    group=-430,
+)
 async def cmd_aidb(client, message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
@@ -840,7 +852,8 @@ async def cmd_aidb(client, message):
         for entry in db_registry.media_entries():
             try:
                 n = await entry.db["media_files"].estimated_document_count()
-            except Exception: n = -1
+            except Exception:
+                n = -1
             lines.append(f"• <code>DB{entry.index + 1}</code> · {_fmt_int(n)}")
         await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -855,35 +868,45 @@ async def cmd_aidb(client, message):
 async def cb_main(client, q):
     try:
         text, kb = await _view_main()
-        await _safe_edit(q, text, kb); await q.answer()
-    except Exception as e: logger.exception(f"[AI] cb_main: {e}")
+        await _safe_edit(q, text, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] cb_main: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:close$"), group=-430)
 async def cb_close(client, q):
     try:
         _clear_session(q.from_user.id)
-        try: await q.message.delete()
-        except Exception: pass
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
         await q.answer("ᴄʟᴏꜱᴇᴅ")
     except Exception:
-        try: await q.answer("ᴄʟᴏꜱᴇᴅ")
-        except Exception: pass
+        try:
+            await q.answer("ᴄʟᴏꜱᴇᴅ")
+        except Exception:
+            pass
 
 
 @Client.on_callback_query(filters.regex(r"^ai:toggle_auto$"), group=-430)
 async def cb_toggle(client, q):
-    cur = await _get_setting("auto_mode", True)
-    await _set_setting("auto_mode", not cur)
-    await q.answer("🟢 ᴀᴜᴛᴏ ᴏɴ" if not cur else "🔴 ᴀᴜᴛᴏ ᴏꜰꜰ")
-    text, kb = await _view_main()
-    await _safe_edit(q, text, kb)
+    try:
+        cur = await _get_setting("auto_mode", True)
+        await _set_setting("auto_mode", not cur)
+        await q.answer("🟢 ᴀᴜᴛᴏ ᴏɴ" if not cur else "🔴 ᴀᴜᴛᴏ ᴏꜰꜰ")
+        text, kb = await _view_main()
+        await _safe_edit(q, text, kb)
+    except Exception as e:
+        logger.exception(f"[AI] toggle: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN
+# SCAN HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def _build_catalog_from_titles(titles: List[str]) -> SeriesCatalog:
+    """Take a list of titles, run engine search on each, build catalog."""
     cat = SeriesCatalog()
     for title in titles:
         try:
@@ -896,31 +919,38 @@ async def _build_catalog_from_titles(titles: List[str]) -> SeriesCatalog:
 
 
 async def _discover_all_series() -> List[str]:
-    """Discover all series titles by scanning shards + parsing filenames."""
+    """
+    Discover all series titles by scanning shards + parsing filenames.
+    FIXED: robust against missing 'type'/'normalized_series_title' fields.
+    """
     titles: Set[str] = set()
     try:
         from database import db_registry
         for entry in db_registry.media_entries():
             try:
                 pipeline = [
-                    {"$match": {"type": "series",
-                                 "normalized_series_title": {"$exists": True,
-                                                              "$ne": None}}},
+                    {"$match": {
+                        "normalized_series_title": {
+                            "$exists": True, "$ne": None, "$ne": ""
+                        }
+                    }},
                     {"$group": {"_id": "$normalized_series_title"}},
                     {"$limit": 500},
                 ]
                 async for doc in entry.db["media_files"].aggregate(pipeline):
                     t = doc.get("_id")
-                    if t: titles.add(t)
+                    if t and isinstance(t, str) and t.strip():
+                        titles.add(t.strip())
             except Exception as e:
-                logger.debug(f"[AI] shard discover: {e}")
+                logger.debug(f"[AI] discover shard err: {e}")
+                continue
     except Exception as e:
         logger.warning(f"[AI] discover: {e}")
     return sorted(titles)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AUTO SCAN
+# AUTO SCAN  ⭐ FIXED: passes uid, uses flat session
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:auto$"), group=-430)
 async def cb_auto(client, q):
@@ -929,10 +959,12 @@ async def cb_auto(client, q):
     try:
         _clear_session(q.from_user.id)
         await q.answer("🚀 ꜱᴄᴀɴɴɪɴɢ...")
+
         try:
             status = await q.message.edit_text(_view_scanning(0, 0),
                                                 parse_mode=ParseMode.HTML)
-        except Exception: status = q.message
+        except Exception:
+            status = q.message
 
         titles = await _discover_all_series()
         logger.info(f"[AI] discovered {len(titles)} unique series")
@@ -941,8 +973,10 @@ async def cb_auto(client, q):
             await client.edit_message_text(
                 chat_id=q.message.chat.id, message_id=status.id,
                 text=_view_scanning(len(titles), len(titles)),
-                parse_mode=ParseMode.HTML)
-        except Exception: pass
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
         cat = await _build_catalog_from_titles(titles)
         await _set_setting("total_series", len(cat.data))
@@ -964,26 +998,35 @@ async def cb_auto(client, q):
                         f"📊 {sc('total')} · <code>{len(cat.data)}</code>",
                     ]),
                     reply_markup=kb_back("ai:main"),
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         random.shuffle(pending)
         picked = pending[:SERIES_PER_AUTO]
 
-        _new_session(q.from_user.id, "auto_scan",
-                     picked=[s["title_slug"] for s in picked], index=0,
-                     chat_id=q.message.chat.id)
-        sess = _SESSIONS[q.from_user.id]
-        sess["catalog_data"] = cat.data
+        # FIXED: flat session + chat_id + picked + index
+        _new_session(
+            q.from_user.id, "auto_scan",
+            picked=[s["title_slug"] for s in picked],
+            index=0,
+            chat_id=q.message.chat.id,
+            catalog_data=cat.data,
+            current_index=1,
+            current_total=len(picked),
+        )
 
         await _show_series(client, q.message.chat.id, status.id,
                             picked[0]["title_slug"], 1, len(picked),
                             uid=q.from_user.id)
     except Exception as e:
         logger.exception(f"[AI] auto: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -993,27 +1036,37 @@ async def cb_auto(client, q):
 async def cb_manual(client, q):
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
-    _clear_session(q.from_user.id)
-    _new_session(q.from_user.id, "manual_name", chat_id=q.message.chat.id)
-    await _safe_edit(q, "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"✍️ <b>{fb('MANUAL SCAN')}</b>", DIV, "",
-        f"📝 {sc('send a name or short form')}", "",
-        f"📌 {sc('examples')}: <code>got</code> · <code>breaking bad</code>",
-        "", f"💡 {sc('bot suggests from tmdb')}",
-    ]), InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
-    await q.answer()
+    try:
+        _clear_session(q.from_user.id)
+        _new_session(q.from_user.id, "manual_name",
+                     chat_id=q.message.chat.id)
+        await _safe_edit(q, "\n".join([
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"✍️ <b>{fb('MANUAL SCAN')}</b>", DIV, "",
+            f"📝 {sc('send a name or short form')}", "",
+            f"📌 {sc('examples')}: <code>got</code> · <code>breaking bad</code>",
+            "", f"💡 {sc('bot suggests from tmdb')}",
+        ]), InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CANCEL", callback_data="ai:main")]]))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] manual: {e}")
 
 
-@Client.on_message(filters.private & filters.text & ~filters.regex(r"^/"), group=-429)
+@Client.on_message(
+    filters.private & filters.text & ~filters.regex(r"^/"),
+    group=-429,
+)
 async def ai_manual_input(client, message):
-    if not message.from_user: return
+    if not message.from_user:
+        return
     s = _get_session(message.from_user.id)
     if not s or s.get("action") != "manual_name":
         return
-    try: message.stop_propagation()
-    except Exception: pass
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
 
     text = (message.text or "").strip()
     if len(text) < 2:
@@ -1023,17 +1076,21 @@ async def ai_manual_input(client, message):
 
     try:
         loading = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ ᴛᴍᴅʙ...")
-    except Exception: return
+    except Exception:
+        return
 
     suggestions = await _tmdb_suggest(text)
 
+    # ── No TMDB → direct engine scan
     if not suggestions:
         try:
             await client.edit_message_text(
                 chat_id=message.chat.id, message_id=loading.id,
                 text="🔍 ᴛᴍᴅʙ ɴᴏ ʀᴇꜱᴜʟᴛ · ꜱᴄᴀɴɴɪɴɢ ᴅʙ...",
-                parse_mode=ParseMode.HTML)
-        except Exception: pass
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
         files = await _engine_search(text)
         if not files:
@@ -1047,8 +1104,10 @@ async def ai_manual_input(client, message):
                         f"📌 {sc('not in your db')}",
                     ]),
                     reply_markup=kb_back("ai:main"),
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         cat = SeriesCatalog()
@@ -1060,21 +1119,25 @@ async def ai_manual_input(client, message):
                     chat_id=message.chat.id, message_id=loading.id,
                     text="⚠️ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ ɪɴ ᴅʙ.",
                     reply_markup=kb_back("ai:main"),
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         _new_session(message.from_user.id, "manual_result",
-                     chat_id=message.chat.id)
-        sess = _SESSIONS[message.from_user.id]
-        sess["catalog_data"] = cat.data
+                     chat_id=message.chat.id,
+                     catalog_data=cat.data,
+                     current_index=1, current_total=1)
         slug0 = list(cat.data.keys())[0]
         await _show_series(client, message.chat.id, loading.id, slug0, 1, 1,
                             uid=message.from_user.id)
         return
 
+    # ── TMDB suggestions
     _new_session(message.from_user.id, "manual_tmdb_pick",
-                 suggestions=suggestions, chat_id=message.chat.id)
+                 suggestions=suggestions,
+                 chat_id=message.chat.id)
 
     lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
              f"🔎 <b>{fb('TMDB SUGGESTIONS')}</b>", DIV, "",
@@ -1091,8 +1154,10 @@ async def ai_manual_input(client, message):
             chat_id=message.chat.id, message_id=loading.id,
             text="\n".join(lines),
             reply_markup=kb_tmdb_suggest(suggestions),
-            parse_mode=ParseMode.HTML)
-    except Exception as e: logger.warning(f"[AI] suggest: {e}")
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning(f"[AI] suggest: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:pick_tmdb:(\d+)$"), group=-430)
@@ -1104,6 +1169,8 @@ async def cb_pick_tmdb(client, q):
         s = _get_session(q.from_user.id)
         if not s or s.get("action") != "manual_tmdb_pick":
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+
+        # FIXED: read flat 'suggestions', not nested s["data"]
         sugg = s.get("suggestions") or []
         if idx < 0 or idx >= len(sugg):
             return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
@@ -1116,7 +1183,8 @@ async def cb_pick_tmdb(client, q):
         try:
             await q.message.edit_text(_view_scanning(0, 0),
                                        parse_mode=ParseMode.HTML)
-        except Exception: pass
+        except Exception:
+            pass
 
         files = await _engine_search(title)
         if not files:
@@ -1133,11 +1201,15 @@ async def cb_pick_tmdb(client, q):
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("✍️ SEARCH AGAIN",
                                                callback_data="ai:manual")],
-                        [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
-                         InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
+                        [InlineKeyboardButton("◀️ MAIN",
+                                               callback_data="ai:main"),
+                         InlineKeyboardButton("❌ CLOSE",
+                                               callback_data="ai:close")],
                     ]),
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         cat = SeriesCatalog()
@@ -1149,20 +1221,23 @@ async def cb_pick_tmdb(client, q):
                     chat_id=q.message.chat.id, message_id=q.message.id,
                     text="⚠️ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ.",
                     reply_markup=kb_back("ai:main"),
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         _new_session(q.from_user.id, "manual_result",
-                     chat_id=q.message.chat.id)
-        sess = _SESSIONS[q.from_user.id]
-        sess["catalog_data"] = cat.data
+                     chat_id=q.message.chat.id,
+                     catalog_data=cat.data,
+                     current_index=1, current_total=1)
 
         slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
         best_slug = None
         for k in cat.data.keys():
             if slug in k or k in slug:
-                best_slug = k; break
+                best_slug = k
+                break
         if not best_slug:
             best_slug = list(cat.data.keys())[0]
 
@@ -1170,33 +1245,48 @@ async def cb_pick_tmdb(client, q):
                             best_slug, 1, 1, uid=q.from_user.id)
     except Exception as e:
         logger.exception(f"[AI] pick_tmdb: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SHOW SERIES  (FIXED: uid-based lookup)
+# SHOW SERIES  ⭐ FIXED: uid-based lookup (no more cross-user leak)
 # ═══════════════════════════════════════════════════════════════════════════
 async def _show_series(client, chat_id, msg_id, slug, i, t, uid=None):
-    # Prefer explicit uid, else match by chat_id
+    """
+    Show series overview.
+    FIXED: uses explicit uid when available; falls back to chat_id match.
+    """
     sess = _get_session(uid) if uid is not None else None
     if sess is None:
         for u, s in _SESSIONS.items():
             if s.get("chat_id") == chat_id and s.get("catalog_data"):
-                sess = s; uid = u; break
+                sess = s
+                uid = u
+                break
     if not sess or not sess.get("catalog_data"):
         try:
-            await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
-                text="⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ.", parse_mode=ParseMode.HTML)
-        except Exception: pass
+            await client.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="⚠️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     series = sess["catalog_data"].get(slug)
     if not series:
         try:
-            await client.edit_message_text(chat_id=chat_id, message_id=msg_id,
-                text="⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ.", parse_mode=ParseMode.HTML)
-        except Exception: pass
+            await client.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     prefs = await _get_prefs(slug)
@@ -1211,24 +1301,34 @@ async def _show_series(client, chat_id, msg_id, slug, i, t, uid=None):
         await client.edit_message_text(
             chat_id=chat_id, message_id=msg_id,
             text=text, reply_markup=kb, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True)
-    except MessageNotModified: pass
-    except Exception as e: logger.debug(f"[AI] show_series: {e}")
+            disable_web_page_preview=True,
+        )
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.debug(f"[AI] show_series: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:next:([a-z0-9_]+)$"), group=-430)
 async def cb_next(client, q):
     try:
         s = _get_session(q.from_user.id)
-        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        if not s:
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+
+        # FIXED: read flat 'picked'/'index', not s["data"]
         picked = s.get("picked") or []
         i = s.get("index", 0) + 1
-        if i >= len(picked): return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
+        if i >= len(picked):
+            return await q.answer("✅ ᴀʟʟ ᴅᴏɴᴇ", show_alert=True)
+
         s["index"] = i
         await q.answer()
         await _show_series(client, q.message.chat.id, q.message.id,
-                            picked[i], i + 1, len(picked), uid=q.from_user.id)
-    except Exception as e: logger.exception(f"[AI] next: {e}")
+                            picked[i], i + 1, len(picked),
+                            uid=q.from_user.id)
+    except Exception as e:
+        logger.exception(f"[AI] next: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1242,7 +1342,8 @@ async def cb_grid(client, q):
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
         prefs = await _get_prefs(slug)
         text = _view_quality_grid(series, prefs)
         kb = InlineKeyboardMarkup([
@@ -1253,8 +1354,10 @@ async def cb_grid(client, q):
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] grid: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1268,7 +1371,8 @@ async def cb_eps(client, q):
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
 
         seasons = series.get("seasons") or {}
         if not seasons:
@@ -1279,7 +1383,8 @@ async def cb_eps(client, q):
             eps = seasons[sn]
             for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
                 qmap = eps[ep]
-                ep_label = f"S{sn:02d}E{ep:02d}" if ep is not None else f"S{sn:02d}"
+                ep_label = (f"S{sn:02d}E{ep:02d}"
+                            if ep is not None else f"S{sn:02d}")
                 if len(qmap) >= 2:
                     icon = "🟢"
                 elif qmap:
@@ -1290,8 +1395,10 @@ async def cb_eps(client, q):
                     f"{icon} {ep_label} · {len(qmap)} ǫᴜᴀʟ",
                     callback_data=f"ai:epq:{slug}:{sn}:"
                                    f"{ep if ep is not None else 0}")])
-        rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
-                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+        rows.append([InlineKeyboardButton("◀️ BACK",
+                                           callback_data=f"ai:view:{slug}"),
+                     InlineKeyboardButton("❌ CLOSE",
+                                           callback_data="ai:close")])
 
         lines = [
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -1305,17 +1412,24 @@ async def cb_eps(client, q):
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] eps: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 async def _render_epq(client, q, slug, season, episode):
-    """Render the per-episode quality picker (no q.answer())."""
+    """
+    Render the per-episode quality picker WITHOUT answering the query.
+    FIXED: extracted so cb_del_go can call it after q.answer().
+    Returns True if rendered, False otherwise.
+    """
     s = _get_session(q.from_user.id)
     if not s or not s.get("catalog_data"):
         return False
     series = s["catalog_data"].get(slug)
-    if not series: return False
+    if not series:
+        return False
 
     eps = (series.get("seasons") or {}).get(season, {})
     qmap = eps.get(episode, {})
@@ -1327,22 +1441,26 @@ async def _render_epq(client, q, slug, season, episode):
 
     rows = []
     qs_sorted = sorted(qmap.keys(),
-                        key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+                       key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
     for i, q_key in enumerate(qs_sorted):
         rows.append([InlineKeyboardButton(
             f"🗑️ DELETE {q_key}",
             callback_data=f"ai:del_pick:{slug}:{season}:"
                            f"{episode if episode is not None else 0}:"
                            f"{q_key}:{i}")])
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:eps:{slug}"),
-                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+    rows.append([InlineKeyboardButton("◀️ BACK",
+                                       callback_data=f"ai:eps:{slug}"),
+                 InlineKeyboardButton("❌ CLOSE",
+                                       callback_data="ai:close")])
 
     await _safe_edit(q, text, InlineKeyboardMarkup(rows))
     return True
 
 
 @Client.on_callback_query(
-    filters.regex(r"^ai:epq:([a-z0-9_]+):(\d+):(\d+)$"), group=-430)
+    filters.regex(r"^ai:epq:([a-z0-9_]+):(\d+):(\d+)$"),
+    group=-430,
+)
 async def cb_epq(client, q):
     try:
         slug = q.matches[0].group(1)
@@ -1355,26 +1473,30 @@ async def cb_epq(client, q):
         ok = await _render_epq(client, q, slug, season, episode)
         if not ok:
             return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ᴇᴘɪꜱᴏᴅᴇ",
-                                    show_alert=True)
+                                   show_alert=True)
         await q.answer()
     except Exception as e:
         logger.exception(f"[AI] epq: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW  (unchanged)
+# VIEW (backwards-compat — jumps to grid)
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
 async def cb_view(client, q):
+    """Jump to series overview (from series list)."""
     try:
         slug = q.matches[0].group(1)
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
         prefs = await _get_prefs(slug)
         text = _view_series_overview(series, prefs,
                                       s.get("current_index", 1),
@@ -1383,11 +1505,11 @@ async def cb_view(client, q):
                                 s.get("current_total", 1))
         await _safe_edit(q, text, kb)
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] view: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] view: {e}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PREFS / COMPLETE / DELETE
+    # ═══════════════════════════════════════════════════════════════════════════
+# PREFS
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
 async def cb_pref(client, q):
@@ -1397,44 +1519,53 @@ async def cb_pref(client, q):
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
         avail = set()
         for _, eps in (series.get("seasons") or {}).items():
             for _, qmap in eps.items():
                 for q_key in qmap.keys():
                     avail.add(q_key)
         al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
-        if not al: return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
+        if not al:
+            return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
+
         cur = await _get_prefs(slug)
         s["pref_working"] = list(cur)
-        await _safe_edit(q,
+        await _safe_edit(
+            q,
             _view_quality_picker(series.get("title"), al, cur),
-            kb_quality_picker(slug, al, cur))
+            kb_quality_picker(slug, al, cur),
+        )
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] pref: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] pref: {e}")
 
 
-def _view_quality_picker(title, avail, cur):
-    return "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🎯 <b>{fb('QUALITY PREFS')}</b>",
-        DIV, "",
-        f"🎬 <b>{_esc(title)}</b>", "",
-        f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
-        f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>",
-    ])
-
-
-@Client.on_callback_query(filters.regex(r"^ai:pref_tog:([a-z0-9_]+):(\w+)$"), group=-430)
+@Client.on_callback_query(
+    filters.regex(r"^ai:pref_tog:([a-z0-9_]+):([A-Za-z0-9]+)$"),
+    group=-430,
+)
 async def cb_pref_tog(client, q):
+    """
+    FIXED: regex now matches uppercase quality tokens (e.g. 1080P, 4K, UNKNOWN).
+    Original r'(\w+)' technically matched, but being explicit is safer.
+    """
     try:
-        slug = q.matches[0].group(1); qual = q.matches[0].group(2)
+        slug = q.matches[0].group(1)
+        qual = q.matches[0].group(2)
         s = _get_session(q.from_user.id)
-        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        if not s:
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+
         w = s.get("pref_working") or []
-        if qual in w: w.remove(qual)
-        else: w.append(qual)
+        if qual in w:
+            w.remove(qual)
+        else:
+            w.append(qual)
         s["pref_working"] = w
+
         series = (s.get("catalog_data") or {}).get(slug) or {}
         avail = set()
         for _, eps in (series.get("seasons") or {}).items():
@@ -1442,29 +1573,42 @@ async def cb_pref_tog(client, q):
                 for q_key in qmap.keys():
                     avail.add(q_key)
         al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
-        await _safe_edit(q, _view_quality_picker(series.get("title"), al, w),
-                          kb_quality_picker(slug, al, w))
+
+        await _safe_edit(
+            q,
+            _view_quality_picker(series.get("title"), al, w),
+            kb_quality_picker(slug, al, w),
+        )
         await q.answer("✅" if qual in w else "⬜")
-    except Exception as e: logger.exception(f"[AI] pref_tog: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] pref_tog: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:pref_save:([a-z0-9_]+)$"), group=-430)
+@Client.on_callback_query(
+    filters.regex(r"^ai:pref_save:([a-z0-9_]+)$"),
+    group=-430,
+)
 async def cb_pref_save(client, q):
     try:
         slug = q.matches[0].group(1)
         s = _get_session(q.from_user.id)
-        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        if not s:
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         w = s.get("pref_working") or []
         series = (s.get("catalog_data") or {}).get(slug) or {}
         title = series.get("title") or slug
         ok = await _set_prefs(slug, title, w)
         await q.answer("✅ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
-        if not ok: return
-        await _show_series(client, q.message.chat.id, q.message.id, slug,
-                            s.get("current_index", 1),
-                            s.get("current_total", 1),
-                            uid=q.from_user.id)
-    except Exception as e: logger.exception(f"[AI] pref_save: {e}")
+        if not ok:
+            return
+        await _show_series(
+            client, q.message.chat.id, q.message.id, slug,
+            s.get("current_index", 1),
+            s.get("current_total", 1),
+            uid=q.from_user.id,
+        )
+    except Exception as e:
+        logger.exception(f"[AI] pref_save: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:prefs$"), group=-430)
@@ -1473,44 +1617,72 @@ async def cb_prefs(client, q):
         return await q.answer("⛔", show_alert=True)
     try:
         items = await _list_prefs()
-        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                 f"🎯 <b>{fb('QUALITY PREFS')}</b>", DIV, ""]
-        if not items: lines.append("⚪ ɴᴏɴᴇ ꜱᴇᴛ.")
+        lines = [
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"🎯 <b>{fb('QUALITY PREFS')}</b>",
+            DIV, "",
+        ]
+        if not items:
+            lines.append("⚪ ɴᴏɴᴇ ꜱᴇᴛ.")
         else:
             for it in items[:30]:
                 lines.append(f"🎬 <b>{_esc(it.get('title'))}</b>")
-                lines.append(f"   ✅ <code>{', '.join(it.get('keep_qualities') or [])}</code>")
+                lines.append(
+                    f"   ✅ <code>"
+                    f"{', '.join(it.get('keep_qualities') or [])}"
+                    f"</code>"
+                )
                 lines.append("")
         await _safe_edit(q, "\n".join(lines), kb_back("ai:main"))
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] prefs: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] prefs: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:complete:([a-z0-9_]+)$"), group=-430)
+# ═══════════════════════════════════════════════════════════════════════════
+# MARK COMPLETE
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^ai:complete:([a-z0-9_]+)$"),
+    group=-430,
+)
 async def cb_complete(client, q):
     try:
         slug = q.matches[0].group(1)
         s = _get_session(q.from_user.id)
-        if not s: return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        if not s:
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = (s.get("catalog_data") or {}).get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        ok = await _mark_completed(series.get("title", slug), slug,
-                                     series.get("file_count", 0))
-        if not ok: return await q.answer("❌ ꜰᴀɪʟᴇᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
+        ok = await _mark_completed(
+            series.get("title", slug), slug, series.get("file_count", 0)
+        )
+        if not ok:
+            return await q.answer("❌ ꜰᴀɪʟᴇᴅ", show_alert=True)
+
         await q.answer("✅ ᴍᴀʀᴋᴇᴅ")
         await _safe_edit(q, "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"✅ <b>{fb('MARKED COMPLETE')}</b>", DIV, "",
+            f"✅ <b>{fb('MARKED COMPLETE')}</b>",
+            DIV, "",
             f"🎬 <b>{_esc(series.get('title'))}</b>",
             f"📁 <code>{_fmt_int(series.get('file_count', 0))}</code> ꜰɪʟᴇꜱ",
             f"📅 <code>{_now_ist()}</code>",
         ]), InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭️ NEXT", callback_data=f"ai:next:{slug}")],
+            [InlineKeyboardButton("⏭️ NEXT",
+                                   callback_data=f"ai:next:{slug}")],
             [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
-             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]]))
-    except Exception as e: logger.exception(f"[AI] complete: {e}")
+             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
+        ]))
+    except Exception as e:
+        logger.exception(f"[AI] complete: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ALL SERIES  ⭐ FIXED: creates proper session via _new_session
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:all$"), group=-430)
 async def cb_all(client, q):
     if not _is_admin(q.from_user.id):
@@ -1518,10 +1690,13 @@ async def cb_all(client, q):
     try:
         _clear_session(q.from_user.id)
         await q.answer("🔍 ʟᴏᴀᴅɪɴɢ...")
+
         try:
-            status = await q.message.edit_text(_view_scanning(0, 0),
-                                                parse_mode=ParseMode.HTML)
-        except Exception: status = q.message
+            status = await q.message.edit_text(
+                _view_scanning(0, 0), parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            status = q.message
 
         titles = await _discover_all_series()
         cat = await _build_catalog_from_titles(titles)
@@ -1530,50 +1705,90 @@ async def cb_all(client, q):
         all_s = cat.list_series()
         if not all_s:
             try:
-                await client.edit_message_text(chat_id=q.message.chat.id,
-                    message_id=status.id, text="⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ.",
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
+                await client.edit_message_text(
+                    chat_id=q.message.chat.id, message_id=status.id,
+                    text="⚪ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
-        _new_session(q.from_user.id, "all_series",
-                     chat_id=q.message.chat.id)
-        sess = _SESSIONS[q.from_user.id]
-        sess["catalog_data"] = cat.data
+        # FIXED: proper session (has expires + chat_id)
+        _new_session(
+            q.from_user.id, "all_series",
+            chat_id=q.message.chat.id,
+            catalog_data=cat.data,
+            current_index=1,
+            current_total=len(all_s),
+        )
 
         comp = {s.get("title_slug") for s in await _list_completed()}
-        lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                 f"📚 <b>{fb('ALL SERIES')}</b>", DIV, "",
-                 f"📊 <code>{len(all_s)}</code> · ✅ <code>{len(comp)}</code>",
-                 "", DIV2, ""]
+        lines = [
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"📚 <b>{fb('ALL SERIES')}</b>",
+            DIV, "",
+            f"📊 <code>{len(all_s)}</code> · ✅ <code>{len(comp)}</code>",
+            "", DIV2, "",
+        ]
         for s in all_s[:25]:
             mk = "✅" if s["title_slug"] in comp else "🎬"
-            lines.append(f"{mk} <b>{_esc(s['title'])}</b> · <code>{s['file_count']}</code>")
+            lines.append(
+                f"{mk} <b>{_esc(s['title'])}</b> · "
+                f"<code>{s['file_count']}</code>"
+            )
         try:
-            await client.edit_message_text(chat_id=q.message.chat.id,
-                message_id=status.id, text="\n".join(lines),
+            await client.edit_message_text(
+                chat_id=q.message.chat.id, message_id=status.id,
+                text="\n".join(lines),
                 reply_markup=kb_series_list(all_s),
-                parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except Exception: pass
-    except Exception as e: logger.exception(f"[AI] all: {e}")
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception(f"[AI] all: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPLETED LIST
+# ═══════════════════════════════════════════════════════════════════════════
 async def _render_completed(q):
+    """
+    Render the completed list WITHOUT answering the callback.
+    FIXED: extracted so cb_unmark doesn't double-answer.
+    """
     items = await _list_completed(50)
-    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-             f"✅ <b>{fb('COMPLETED')}</b>", DIV, ""]
-    if not items: lines.append("⚪ ɴᴏɴᴇ ʏᴇᴛ.")
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"✅ <b>{fb('COMPLETED')}</b>",
+        DIV, "",
+    ]
+    if not items:
+        lines.append("⚪ ɴᴏɴᴇ ʏᴇᴛ.")
     else:
         for it in items[:30]:
             ts = it.get("completed_at", 0)
-            try: d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
-            except Exception: d = "?"
-            lines.append(f"✅ <b>{_esc(it.get('title'))}</b> · <code>{d}</code>")
-    rows = [[InlineKeyboardButton(f"🔄 UNMARK · {(it.get('title') or '?')[:25]}",
-                                   callback_data=f"ai:unmark:{it.get('title_slug')}")]
-            for it in items[:10]]
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
-                 InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+            try:
+                d = datetime.fromtimestamp(ts, IST).strftime("%d %b %Y")
+            except Exception:
+                d = "?"
+            lines.append(
+                f"✅ <b>{_esc(it.get('title'))}</b> · <code>{d}</code>"
+            )
+
+    rows = [
+        [InlineKeyboardButton(
+            f"🔄 UNMARK · {(it.get('title') or '?')[:25]}",
+            callback_data=f"ai:unmark:{it.get('title_slug')}",
+        )]
+        for it in items[:10]
+    ]
+    rows.append([
+        InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
+        InlineKeyboardButton("❌ CLOSE", callback_data="ai:close"),
+    ])
     await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1584,25 +1799,37 @@ async def cb_comp(client, q):
     try:
         await _render_completed(q)
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] comp: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] comp: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:unmark:([a-z0-9_]+)$"), group=-430)
+@Client.on_callback_query(
+    filters.regex(r"^ai:unmark:([a-z0-9_]+)$"),
+    group=-430,
+)
 async def cb_unmark(client, q):
+    """
+    FIXED: no longer calls cb_comp (which would double-answer).
+    Uses _render_completed helper instead.
+    """
     try:
         slug = q.matches[0].group(1)
         ok = await _unmark_completed(slug)
         await q.answer("✅ ᴜɴᴍᴀʀᴋᴇᴅ" if ok else "❌ ɴᴏᴛ ꜰᴏᴜɴᴅ")
         await _render_completed(q)
-    except Exception as e: logger.exception(f"[AI] unmark: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] unmark: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DELETE FILE  (FIXED: no double answer)
+# DELETE FILE  ⭐ FIXED: no double-answer via _render_epq
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(
-    filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\w+):(\d+)$"),
-    group=-430)
+    filters.regex(
+        r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):([A-Za-z0-9]+):(\d+)$"
+    ),
+    group=-430,
+)
 async def cb_del_pick(client, q):
     try:
         slug = q.matches[0].group(1)
@@ -1611,18 +1838,24 @@ async def cb_del_pick(client, q):
         qual = q.matches[0].group(4)
         idx = int(q.matches[0].group(5))
         ep = ep_raw if ep_raw > 0 else None
+
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
         qmap = ((series.get("seasons") or {}).get(sn) or {}).get(ep, {})
         f = qmap.get(qual)
-        if not f: return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
-                                          show_alert=True)
+        if not f:
+            return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
+                                   show_alert=True)
+
         ep_label = f"S{sn:02d}" + (f"E{ep:02d}" if ep else "")
         langs = "+".join(f.get("languages", [])) or "?"
         size = _fmt_size(f.get("file_size", 0))
+
         text = "\n".join([
             f"⚠️ <b>{fb('CONFIRM DELETE')}</b>",
             DIV, "",
@@ -1630,16 +1863,21 @@ async def cb_del_pick(client, q):
             f"🎯 {sc('quality')} · <code>{qual}</code>",
             f"🌍 {sc('languages')} · <code>{langs}</code>",
             f"📦 {sc('size')} · <code>{size}</code>",
-            "",
-            DIV2, "",
+            "", DIV2, "",
             f"❗ <b>{sc('this cannot be undone')}</b>",
         ])
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ YES, DELETE",
+            [InlineKeyboardButton(
+                "✅ YES, DELETE",
                 callback_data=f"ai:del_go:{slug}:{sn}:"
-                               f"{ep if ep is not None else 0}:{qual}:{idx}")],
-            [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:epq:{slug}:{sn}:"
-                                                              f"{ep if ep is not None else 0}")],
+                               f"{ep if ep is not None else 0}:"
+                               f"{qual}:{idx}",
+            )],
+            [InlineKeyboardButton(
+                "❌ CANCEL",
+                callback_data=f"ai:epq:{slug}:{sn}:"
+                               f"{ep if ep is not None else 0}",
+            )],
         ])
         await _safe_edit(q, text, kb)
         await q.answer()
@@ -1648,41 +1886,60 @@ async def cb_del_pick(client, q):
 
 
 @Client.on_callback_query(
-    filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\w+):(\d+)$"),
-    group=-430)
+    filters.regex(
+        r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):([A-Za-z0-9]+):(\d+)$"
+    ),
+    group=-430,
+)
 async def cb_del_go(client, q):
     try:
         slug = q.matches[0].group(1)
         sn = int(q.matches[0].group(2))
         ep_raw = int(q.matches[0].group(3))
         qual = q.matches[0].group(4)
-        idx = int(q.matches[0].group(5))
+        # idx = int(q.matches[0].group(5))  # not needed — using qual lookup
         ep = ep_raw if ep_raw > 0 else None
+
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
-        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        if not series:
+            return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
         qmap = ((series.get("seasons") or {}).get(sn) or {}).get(ep, {})
         f = qmap.get(qual)
-        if not f: return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
-                                          show_alert=True)
-        fid = f.get("file_id") or f.get("file_unique_id") or ""
-        if not fid: return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
-        ok = await _delete_file_record(fid)
-        if not ok: return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
+        if not f:
+            return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
+                                   show_alert=True)
 
-        del s["catalog_data"][slug]["seasons"][sn][ep][qual]
-        s["catalog_data"][slug]["file_count"] = max(
-            0, s["catalog_data"][slug]["file_count"] - 1)
+        # FIXED: fall back to file_unique_id if file_id empty
+        fid = f.get("file_id") or f.get("file_unique_id") or ""
+        if not fid:
+            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
+
+        ok = await _delete_file_record(fid)
+        if not ok:
+            return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
+
+        # Remove from in-memory catalog
+        try:
+            del s["catalog_data"][slug]["seasons"][sn][ep][qual]
+            s["catalog_data"][slug]["file_count"] = max(
+                0, s["catalog_data"][slug]["file_count"] - 1
+            )
+        except Exception as e:
+            logger.debug(f"[AI] catalog prune: {e}")
 
         await q.answer("🗑️ ᴅᴇʟᴇᴛᴇᴅ")
-        # Re-render without answering again
+        # FIXED: use _render_epq (which does NOT answer again)
         await _render_epq(client, q, slug, sn, ep)
     except Exception as e:
         logger.exception(f"[AI] del_go: {e}")
-        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
-        except Exception: pass
+        try:
+            await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1703,8 +1960,10 @@ async def _daily_loop(client):
                     and now.minute < 5 and _LAST_REPORT != key):
                 _LAST_REPORT = key
                 await _send_report(client)
-        except asyncio.CancelledError: break
-        except Exception as e: logger.warning(f"[AI] daily: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"[AI] daily: {e}")
         await asyncio.sleep(60)
 
 
@@ -1714,11 +1973,13 @@ async def _send_report(client):
         total = await _get_setting("total_series", 0)
         text = "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"🎛️ <b>{fb('DAILY AI REPORT')}</b>", DIV, "",
+            f"🎛️ <b>{fb('DAILY AI REPORT')}</b>",
+            DIV, "",
             f"📅 <code>{_now_ist()}</code>", "",
             f"📚 {sc('total')} · <code>{_fmt_int(total)}</code>",
             f"✅ {sc('completed')} · <code>{_fmt_int(comp)}</code>",
-            f"⏳ {sc('pending')} · <code>{_fmt_int(max(0, total - comp))}</code>",
+            f"⏳ {sc('pending')} · "
+            f"<code>{_fmt_int(max(0, total - comp))}</code>",
             "", DIV2, "",
             f"📌 {sc('tap auto to review 3 series')}",
         ])
@@ -1726,16 +1987,22 @@ async def _send_report(client):
             [InlineKeyboardButton("🚀 AUTO", callback_data="ai:auto"),
              InlineKeyboardButton("✍️ MANUAL", callback_data="ai:manual")],
             [InlineKeyboardButton("🎛️ PANEL", callback_data="ai:main"),
-             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]])
+             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
+        ])
         for a in ADMINS:
             try:
                 aid = int(a) if str(a).lstrip("-").isdigit() else None
-                if not aid: continue
-                await client.send_message(aid, text, reply_markup=kb,
-                                           parse_mode=ParseMode.HTML,
-                                           disable_web_page_preview=True)
-            except Exception: pass
-    except Exception as e: logger.warning(f"[AI] report: {e}")
+                if not aid:
+                    continue
+                await client.send_message(
+                    aid, text, reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.debug(f"[AI] report to {a}: {e}")
+    except Exception as e:
+        logger.warning(f"[AI] report: {e}")
 
 
 @Client.on_callback_query(filters.regex(r"^ai:last_report$"), group=-430)
@@ -1747,34 +2014,56 @@ async def cb_last(client, q):
         total = await _get_setting("total_series", 0)
         await _safe_edit(q, "\n".join([
             f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-            f"📊 <b>{fb('STATUS')}</b>", DIV, "",
-            f"📚 <code>{_fmt_int(total)}</code> · ✅ <code>{_fmt_int(comp)}</code>",
-            "", f"🕒 <code>{_now_ist()}</code>"]), kb_back("ai:main"))
+            f"📊 <b>{fb('STATUS')}</b>",
+            DIV, "",
+            f"📚 <code>{_fmt_int(total)}</code> · "
+            f"✅ <code>{_fmt_int(comp)}</code>",
+            "",
+            f"🕒 <code>{_now_ist()}</code>",
+        ]), kb_back("ai:main"))
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] last: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] last: {e}")
 
 
 async def _cleanup_loop():
     while True:
         try:
-            await asyncio.sleep(600); _cleanup_sessions()
-        except asyncio.CancelledError: break
-        except Exception: pass
+            await asyncio.sleep(600)
+            _cleanup_sessions()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
 
 _BOOTED = False
 
+
 @Client.on_message(filters.private, group=-428)
 async def _boot(client, message):
+    """
+    Start background loops on first private message.
+    FIXED: uses get_running_loop() (get_event_loop is deprecated in 3.10+).
+    """
     global _BOOTED
-    if _BOOTED: return
+    if _BOOTED:
+        return
     _BOOTED = True
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_daily_loop(client))
         loop.create_task(_cleanup_loop())
-        logger.info("[AI] loops started")
-    except Exception as e: logger.warning(f"[AI] boot: {e}")
+        logger.info("[AI] background loops started")
+    except Exception as e:
+        logger.warning(f"[AI] boot: {e}")
 
 
 logger.info("🎛️ AI LIBRARIAN v4 LOADED — same engine as series group")
+    
+    
+
+
+
+    
+    return _dedupe_by_episode(all_files)
