@@ -980,11 +980,46 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             uid = message.from_user.id
             logger.info(f"[SG] search: {txt!r} from {uid}")
 
+            # ⭐ PREMIUM CHECK — before normal flow
+            try:
+                from plugins.premium_watch import (
+                    is_premium, handle_premium_group_search
+                )
+                _is_prem = await is_premium(uid)
+                logger.info(f"[SG] user {uid} premium={_is_prem}")
+            except Exception as e:
+                logger.debug(f"[SG] premium import: {e}")
+                _is_prem = False
+                handle_premium_group_search = None
+
             try:
                 status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ...")
             except Exception: return
 
             db_match = await _smart_db_search(txt)
+
+            # ⭐ PREMIUM + DB HIT → redirect to PM
+            if _is_prem and db_match and handle_premium_group_search:
+                try:
+                    tmdb_pre = await _tmdb_search_series(txt)
+                    if not tmdb_pre:
+                        tmdb_pre = await _tmdb_search_series(
+                            db_match.get("matched_title") or txt
+                        )
+                    handled = await handle_premium_group_search(
+                        client, message, txt, db_match, tmdb_pre or []
+                    )
+                    # delete the "searching..." status
+                    try: await status.delete()
+                    except Exception: pass
+                    if handled:
+                        return
+                except Exception as e:
+                    logger.exception(f"[SG] premium hook: {e}")
+                    try: await status.delete()
+                    except Exception: pass
+
+            # ── NORMAL FLOW (unchanged) ─────────────────────────────
             if db_match:
                 matched_title = db_match["matched_title"]
                 hits = db_match["hits"]
@@ -1367,7 +1402,7 @@ async def cb_fsub_check(client, q):
 # ═══════════════════════════════════════════════════════════════════════════
 # PM /start HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_message(filters.command("start") & filters.private, group=-9999)
+@Client.on_message(filters.command("start") & filters.private, group=-9998)
 async def pm_start_handler(client, message):
     try:
         uid = message.from_user.id if message.from_user else None
