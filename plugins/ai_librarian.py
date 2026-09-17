@@ -1,5 +1,15 @@
 # plugins/ai_librarian.py
-"""🎛️ AI LIBRARIAN v3 — uses media_search engine + shard scan + TMDB suggest"""
+"""
+🎛️ AI LIBRARIAN v4 — uses SERIES GROUP engine (same quality detection)
+
+Features:
+- Same engine + parser as plugins/series_group.py
+- Sees ALL qualities (480p/720p/1080p/etc.)
+- Episode × quality grid with 🟢/🟡/🔴 status
+- Per-series quality prefs
+- Auto-scan, manual scan, mark complete
+- Delete individual files
+"""
 import asyncio
 import logging
 import os
@@ -13,7 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import MessageNotModified
+from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -28,6 +38,9 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
@@ -38,6 +51,9 @@ PROGRESS_UPDATE_INTERVAL = 2.0
 
 DIV = "━" * 26
 DIV2 = "─" * 26
+
+# Priority order of qualities (highest first)
+QUALITY_ORDER = ["4320P", "2160P", "1440P", "1080P", "720P", "576P", "480P", "360P"]
 
 QUALITY_RANK = {
     "4320P": 100, "8K": 100, "2160P": 90, "4K": 90, "UHD": 90,
@@ -104,22 +120,12 @@ def _get_db():
     try: return db_manager._db
     except Exception: return None
 
-def _get_client():
-    try: return db_manager._client or db_manager.client
-    except Exception: return None
-
-
 def _completed_coll():
-    d = _get_db()
-    return d["ai_completed"] if d is not None else None
-
+    d = _get_db(); return d["ai_completed"] if d is not None else None
 def _settings_coll():
-    d = _get_db()
-    return d["ai_settings"] if d is not None else None
-
+    d = _get_db(); return d["ai_settings"] if d is not None else None
 def _prefs_coll():
-    d = _get_db()
-    return d["ai_prefs"] if d is not None else None
+    d = _get_db(); return d["ai_prefs"] if d is not None else None
 
 
 async def _get_setting(key, default=None):
@@ -178,20 +184,28 @@ async def _count_completed():
 
 
 async def _delete_file_record(file_id):
-    """Delete by file_id or file_unique_id across shards."""
+    """Delete by file_id across all media shards."""
     if not file_id: return False
-    colls = await _all_file_collections()
-    deleted = False
-    for _, coll in colls:
-        try:
-            r = await coll.delete_one({"file_id": file_id})
-            if r.deleted_count > 0: deleted = True; continue
-            r = await coll.delete_one({"file_unique_id": file_id})
-            if r.deleted_count > 0: deleted = True
-        except Exception: continue
-    return deleted
+    try:
+        from database import db_registry
+        deleted = False
+        for entry in db_registry.media_entries():
+            try:
+                r = await entry.db["media_files"].delete_one({"file_id": file_id})
+                if r.deleted_count > 0:
+                    deleted = True; continue
+                r = await entry.db["media_files"].delete_one(
+                    {"file_unique_id": file_id})
+                if r.deleted_count > 0: deleted = True
+            except Exception:
+                continue
+        return deleted
+    except Exception as e:
+        logger.warning(f"[AI] delete_file: {e}")
+        return False
 
 
+# ─── Series quality prefs ───
 async def _get_prefs(slug):
     c = _prefs_coll()
     if c is None: return []
@@ -220,95 +234,6 @@ async def _list_prefs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ALL FILE COLLECTIONS — tries media_files_repo + shards + raw
-# ═══════════════════════════════════════════════════════════════════════════
-async def _all_file_collections():
-    results = []
-    seen_ids = set()
-
-    def _add(name, c):
-        try:
-            key = str(id(c))
-        except Exception:
-            key = name
-        if key in seen_ids: return
-        if not hasattr(c, "find"): return
-        seen_ids.add(key)
-        results.append((name, c))
-
-    # 1. Try media_files_repo
-    try:
-        from database.media.files import media_files_repo
-        for attr in ("collection", "_coll", "_collection", "coll", "col"):
-            c = getattr(media_files_repo, attr, None)
-            if c is not None and hasattr(c, "find"):
-                _add(f"media_files_repo.{attr}", c)
-                break
-    except Exception as e:
-        logger.debug(f"[AI] media_files_repo: {e}")
-
-    # 2. Try media_router shards
-    try:
-        from database.media.routing import media_router
-        for attr in ("_dbs", "_shards", "shards", "_collections"):
-            val = getattr(media_router, attr, None)
-            if isinstance(val, dict):
-                for k, v in val.items():
-                    if hasattr(v, "find"):
-                        _add(f"router.{k}", v)
-                    elif hasattr(v, "list_collection_names"):
-                        for cn in ("media_files", "files", "media"):
-                            try:
-                                _add(f"router.{k}.{cn}", v[cn])
-                            except Exception: pass
-            elif isinstance(val, (list, tuple)):
-                for i, v in enumerate(val):
-                    if hasattr(v, "find"):
-                        _add(f"router.shard_{i}", v)
-    except Exception as e:
-        logger.debug(f"[AI] media_router: {e}")
-
-    # 3. Raw client scan — ALL databases, file-like collections
-    client = _get_client()
-    if client is not None:
-        try:
-            dbs = await client.list_database_names()
-        except Exception:
-            dbs = []
-        patterns = ("media", "file", "shard", "movie", "series", "content")
-        for db_name in dbs:
-            if db_name in ("admin", "local", "config"): continue
-            try:
-                db = client[db_name]
-                colls = await db.list_collection_names()
-            except Exception: continue
-            for cname in colls:
-                cl = cname.lower()
-                if cname.startswith("ai_"): continue
-                if any(p in cl for p in patterns):
-                    try: _add(f"{db_name}.{cname}", db[cname])
-                    except Exception: pass
-
-    # 4. Fallback: default media DB collections
-    if not results:
-        d = _get_db()
-        if d is not None:
-            try:
-                colls = await d.list_collection_names()
-                for cname in colls:
-                    cl = cname.lower()
-                    if cname.startswith("ai_"): continue
-                    if any(p in cl for p in ("media", "file", "shard",
-                                              "movie", "series")):
-                        try: _add(f"db.{cname}", d[cname])
-                        except Exception: pass
-            except Exception: pass
-
-    logger.info(f"[AI] found {len(results)} file collections")
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # SESSIONS
 # ═══════════════════════════════════════════════════════════════════════════
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
@@ -333,287 +258,209 @@ def _cleanup_sessions():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PARSER (unchanged, works)
+# ⭐⭐ SAME ENGINE AS SERIES GROUP ⭐⭐
 # ═══════════════════════════════════════════════════════════════════════════
-SE_PATTERNS = [
+async def _engine_search(title, season=None, language=None, quality=None):
+    """EXACTLY the same as series_group._engine_search"""
+    try:
+        from media_search.engine import engine
+        from media_search.normalizer import normalize
+    except Exception as e:
+        logger.exception(f"[AI] engine import failed: {e}")
+        return []
+
+    all_files = []
+    try:
+        norm = normalize(title)
+        result = await engine.search_series(norm)
+        hits = result.hits
+        if not hits:
+            result = await engine.search_any(norm)
+            hits = result.hits
+
+        logger.info(f"[AI] engine: {len(hits)} hits for {norm!r}")
+
+        for h in hits:
+            h_season = getattr(h, "season", None)
+            h_episode = getattr(h, "episode", None)
+            h_quality = getattr(h, "quality", None)
+            h_langs = list(getattr(h, "audio_languages", []) or [])
+            file_name = getattr(h, "file_name", "") or ""
+
+            if h_season is None or h_episode is None or not h_quality or not h_langs:
+                p = _parse_filename_light(file_name)
+                if h_season is None: h_season = p.get("season")
+                if h_episode is None: h_episode = p.get("episode")
+                if not h_quality: h_quality = p.get("quality")
+                if not h_langs: h_langs = p.get("languages") or []
+
+            if season is not None and h_season != season: continue
+            if language:
+                ll = language.lower()
+                hl = [l.lower() for l in h_langs]
+                if hl and not any(ll in l or l in ll for l in hl): continue
+            if quality and h_quality:
+                if h_quality.upper() != quality.upper(): continue
+
+            all_files.append({
+                "file_hit": h,
+                "file_id": getattr(h, "file_id", "") or "",
+                "file_unique_id": getattr(h, "file_unique_id", None),
+                "file_name": file_name,
+                "file_size": getattr(h, "file_size", 0) or 0,
+                "season": h_season,
+                "episode": h_episode,
+                "quality": (h_quality or "UNKNOWN").upper(),
+                "languages": h_langs,
+                "title": getattr(h, "title", "") or "",
+                "series_title": getattr(h, "series_title", None) or "",
+                "chat_id": getattr(h, "chat_id", None),
+                "message_id": getattr(h, "message_id", None) or
+                              getattr(h, "msg_id", None),
+            })
+    except Exception as e:
+        logger.exception(f"[AI] engine search failed: {e}")
+
+    return _dedupe_by_episode(all_files)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SAME LIGHT PARSER AS SERIES GROUP
+# ═══════════════════════════════════════════════════════════════════════════
+_SE_PATTERNS = [
     re.compile(r"[sS](\d{1,2})[\s._-]?[eE][pP]?(\d{1,3})"),
     re.compile(r"\b(\d{1,2})[xX](\d{1,3})\b"),
     re.compile(r"[sS]eason[\s._-]?(\d{1,2})[\s._-]?[eE]pisode[\s._-]?(\d{1,3})"),
-    re.compile(r"[sS]eason[\s._-]?(\d{1,2})[\s._-]?(?:[eE]p|EP)[\s._-]?(\d{1,3})"),
     re.compile(r"[sS](\d{1,2})[\s._-]+[eE](\d{1,3})"),
 ]
-SEASON_ONLY = [
+_SEASON_ONLY = [
     re.compile(r"\b[sS](\d{1,2})\b(?![\s._-]?[eE])"),
     re.compile(r"[sS]eason[\s._-]?(\d{1,2})\b(?![\s._-]?[eE])"),
 ]
-YEAR_PATTERN = re.compile(r"\b(19[3-9]\d|20[0-4]\d)\b")
-
-QUALITY_MARKERS = [
-    ("4320p", "4320P"), ("8k", "8K"), ("2160p", "2160P"), ("4k", "4K"),
-    ("uhd", "UHD"), ("1440p", "1440P"), ("2k", "2K"), ("1080p", "1080P"),
-    ("fullhd", "1080P"), ("fhd", "1080P"), ("720p", "720P"),
-    ("576p", "576P"), ("480p", "480P"), ("360p", "360P"),
-    ("240p", "240P"), ("hdcam", "HDCAM"), ("cam", "CAM"),
-    ("telesync", "TS"), ("ts", "TS"),
+_QUALITY_MARKERS = [
+    ("4320p", "4320P"), ("2160p", "2160P"), ("4k", "4K"), ("uhd", "UHD"),
+    ("1440p", "1440P"), ("1080p", "1080P"), ("fullhd", "1080P"), ("fhd", "1080P"),
+    ("720p", "720P"), ("576p", "576P"), ("480p", "480P"), ("360p", "360P"),
 ]
-CODEC_PATTERNS = [
-    (re.compile(r"\bav1\b", re.I), "AV1"),
-    (re.compile(r"\bx265\b|\bh\.?265\b|\bhevc\b", re.I), "X265"),
-    (re.compile(r"\bx264\b|\bh\.?264\b|\bavc\b", re.I), "X264"),
-    (re.compile(r"\bmpeg2?\b|\bxvid\b|\bdivx\b", re.I), "MPEG"),
-]
-SOURCE_PATTERNS = [
-    (re.compile(r"\bremux\b", re.I), "REMUX"),
-    (re.compile(r"\bbluray\b|\bblu-ray\b|\bbdrip\b|\bbrrip\b|\bbdremux\b", re.I), "BLURAY"),
-    (re.compile(r"\bweb-?dl\b|\bwebdl\b|\bamzn\b|\bdsnp\b|\bnf\b|\batvp\b|\bitunes\b|\bpcok\b", re.I), "WEBDL"),
-    (re.compile(r"\bweb-?rip\b|\bwebrip\b|\bweb\b", re.I), "WEBRIP"),
-    (re.compile(r"\bhdtv\b|\bpdtv\b", re.I), "HDTV"),
-    (re.compile(r"\bdvdrip\b|\bdvdscr\b|\bdvd\b|\bhdrip\b", re.I), "DVDRIP"),
-    (re.compile(r"\bhdcam\b|\bcam\b", re.I), "CAM"),
-    (re.compile(r"\bts\b|\btelesync\b|\btc\b", re.I), "TS"),
-    (re.compile(r"\bscreener\b|\bscr\b|\br5\b", re.I), "SCR"),
-]
-AUDIO_PATTERNS = [
-    (re.compile(r"\batmos\b", re.I), "ATMOS"),
-    (re.compile(r"\btruehd\b|\bthd\b", re.I), "TRUEHD"),
-    (re.compile(r"\bdts-?hd[\s._-]?ma\b|\bdts[\s._-]?hd\b", re.I), "DTS-HD"),
-    (re.compile(r"\bdts-?x\b|\bdtsx\b", re.I), "DTSX"),
-    (re.compile(r"\bdts\b", re.I), "DTS"),
-    (re.compile(r"\bddp[\s._-]?7\.1\b|\bdd\+[\s._-]?7\.1\b", re.I), "DDP7.1"),
-    (re.compile(r"\bddp[\s._-]?5\.1\b|\bdd\+[\s._-]?5\.1\b|\beac3\b|\bdd5\.1\b", re.I), "DDP5.1"),
-    (re.compile(r"\bddp\b|\bdd\+\b", re.I), "DDP"),
-    (re.compile(r"\bac3\b|\bdd\b", re.I), "AC3"),
-    (re.compile(r"\baac\b", re.I), "AAC"),
-    (re.compile(r"\bflac\b", re.I), "FLAC"),
-    (re.compile(r"\bopus\b", re.I), "OPUS"),
-    (re.compile(r"\bmp3\b", re.I), "MP3"),
-]
-SIZE_REGEX = re.compile(r"\b(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b", re.IGNORECASE)
-
-LANGUAGE_ALIASES = {
+_LANG_ALIASES = {
     "English": ["english", "eng"], "Hindi": ["hindi", "hin"],
     "Tamil": ["tamil", "tam"], "Telugu": ["telugu", "tel"],
     "Malayalam": ["malayalam", "mal"], "Kannada": ["kannada", "kan"],
     "Bengali": ["bengali", "bangla"], "Marathi": ["marathi"],
-    "Punjabi": ["punjabi"], "Gujarati": ["gujarati"], "Urdu": ["urdu"],
-    "Korean": ["korean"], "Japanese": ["japanese"],
-    "Chinese": ["chinese", "mandarin"], "Thai": ["thai"],
-    "Spanish": ["spanish"], "French": ["french"], "German": ["german"],
-    "Italian": ["italian"], "Portuguese": ["portuguese"],
-    "Russian": ["russian"], "Turkish": ["turkish"], "Arabic": ["arabic"],
-}
-
-NOISE_WORDS = {
-    "web", "webdl", "webrip", "bluray", "bdrip", "brrip", "hdtv",
-    "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "ac3",
-    "dts", "dtshd", "ddp", "dd", "truehd", "atmos", "remux",
-    "proper", "repack", "extended", "unrated", "remastered",
-    "internal", "dubbed", "dual", "multi", "esubs", "subs",
-    "sub", "hdr", "sdr", "dolby", "vision", "imax", "complete",
-    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm",
+    "Punjabi": ["punjabi"], "Korean": ["korean"], "Japanese": ["japanese"],
+    "Chinese": ["chinese", "mandarin"], "Spanish": ["spanish"],
+    "French": ["french"], "German": ["german"], "Italian": ["italian"],
+    "Portuguese": ["portuguese"], "Russian": ["russian"], "Turkish": ["turkish"],
+    "Arabic": ["arabic"], "Thai": ["thai"],
 }
 
 
-def _smart_title_case(s):
-    if not s: return ""
-    small = {"of", "the", "and", "or", "a", "an", "in", "on", "at",
-             "to", "for", "by", "with", "from"}
-    parts = s.split()
-    if not parts: return ""
-    out = [parts[0].capitalize()]
-    for w in parts[1:]:
-        out.append(w.lower() if w.lower() in small else w.capitalize())
-    return " ".join(out)
-
-def _parse_size(name):
-    m = SIZE_REGEX.search(name)
-    if not m: return 0
-    try:
-        v = float(m.group(1)); u = m.group(2).upper()
-        if u in ("GB", "GIB"): return int(v * 1024**3)
-        if u in ("MB", "MIB"): return int(v * 1024**2)
-    except Exception: pass
-    return 0
-
-def _detect(name, patterns):
-    for pat, label in patterns:
-        if pat.search(name): return label
-    return None
-
-
-def parse_filename(filename):
-    result = {"raw": filename, "title": "", "title_slug": "",
-              "year": None, "season": None, "episode": None,
-              "quality": None, "quality_rank": 0,
-              "codec": None, "source": None, "audio_codec": None,
-              "languages": [], "size_from_name": 0,
-              "is_series": False, "is_season_pack": False}
-    if not filename: return result
-
+def _parse_filename_light(filename):
+    out = {"season": None, "episode": None, "quality": None, "languages": []}
+    if not filename: return out
     name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    name = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts)$", "",
-                  name, flags=re.I)
-    work = name
-    wl = work.lower()
+    name = re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts)$", "", name, flags=re.I)
+    wl = name.lower()
 
-    season = episode = None
-    for pat in SE_PATTERNS:
-        m = pat.search(work)
+    for pat in _SE_PATTERNS:
+        m = pat.search(name)
         if m:
             try:
-                season = int(m.group(1)); episode = int(m.group(2)); break
+                out["season"] = int(m.group(1))
+                out["episode"] = int(m.group(2)); break
             except Exception: continue
-    if season is None:
-        for pat in SEASON_ONLY:
-            m = pat.search(work)
+    if out["season"] is None:
+        for pat in _SEASON_ONLY:
+            m = pat.search(name)
             if m:
-                try:
-                    season = int(m.group(1))
-                    result["is_season_pack"] = True; break
+                try: out["season"] = int(m.group(1)); break
                 except Exception: continue
 
-    result["season"] = season
-    result["episode"] = episode
-
-    ym = YEAR_PATTERN.search(work)
-    if ym:
-        try: result["year"] = int(ym.group(1))
-        except Exception: pass
-
-    for marker, label in QUALITY_MARKERS:
+    for marker, label in _QUALITY_MARKERS:
         if re.search(r"\b" + re.escape(marker) + r"\b", wl):
-            result["quality"] = label
-            result["quality_rank"] = QUALITY_RANK.get(label, 0); break
-
-    result["codec"] = _detect(wl, CODEC_PATTERNS)
-    result["source"] = _detect(wl, SOURCE_PATTERNS)
-    result["audio_codec"] = _detect(wl, AUDIO_PATTERNS)
+            out["quality"] = label; break
 
     langs = []
-    for ln, aliases in LANGUAGE_ALIASES.items():
+    for ln, aliases in _LANG_ALIASES.items():
         for a in aliases:
             if re.search(r"\b" + re.escape(a) + r"\b", wl):
                 if ln not in langs: langs.append(ln)
                 break
-    result["languages"] = langs
-    result["size_from_name"] = _parse_size(name)
-
-    if season is not None or episode is not None:
-        result["is_series"] = True
-
-    tw = work
-    for pat in SE_PATTERNS: tw = pat.sub(" ", tw)
-    for pat in SEASON_ONLY: tw = pat.sub(" ", tw)
-    if result["year"]:
-        tw = re.sub(r"\b" + str(result["year"]) + r"\b", " ", tw)
-    for marker, _ in QUALITY_MARKERS:
-        tw = re.sub(r"\b" + re.escape(marker) + r"\b", " ", tw, flags=re.I)
-    for lang in langs:
-        for a in LANGUAGE_ALIASES.get(lang, []):
-            tw = re.sub(r"\b" + re.escape(a) + r"\b", " ", tw, flags=re.I)
-    for noise in NOISE_WORDS:
-        tw = re.sub(r"\b" + re.escape(noise) + r"\b", " ", tw, flags=re.I)
-
-    tw = re.sub(r"[-_.\s]*@\w+\b", " ", tw)
-    tw = re.sub(r"[-_.\s]*\[[^\]]{1,40}\]", " ", tw)
-    tw = re.sub(r"[-_.\s]*\([^\)]{1,20}\)\s*$", " ", tw)
-    tw = re.sub(
-        r"[-_.\s]*(?:rarbg|eztv|yts|yify|galaxyrg|psa|hon3y|bolly4u|"
-        r"subsplease|evo|fgt|thetvshare|tvshare|hdhub4u|mkvcage|"
-        r"shaanig|tamilrockers|isaimini|katmoviehd|moviesverse)\b",
-        " ", tw, flags=re.I)
-
-    tw = re.sub(r"[._\-]+", " ", tw)
-    tw = re.sub(r"\s+", " ", tw).strip()
-    parts = [p for p in tw.split() if len(p) > 1]
-    result["title"] = _smart_title_case(" ".join(parts))
-    result["title_slug"] = re.sub(r"[^a-z0-9]+", "_",
-                                   result["title"].lower()).strip("_")
-    return result
+    out["languages"] = langs
+    return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SCORING
-# ═══════════════════════════════════════════════════════════════════════════
-CODEC_BONUS = {"AV1": 10, "X265": 8, "X264": 4, "MPEG": 0, None: 2}
-SOURCE_BONUS = {"REMUX": 15, "BLURAY": 12, "WEBDL": 10, "WEBRIP": 7,
-                "HDTV": 4, "DVDRIP": 3, "SCR": 2, "CAM": 0, "TS": 0, None: 2}
-AUDIO_BONUS = {"ATMOS": 8, "TRUEHD": 7, "DTS-HD": 6, "DTSX": 6, "DTS": 5,
-               "DDP7.1": 5, "DDP5.1": 4, "DDP": 3, "AC3": 2, "AAC": 2,
-               "FLAC": 5, "OPUS": 2, "MP3": 1, None: 1}
+def _dedupe_by_episode(files):
+    """Same as series group — 1 file per (season, episode, quality)."""
+    if not files: return []
+    seen_ids: Set[str] = set()
+    by_id = []
+    for f in files:
+        fid = str(f.get("file_id") or f.get("file_unique_id") or "")
+        if fid and fid in seen_ids: continue
+        if fid: seen_ids.add(fid)
+        by_id.append(f)
 
+    def _size(f):
+        s = f.get("file_size") or 0
+        try: return int(s)
+        except (TypeError, ValueError): return 0
 
-def _score(f):
-    res = (f.get("quality") or "UNKNOWN").upper()
-    codec = (f.get("codec") or "").upper() or None
-    src = (f.get("source") or "").upper() or None
-    aud = (f.get("audio_codec") or "").upper() or None
-    langs = f.get("languages") or []
-    size = f.get("size") or f.get("size_from_name") or 0
-    r = QUALITY_RANK.get(res, 25)
-    c = CODEC_BONUS.get(codec, 2)
-    s = SOURCE_BONUS.get(src, 2)
-    a = AUDIO_BONUS.get(aud, 1)
-    l = len(langs) * 2
-    try:
-        size_mb = max(0, size) / (1024**2)
-        sz = min(20.0, size_mb / 500.0)
-    except Exception:
-        sz = 0.0
-    return round(r + c + s + a + l + sz, 1)
+    by_id.sort(key=_size, reverse=True)
 
+    seen_keys: Set[Tuple] = set()
+    out = []
+    for f in by_id:
+        s = f.get("season"); e = f.get("episode")
+        if e is None:
+            p = _parse_filename_light(f.get("file_name") or "")
+            if p.get("episode") is not None:
+                e = p["episode"]; f["episode"] = e
+            if p.get("season") is not None and s is None:
+                s = p["season"]; f["season"] = s
+        q = (f.get("quality") or "UNKNOWN").upper().strip()
+        key = (s, e, q)
+        if key in seen_keys: continue
+        seen_keys.add(key)
+        out.append(f)
 
-def _pick_best(files):
-    if not files: return None, []
-    scored = sorted([(_score(f), f) for f in files], key=lambda x: x[0], reverse=True)
-    if all((f.get("quality") or "UNKNOWN").upper() == "UNKNOWN" for _, f in scored):
-        return None, []
-    best = scored[0][1]; best["_score"] = scored[0][0]
-    others = []
-    for s, f in scored[1:]:
-        f["_score"] = s; others.append(f)
-    return best, others
+    out.sort(key=lambda x: (
+        x.get("season") or 0,
+        x.get("episode") if x.get("episode") is not None else 9999))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATALOG
+# CATALOG BUILD (uses engine results)
 # ═══════════════════════════════════════════════════════════════════════════
 class SeriesCatalog:
+    """Groups files by: title → season → episode → quality."""
     def __init__(self):
-        self.data: Dict[str, Any] = {}
+        # {title_slug: {"title": str, "seasons": {s: {ep: {q: file}}}}}
+        self.data: Dict[str, Dict[str, Any]] = {}
 
-    def add(self, parsed, rec):
-        if not parsed.get("is_series"): return
-        if parsed.get("season") is None: return
-        slug = parsed["title_slug"]
-        if not slug: return
+    def add_file(self, f: Dict[str, Any]) -> bool:
+        title = (f.get("series_title") or f.get("title") or "").strip()
+        if not title: return False
+        season = f.get("season")
+        episode = f.get("episode")
+        if season is None: return False
+        quality = (f.get("quality") or "UNKNOWN").upper()
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        if not slug: return False
 
         if slug not in self.data:
-            self.data[slug] = {"title": parsed["title"],
-                                "seasons": defaultdict(lambda: defaultdict(list)),
-                                "file_count": 0}
+            self.data[slug] = {
+                "title": title,
+                "seasons": defaultdict(lambda: defaultdict(dict)),
+                "file_count": 0,
+            }
 
-        s = parsed["season"]; e = parsed.get("episode")
-        size = (rec.get("file_size") or rec.get("size")
-                or parsed.get("size_from_name") or 0)
-
-        self.data[slug]["seasons"][s][e].append({
-            "file_id": rec.get("file_id") or rec.get("file_unique_id") or "",
-            "file_name": parsed.get("raw", ""),
-            "quality": (parsed.get("quality") or "UNKNOWN").upper(),
-            "codec": (parsed.get("codec") or "").upper() or None,
-            "source": (parsed.get("source") or "").upper() or None,
-            "audio_codec": (parsed.get("audio_codec") or "").upper() or None,
-            "languages": parsed.get("languages", []),
-            "size": size,
-            "size_from_name": parsed.get("size_from_name", 0),
-            "chat_id": rec.get("chat_id"),
-            "message_id": rec.get("message_id") or rec.get("msg_id"),
-            "_score": 0,
-        })
+        self.data[slug]["seasons"][season][episode][quality] = f
         self.data[slug]["file_count"] += 1
+        return True
 
-    def list_series(self):
+    def list_series(self) -> List[Dict[str, Any]]:
         out = [{"title_slug": k, "title": v["title"],
                 "file_count": v["file_count"],
                 "season_count": len(v["seasons"])} for k, v in self.data.items()]
@@ -621,164 +468,34 @@ class SeriesCatalog:
         return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DOC → CATALOG (handles many field names, including FileHit dict)
-# ═══════════════════════════════════════════════════════════════════════════
-def _extract_filename(doc: Dict[str, Any]) -> str:
-    """Pull filename from any likely field."""
-    for key in ("file_name", "filename", "title", "name", "file_title",
-                "caption", "file_caption", "media_title", "text"):
-        v = doc.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-    # Fallback: any string with video ext
-    for k, v in doc.items():
-        if k in ("_id", "chat_id", "message_id", "msg_id",
-                 "file_id", "file_unique_id", "file_size", "size"):
-            continue
-        if isinstance(v, str) and len(v) > 5:
-            if any(x in v.lower() for x in
-                   (".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v")):
-                return v
-    return ""
-
-
-def _process_doc(doc: Dict[str, Any], cat: SeriesCatalog,
-                 filter_slug: Optional[str] = None) -> bool:
-    fname = _extract_filename(doc)
-    if not fname: return False
-    p = parse_filename(str(fname))
-    if filter_slug is not None:
-        sm = p.get("title_slug", "")
-        if filter_slug not in sm and sm not in filter_slug:
-            return False
-    cat.add(p, doc)
-    return True
+def _summarize_catalog(cat: SeriesCatalog, slug: str) -> Dict[str, Any]:
+    """Return overall qualities, seasons, episodes count."""
+    series = cat.data.get(slug) or {}
+    seasons = series.get("seasons") or {}
+    qualities: Set[str] = set()
+    all_eps: Set[Tuple[int, Optional[int]]] = set()
+    for sn, eps in seasons.items():
+        for ep, qmap in eps.items():
+            all_eps.add((sn, ep))
+            for q in qmap.keys():
+                qualities.add(q)
+    return {
+        "qualities": sorted(qualities, key=lambda x: QUALITY_RANK.get(x, 0),
+                            reverse=True),
+        "season_count": len(seasons),
+        "episode_count": len(all_eps),
+        "file_count": series.get("file_count", 0),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCAN — uses engine for manual, raw collections for auto
+# TMDB SUGGEST (for manual scan)
 # ═══════════════════════════════════════════════════════════════════════════
-async def _scan_via_engine(query: str) -> Optional[SeriesCatalog]:
-    """Use media_search engine — same as working search."""
-    try:
-        from media_search.engine import engine
-        from media_search.normalizer import normalize, parse_query
-    except Exception as e:
-        logger.warning(f"[AI] engine import: {e}")
-        return None
-
-    norm, year, is_series = parse_query(query)
-    if not norm: return None
-
-    # Search as series first
-    cat = SeriesCatalog()
-    try:
-        result = await engine.search_series(norm, year=year)
-        hits = result.hits
-    except Exception as e:
-        logger.warning(f"[AI] engine.search_series: {e}")
-        hits = []
-
-    # If no series hits, try movie (in case parse_query mislabeled)
-    if not hits:
-        try:
-            result = await engine.search_any(norm, year=year)
-            hits = result.hits
-        except Exception as e:
-            logger.warning(f"[AI] engine.search_any: {e}")
-            hits = []
-
-    logger.info(f"[AI] engine returned {len(hits)} hits for {query!r}")
-
-    for h in hits:
-        # Convert FileHit → dict for parsing
-        doc = {
-            "file_id": getattr(h, "file_id", "") or "",
-            "file_unique_id": getattr(h, "file_unique_id", None),
-            "file_name": getattr(h, "file_name", "") or "",
-            "file_size": getattr(h, "file_size", 0) or 0,
-            "chat_id": None,
-            "message_id": None,
-        }
-        # If FileHit has explicit series/season/episode, use directly
-        s = getattr(h, "season", None)
-        e = getattr(h, "episode", None)
-        if s is not None or e is not None:
-            p = parse_filename(doc["file_name"])
-            if not p.get("is_series"):
-                p["is_series"] = True
-                p["season"] = s
-                p["episode"] = e
-                if not p.get("title"):
-                    p["title"] = getattr(h, "series_title", None) or p["title"]
-                    p["title_slug"] = re.sub(r"[^a-z0-9]+", "_",
-                                              p["title"].lower()).strip("_")
-            cat.add(p, doc)
-        else:
-            _process_doc(doc, cat)
-
-    return cat if cat.data else None
-
-
-async def _scan_library(client, chat_id, status_msg_id, filter_slug=None):
-    """Raw scan of ALL file collections."""
-    colls = await _all_file_collections()
-    if not colls:
-        logger.warning("[AI] no file collections")
-        return SeriesCatalog()
-
-    cat = SeriesCatalog()
-    processed = 0
-    total = 0
-    last_edit = 0.0
-
-    for cname, coll in colls:
-        try:
-            n = await coll.estimated_document_count()
-            total += n
-        except Exception: pass
-
-    logger.info(f"[AI] scanning {len(colls)} colls, {total} docs")
-
-    for cname, coll in colls:
-        try:
-            async for doc in coll.find({}):
-                processed += 1
-                ok = _process_doc(doc, cat, filter_slug)
-                now = time.time()
-                if now - last_edit >= PROGRESS_UPDATE_INTERVAL:
-                    last_edit = now
-                    try:
-                        await client.edit_message_text(
-                            chat_id=chat_id, message_id=status_msg_id,
-                            text=_view_scanning(processed, total or processed, cname),
-                            parse_mode=ParseMode.HTML)
-                    except Exception: pass
-        except Exception as e:
-            logger.warning(f"[AI] scan {cname}: {e}")
-            continue
-
-    logger.info(f"[AI] done: {processed} files, {len(cat.data)} series")
-
-    try:
-        await client.edit_message_text(
-            chat_id=chat_id, message_id=status_msg_id,
-            text=_view_scanning(processed, total or processed),
-            parse_mode=ParseMode.HTML)
-    except Exception: pass
-    return cat
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TMDB SUGGEST
-# ═══════════════════════════════════════════════════════════════════════════
-async def _tmdb_suggest(query: str) -> List[Dict[str, Any]]:
+async def _tmdb_suggest(query):
     if not TMDB_API_KEY: return []
     try:
         import aiohttp
     except ImportError: return []
-
     params = {"api_key": TMDB_API_KEY, "query": query, "language": "en-US"}
     try:
         async with aiohttp.ClientSession() as sess:
@@ -786,17 +503,15 @@ async def _tmdb_suggest(query: str) -> List[Dict[str, Any]]:
                                 params=params, timeout=12) as r:
                 if r.status != 200: return []
                 data = await r.json()
-    except Exception as e:
-        logger.debug(f"[AI] tmdb: {e}"); return []
+    except Exception: return []
 
     out = []
     for it in (data.get("results") or [])[:8]:
-        title = it.get("name") or it.get("original_name") or ""
-        if not title: continue
+        t = it.get("name") or it.get("original_name") or ""
+        if not t: continue
         date = it.get("first_air_date") or ""
         out.append({
-            "title": title,
-            "year": (date or "")[:4],
+            "title": t, "year": (date or "")[:4],
             "tmdb_id": it.get("id"),
             "rating": it.get("vote_average", 0),
         })
@@ -815,7 +530,7 @@ def kb_tmdb_suggest(items):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# KEYBOARDS / VIEWS
+# KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
 def kb_main(auto_on, completed, total):
     return InlineKeyboardMarkup([
@@ -832,11 +547,16 @@ def kb_main(auto_on, completed, total):
     ])
 
 
-def kb_scan_result(slug, i, t):
+def kb_series_result(slug, i, t):
     rows = [
-        [InlineKeyboardButton("👁️ VIEW FILES", callback_data=f"ai:view:{slug}")],
-        [InlineKeyboardButton("🎯 SET KEEP QUALITIES", callback_data=f"ai:pref:{slug}")],
-        [InlineKeyboardButton("✅ MARK COMPLETE", callback_data=f"ai:complete:{slug}")],
+        [InlineKeyboardButton("📊 QUALITY GRID",
+                              callback_data=f"ai:grid:{slug}")],
+        [InlineKeyboardButton("📋 EPISODE LIST",
+                              callback_data=f"ai:eps:{slug}")],
+        [InlineKeyboardButton("🎯 SET KEEP QUALITIES",
+                              callback_data=f"ai:pref:{slug}")],
+        [InlineKeyboardButton("✅ MARK COMPLETE",
+                              callback_data=f"ai:complete:{slug}")],
     ]
     if i < t:
         rows.append([InlineKeyboardButton(f"⏭️ NEXT ({i+1}/{t})",
@@ -847,33 +567,37 @@ def kb_scan_result(slug, i, t):
 
 
 def kb_series_list(lst):
-    rows = [[InlineKeyboardButton(
-        f"🎬 {(s.get('title') or '?')[:32]} · {s.get('file_count', 0)}",
-        callback_data=f"ai:view:{s['title_slug']}")] for s in lst[:25]]
+    rows = []
+    for s in lst[:25]:
+        title = (s.get("title") or "?")[:32]
+        count = s.get("file_count", 0)
+        rows.append([InlineKeyboardButton(
+            f"🎬 {title} · {count}",
+            callback_data=f"ai:view:{s['title_slug']}")])
     rows.append([InlineKeyboardButton("◀️ BACK", callback_data="ai:main"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_episode_files(slug, season, episode, files):
+def kb_episode_files(slug, season, episode, quality, files):
     rows = []
     for i, f in enumerate(files[:10]):
         q = f.get("quality", "?")
         langs = "+".join(f.get("languages", [])) or "?"
         ep_i = episode if episode is not None else 0
         rows.append([InlineKeyboardButton(f"🗑️ {i+1}. {q} · {langs}",
-            callback_data=f"ai:del_pick:{slug}:{season}:{ep_i}:{i}")])
-    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
+            callback_data=f"ai:del_pick:{slug}:{season}:{ep_i}:{q}:{i}")])
+    rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:grid:{slug}"),
                  InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_confirm_delete(slug, season, episode, idx):
+def kb_confirm_delete(slug, season, episode, quality, idx):
     ep_i = episode if episode is not None else 0
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ YES, DELETE",
-            callback_data=f"ai:del_go:{slug}:{season}:{ep_i}:{idx}")],
-        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:view:{slug}")]])
+            callback_data=f"ai:del_go:{slug}:{season}:{ep_i}:{quality}:{idx}")],
+        [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:grid:{slug}")]])
 
 
 def kb_quality_picker(slug, avail, cur):
@@ -896,6 +620,9 @@ def kb_back(t="ai:main"):
         InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")]])
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════
 async def _view_main():
     auto_on = await _get_setting("auto_mode", True)
     comp = await _count_completed()
@@ -922,88 +649,162 @@ def _progress_bar(p, w=16):
     return block * filled + "⬛" * empty + f"  {p:.0f}%"
 
 
-def _view_scanning(cur, total, coll=""):
+def _view_scanning(cur, total):
     p = (cur / total * 100) if total else 0
-    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-             f"🔍 <b>{fb('SCANNING')}</b>", DIV, "",
-             f"<code>{_progress_bar(p)}</code>", "",
-             f"📁 <code>{_fmt_int(cur)}</code> / <code>{_fmt_int(total)}</code>"]
-    if coll: lines.append(f"📚 <code>{_esc(coll[:40])}</code>")
-    return "\n".join(lines)
+    return "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🔍 <b>{fb('SCANNING')}</b>",
+        DIV, "",
+        f"<code>{_progress_bar(p)}</code>",
+        "",
+        f"📁 <code>{_fmt_int(cur)}</code> / <code>{_fmt_int(total)}</code>",
+    ])
 
 
-def _view_series_result(series, prefs, i, t):
+def _view_series_overview(series: Dict[str, Any], prefs: List[str],
+                          i: int, t: int) -> str:
+    """Overview with quality × episode status."""
     title = series.get("title") or "?"
     seasons = series.get("seasons") or {}
-    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-             f"🎬 <b>{_esc(title)}</b>",
-             f"📄 {sc('series')} · <code>{i}/{t}</code>",
-             DIV, ""]
+
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🎬 <b>{_esc(title)}</b>",
+        f"📄 {sc('series')} · <code>{i}/{t}</code>",
+        DIV, "",
+    ]
+
     total_files = 0
+    complete_eps = 0
+    partial_eps = 0
+    missing_eps = 0
+
     for sn in sorted(seasons.keys()):
         eps = seasons[sn]
-        lines.append(f"📺 <b>{sc('season')} {sn}</b> · <code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
-        qmap = defaultdict(set)
-        for ep, files in eps.items():
-            for f in files:
-                qmap[f.get("quality", "?")].add(ep if ep is not None else 0)
-                total_files += 1
-        for q in sorted(qmap.keys(), key=lambda x: QUALITY_RANK.get(x, 0), reverse=True):
-            eps_p = sorted(qmap[q])
-            ps = ", ".join(f"E{e:02d}" if e else "?" for e in eps_p[:15])
-            if len(eps_p) > 15: ps += f" +{len(eps_p) - 15}"
-            mk = ""
-            if prefs and q not in prefs: mk = " · 🗑️ ᴛᴏ ᴅᴇʟᴇᴛᴇ"
-            elif prefs and q in prefs: mk = " · ✅ ᴋᴇᴇᴘ"
-            lines.append(f"   🎯 <code>{q}</code> · <code>{ps}</code>{mk}")
+        lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b> · "
+                     f"<code>{len(eps)} ᴇᴘɪꜱᴏᴅᴇꜱ</code>")
+
+        # Quality map for this season
+        qual_set: Set[str] = set()
+        for ep, qmap in eps.items():
+            for q in qmap.keys():
+                qual_set.add(q)
+            total_files += len(qmap)
+        qual_list = sorted(qual_set, key=lambda x: QUALITY_RANK.get(x, 0),
+                            reverse=True)
+
+        # Per-episode status
+        for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
+            qmap = eps[ep]
+            ep_label = f"E{ep:02d}" if ep is not None else "?"
+
+            have = sorted(qmap.keys(),
+                           key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+            # Any admin prefs filter
+            if prefs:
+                keep = [q for q in have if q in prefs]
+                ignore = [q for q in have if q not in prefs]
+                if keep:
+                    icon = "🟢"
+                    complete_eps += 1
+                elif ignore:
+                    icon = "🟡"
+                    partial_eps += 1
+                else:
+                    icon = "🔴"
+                    missing_eps += 1
+                q_str = " ".join(f"{'✅' if q in prefs else '⏭️'}{q}" for q in have)
+            else:
+                if len(have) >= 2:
+                    icon = "🟢"; complete_eps += 1
+                elif have:
+                    icon = "🟡"; partial_eps += 1
+                else:
+                    icon = "🔴"; missing_eps += 1
+                q_str = " ".join(f"✅{q}" for q in have)
+
+            lines.append(f"   {icon} <b>{ep_label}</b> · {q_str}")
+
+        # Quality summary line
+        lines.append(f"   📊 {sc('qualities')} · <code>{', '.join(qual_list) or '—'}</code>")
         lines.append("")
+
     lines.append(DIV2)
     lines.append(f"📁 {sc('total files')} · <code>{_fmt_int(total_files)}</code>")
+    lines.append(f"🟢 {sc('complete')} · <code>{complete_eps}</code>   "
+                 f"🟡 {sc('partial')} · <code>{partial_eps}</code>   "
+                 f"🔴 {sc('missing')} · <code>{missing_eps}</code>")
     if prefs:
-        lines.append(f"🎯 {sc('keep')} · <code>{', '.join(prefs)}</code>")
+        lines.append(f"🎯 {sc('keeping')} · <code>{', '.join(prefs)}</code>")
+    else:
+        lines.append(f"🎯 {sc('keeping')} · ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇꜱ")
     return "\n".join(lines)
 
 
-def _view_episode_files(title, season, episode, files, prefs):
-    ep = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
-    best, _ = _pick_best(files)
-    lines = [f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-             f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
-             DIV, "", f"📁 <code>{len(files)}</code> ꜰɪʟᴇꜱ", ""]
-    for i, f in enumerate(files[:10]):
-        q = f.get("quality", "?")
+def _view_quality_grid(series: Dict[str, Any], prefs: List[str]) -> str:
+    """Matrix view: episodes × qualities with ✅/❌"""
+    title = series.get("title") or "?"
+    seasons = series.get("seasons") or {}
+
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"📊 <b>{_esc(title)}</b> · {sc('Quality Grid')}",
+        DIV, "",
+    ]
+
+    for sn in sorted(seasons.keys()):
+        eps = seasons[sn]
+        qual_set: Set[str] = set()
+        for qmap in eps.values():
+            qual_set.update(qmap.keys())
+        qual_list = sorted(qual_set, key=lambda x: QUALITY_RANK.get(x, 0),
+                            reverse=True)
+        if not qual_list:
+            lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b> · —")
+            continue
+
+        # Header: short quality labels
+        header = "       " + "  ".join(f"{q[:5]:>5}" for q in qual_list)
+        lines.append(f"📺 <b>{sc('Season')} {sn:02d}</b>")
+        lines.append(f"<code>{header}</code>")
+
+        for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
+            qmap = eps[ep]
+            ep_label = f"E{ep:02d}" if ep is not None else "?"
+            row = " ".join(
+                f"{'  ✅ ' if q in qmap else '  ❌ '}" for q in qual_list
+            )
+            lines.append(f"<code>{ep_label:>4}  {row}</code>")
+        lines.append("")
+
+    lines.append(DIV2)
+    lines.append(f"✅ = {sc('available')}  ·  ❌ = {sc('missing')}")
+    return "\n".join(lines)
+
+
+def _view_episode_quality_picker(series: Dict[str, Any], season: int,
+                                  episode: Optional[int],
+                                  qmap: Dict[str, Dict[str, Any]],
+                                  prefs: List[str]) -> str:
+    ep_label = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🎬 <b>{_esc(series.get('title'))}</b> · <code>{ep_label}</code>",
+        DIV, "",
+        f"📁 <code>{len(qmap)}</code> ǫᴜᴀʟɪᴛɪᴇꜱ ꜰᴏᴜɴᴅ",
+        "",
+    ]
+    for q in sorted(qmap.keys(), key=lambda x: QUALITY_RANK.get(x, 0),
+                     reverse=True):
+        f = qmap[q]
         langs = "+".join(f.get("languages", [])) or "?"
-        size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
-        codec = f.get("codec") or "?"
-        src = f.get("source") or "?"
+        size = _fmt_size(f.get("file_size", 0))
         tag = ""
-        if f is best: tag = " · ⭐ ʙᴇꜱᴛ"
-        elif prefs and q not in prefs: tag = " · 🗑️ ʀᴇᴍᴏᴠᴇ"
-        elif q == "UNKNOWN": tag = " · ⚠️ ᴜɴᴋɴᴏᴡɴ"
-        lines.append(f"<b>{i+1}.</b> <code>{q}</code> · <code>{codec}</code> · <code>{src}</code>{tag}")
-        lines.append(f"   🌍 <code>{langs}</code> · 📦 {size}")
-    lines += ["", DIV2, f"📌 {sc('tap a file to delete it')}"]
+        if prefs and q not in prefs:
+            tag = " · 🗑️ ᴛᴏ ʀᴇᴍᴏᴠᴇ"
+        lines.append(f"🎯 <code>{q}</code> · 🌍 <code>{langs}</code> · 📦 {size}{tag}")
+    lines += ["", DIV2, f"📌 {sc('tap below to manage a quality')}"]
     return "\n".join(lines)
-
-
-def _view_confirm_delete(title, season, episode, f):
-    ep = f"S{season:02d}" + (f"E{episode:02d}" if episode else "")
-    q = f.get("quality", "?"); langs = "+".join(f.get("languages", [])) or "?"
-    size = _fmt_size(f.get("size", 0) or f.get("size_from_name", 0))
-    return "\n".join([f"⚠️ <b>{fb('CONFIRM DELETE')}</b>", DIV, "",
-                      f"🎬 <b>{_esc(title)}</b> · <code>{ep}</code>",
-                      f"🎯 {sc('quality')} · <code>{q}</code>",
-                      f"🌍 {sc('languages')} · <code>{langs}</code>",
-                      f"📦 {sc('size')} · <code>{size}</code>",
-                      "", DIV2, f"❗ <b>{sc('cannot be undone')}</b>"])
-
-
-def _view_quality_picker(title, avail, cur):
-    return "\n".join([f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                      f"🎯 <b>{fb('QUALITY PREFS')}</b>", DIV, "",
-                      f"🎬 <b>{_esc(title)}</b>", "",
-                      f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
-                      f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>"])
 
 
 async def _safe_edit(t, text, kb=None):
@@ -1038,24 +839,15 @@ async def cmd_aidb(client, message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
     try:
-        colls = await _all_file_collections()
+        from database import db_registry
         lines = ["🗄️ <b>AI ᴅɪᴀɢɴᴏꜱᴛɪᴄꜱ</b>",
                  "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                 f"📁 <b>{len(colls)} ꜰɪʟᴇ ᴄᴏʟʟᴇᴄᴛɪᴏɴꜱ</b>", ""]
-        for name, c in colls:
-            try: n = await c.estimated_document_count()
-            except Exception: n = -1
-            lines.append(f"• <code>{_esc(name[:60])}</code> · {_fmt_int(n)}")
-        if colls:
+                 f"📁 <b>{len(db_registry.media_entries())} ᴍᴇᴅɪᴀ ꜱʜᴀʀᴅꜱ</b>", ""]
+        for entry in db_registry.media_entries():
             try:
-                sample = await colls[0][1].find_one({})
-                if sample:
-                    sample.pop("_id", None)
-                    lines += ["", "🔑 <b>ꜱᴀᴍᴘʟᴇ ꜰɪᴇʟᴅꜱ</b>"]
-                    for k in list(sample.keys())[:25]:
-                        v = str(sample[k])[:70]
-                        lines.append(f"• <code>{k}</code> = {_esc(v)}")
-            except Exception: pass
+                n = await entry.db["media_files"].estimated_document_count()
+            except Exception: n = -1
+            lines.append(f"• <code>DB{entry.index + 1}</code> · {_fmt_int(n)}")
         await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.exception(f"[AI] aidb: {e}")
@@ -1095,6 +887,46 @@ async def cb_toggle(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SCAN — uses engine (same as series group)
+# ═══════════════════════════════════════════════════════════════════════════
+async def _build_catalog_from_titles(titles: List[str]) -> SeriesCatalog:
+    """Take a list of titles, run engine search on each, build catalog."""
+    cat = SeriesCatalog()
+    for title in titles:
+        try:
+            files = await _engine_search(title)
+            for f in files:
+                cat.add_file(f)
+        except Exception as e:
+            logger.warning(f"[AI] scan '{title}': {e}")
+    return cat
+
+
+async def _discover_all_series() -> List[str]:
+    """Discover all series titles by scanning shards + parsing filenames."""
+    titles: Set[str] = set()
+    try:
+        from database import db_registry
+        for entry in db_registry.media_entries():
+            try:
+                # Sample unique normalized_series_title
+                pipeline = [
+                    {"$match": {"type": "series",
+                                 "normalized_series_title": {"$exists": True,
+                                                              "$ne": None}}},
+                    {"$group": {"_id": "$normalized_series_title"}},
+                    {"$limit": 500},
+                ]
+                async for doc in entry.db["media_files"].aggregate(pipeline):
+                    t = doc.get("_id")
+                    if t: titles.add(t)
+            except Exception: pass
+    except Exception as e:
+        logger.warning(f"[AI] discover: {e}")
+    return sorted(titles)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # AUTO SCAN
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:auto$"), group=-430)
@@ -1109,16 +941,27 @@ async def cb_auto(client, q):
                                                 parse_mode=ParseMode.HTML)
         except Exception: status = q.message
 
-        cat = await _scan_library(client, q.message.chat.id, status.id)
-        if cat is None:
-            return await client.edit_message_text(
+        # Discover series titles
+        titles = await _discover_all_series()
+        logger.info(f"[AI] discovered {len(titles)} unique series")
+
+        # Update progress
+        try:
+            await client.edit_message_text(
                 chat_id=q.message.chat.id, message_id=status.id,
-                text="⚠️ ᴅʙ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ.", parse_mode=ParseMode.HTML)
+                text=_view_scanning(len(titles), len(titles)),
+                parse_mode=ParseMode.HTML)
+        except Exception: pass
 
-        all_s = cat.list_series()
-        await _set_setting("total_series", len(all_s))
+        # Build catalog using engine
+        cat = await _build_catalog_from_titles(titles)
+        await _set_setting("total_series", len(cat.data))
 
-        pending = [s for s in all_s if not await _is_completed(s["title_slug"])]
+        # Filter pending
+        pending: List[Dict[str, Any]] = []
+        for s in cat.list_series():
+            if not await _is_completed(s["title_slug"]):
+                pending.append(s)
 
         if not pending:
             try:
@@ -1128,9 +971,8 @@ async def cb_auto(client, q):
                         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
                         f"✅ <b>{fb('ALL REVIEWED')}</b>",
                         DIV, "",
-                        f"🎉 {sc('every series is completed')}",
-                        f"📊 {sc('total')} · <code>{len(all_s)}</code>",
-                        f"📌 {sc('scan found')} <code>{len(all_s)}</code> ꜱᴇʀɪᴇꜱ",
+                        f"🎉 {sc('every series is marked complete')}",
+                        f"📊 {sc('total')} · <code>{len(cat.data)}</code>",
                     ]),
                     reply_markup=kb_back("ai:main"),
                     parse_mode=ParseMode.HTML)
@@ -1196,7 +1038,7 @@ async def ai_manual_input(client, message):
     suggestions = await _tmdb_suggest(text)
 
     if not suggestions:
-        # No TMDB → direct scan
+        # No TMDB → direct engine scan
         try:
             await client.edit_message_text(
                 chat_id=message.chat.id, message_id=loading.id,
@@ -1204,15 +1046,8 @@ async def ai_manual_input(client, message):
                 parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        # Use ENGINE for direct search
-        cat = await _scan_via_engine(text)
-        if cat is None or not cat.data:
-            # fallback to raw
-            slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-            cat = await _scan_library(client, message.chat.id, loading.id,
-                                        filter_slug=slug)
-
-        if cat is None or not cat.data:
+        files = await _engine_search(text)
+        if not files:
             try:
                 await client.edit_message_text(
                     chat_id=message.chat.id, message_id=loading.id,
@@ -1222,6 +1057,19 @@ async def ai_manual_input(client, message):
                         f"🔍 <code>{_esc(text)}</code>",
                         f"📌 {sc('not in your db')}",
                     ]),
+                    reply_markup=kb_back("ai:main"),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            return
+
+        cat = SeriesCatalog()
+        for f in files:
+            cat.add_file(f)
+        if not cat.data:
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id, message_id=loading.id,
+                    text="⚠️ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ ɪɴ ᴅʙ.",
                     reply_markup=kb_back("ai:main"),
                     parse_mode=ParseMode.HTML)
             except Exception: pass
@@ -1278,15 +1126,9 @@ async def cb_pick_tmdb(client, q):
                                        parse_mode=ParseMode.HTML)
         except Exception: pass
 
-        # ⭐ USE ENGINE (same as working search)
-        cat = await _scan_via_engine(title)
-        if cat is None or not cat.data:
-            # Fallback to raw scan
-            slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-            cat = await _scan_library(client, q.message.chat.id,
-                                        q.message.id, filter_slug=slug)
-
-        if cat is None or not cat.data:
+        # ⭐ USE ENGINE
+        files = await _engine_search(title)
+        if not files:
             try:
                 await client.edit_message_text(
                     chat_id=q.message.chat.id, message_id=q.message.id,
@@ -1294,7 +1136,6 @@ async def cb_pick_tmdb(client, q):
                         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
                         f"❌ <b>{fb('NOT IN YOUR DB')}</b>", DIV, "",
                         f"🎬 <b>{_esc(title)}</b>",
-                        f"📅 <code>{chosen.get('year') or '?'}</code>",
                         "", DIV2, "",
                         f"📌 {sc('not in your library')}",
                     ]),
@@ -1304,6 +1145,19 @@ async def cb_pick_tmdb(client, q):
                         [InlineKeyboardButton("◀️ MAIN", callback_data="ai:main"),
                          InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
                     ]),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            return
+
+        cat = SeriesCatalog()
+        for f in files:
+            cat.add_file(f)
+        if not cat.data:
+            try:
+                await client.edit_message_text(
+                    chat_id=q.message.chat.id, message_id=q.message.id,
+                    text="⚠️ ɴᴏ ꜱᴇʀɪᴇꜱ ꜰᴏᴜɴᴅ.",
+                    reply_markup=kb_back("ai:main"),
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
@@ -1352,10 +1206,8 @@ async def _show_series(client, chat_id, msg_id, slug, i, t):
         return
 
     prefs = await _get_prefs(slug)
-    text = _view_series_result(
-        {"title": series.get("title"), "seasons": series.get("seasons")},
-        prefs, i, t)
-    kb = kb_scan_result(slug, i, t)
+    text = _view_series_overview(series, prefs, i, t)
+    kb = kb_series_result(slug, i, t)
 
     sess["current_slug"] = slug
     sess["current_index"] = i
@@ -1387,10 +1239,10 @@ async def cb_next(client, q):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW / PREFS / COMPLETE / DELETE
+# ⭐ QUALITY GRID ⭐
 # ═══════════════════════════════════════════════════════════════════════════
-@Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
-async def cb_view(client, q):
+@Client.on_callback_query(filters.regex(r"^ai:grid:([a-z0-9_]+)$"), group=-430)
+async def cb_grid(client, q):
     try:
         slug = q.matches[0].group(1)
         s = _get_session(q.from_user.id)
@@ -1398,23 +1250,146 @@ async def cb_view(client, q):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
         if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        seasons = series.get("seasons") or {}
-        if not seasons: return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-        fs = sorted(seasons.keys())[0]
-        eps = seasons[fs]
-        fe = sorted([e for e in eps.keys() if e is not None])[0] \
-            if any(e is not None for e in eps.keys()) else None
-        if fe is None: return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
-        files = eps[fe]
-        for f in files: f["_score"] = _score(f)
         prefs = await _get_prefs(slug)
-        await _safe_edit(q,
-            _view_episode_files(series.get("title"), fs, fe, files, prefs),
-            kb_episode_files(slug, fs, fe, files))
+        text = _view_quality_grid(series, prefs)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
+             InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")],
+        ])
+        await _safe_edit(q, text, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] grid: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ EPISODE LIST (drill-down) ⭐
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(filters.regex(r"^ai:eps:([a-z0-9_]+)$"), group=-430)
+async def cb_eps(client, q):
+    try:
+        slug = q.matches[0].group(1)
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
+        seasons = series.get("seasons") or {}
+        if not seasons:
+            return await q.answer("⚠️ ɴᴏ ᴇᴘɪꜱᴏᴅᴇꜱ", show_alert=True)
+
+        # Show episode picker as buttons — one per episode (S..E..)
+        rows = []
+        for sn in sorted(seasons.keys()):
+            eps = seasons[sn]
+            for ep in sorted(eps.keys(), key=lambda e: (e is None, e or 0)):
+                qmap = eps[ep]
+                ep_label = f"S{sn:02d}E{ep:02d}" if ep is not None else f"S{sn:02d}"
+                # Status icon
+                if len(qmap) >= 2:
+                    icon = "🟢"
+                elif qmap:
+                    icon = "🟡"
+                else:
+                    icon = "🔴"
+                rows.append([InlineKeyboardButton(
+                    f"{icon} {ep_label} · {len(qmap)} ǫᴜᴀʟ",
+                    callback_data=f"ai:epq:{slug}:{sn}:"
+                                   f"{ep if ep is not None else 0}")])
+        rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:view:{slug}"),
+                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+
+        lines = [
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"📋 <b>{_esc(series.get('title'))}</b>",
+            DIV, "",
+            f"📌 {sc('tap an episode to view its qualities')}",
+            "",
+            f"🟢 = 2+ ǫᴜᴀʟɪᴛɪᴇꜱ · 🟡 = 1 ǫᴜᴀʟɪᴛʏ",
+        ]
+        await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] eps: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
+
+
+@Client.on_callback_query(
+    filters.regex(r"^ai:epq:([a-z0-9_]+):(\d+):(\d+)$"), group=-430)
+async def cb_epq(client, q):
+    """Show per-episode quality picker with delete buttons."""
+    try:
+        slug = q.matches[0].group(1)
+        season = int(q.matches[0].group(2))
+        ep_raw = int(q.matches[0].group(3))
+        episode = ep_raw if ep_raw > 0 else None
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+
+        eps = (series.get("seasons") or {}).get(season, {})
+        qmap = eps.get(episode, {})
+        if not qmap:
+            return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇꜱ ꜰᴏʀ ᴛʜɪꜱ ᴇᴘɪꜱᴏᴅᴇ",
+                                    show_alert=True)
+
+        prefs = await _get_prefs(slug)
+        text = _view_episode_quality_picker(series, season, episode, qmap, prefs)
+
+        # One button per quality to delete
+        rows = []
+        qs_sorted = sorted(qmap.keys(),
+                            key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
+        for i, q_key in enumerate(qs_sorted):
+            rows.append([InlineKeyboardButton(
+                f"🗑️ DELETE {q_key}",
+                callback_data=f"ai:del_pick:{slug}:{season}:"
+                               f"{episode if episode is not None else 0}:"
+                               f"{q_key}:{i}")])
+        rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"ai:eps:{slug}"),
+                     InlineKeyboardButton("❌ CLOSE", callback_data="ai:close")])
+
+        await _safe_edit(q, text, InlineKeyboardMarkup(rows))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[AI] epq: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW FILES (backwards-compat — jumps to grid)
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(filters.regex(r"^ai:view:([a-z0-9_]+)$"), group=-430)
+async def cb_view(client, q):
+    """Jump to quality grid."""
+    try:
+        slug = q.matches[0].group(1)
+        s = _get_session(q.from_user.id)
+        if not s or not s.get("catalog_data"):
+            return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
+        series = s["catalog_data"].get(slug)
+        if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
+        prefs = await _get_prefs(slug)
+        text = _view_series_overview(series, prefs,
+                                      s.get("current_index", 1),
+                                      s.get("current_total", 1))
+        kb = kb_series_result(slug, s.get("current_index", 1),
+                                s.get("current_total", 1))
+        await _safe_edit(q, text, kb)
         await q.answer()
     except Exception as e: logger.exception(f"[AI] view: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PREFS / COMPLETE / DELETE
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^ai:pref:([a-z0-9_]+)$"), group=-430)
 async def cb_pref(client, q):
     try:
@@ -1426,17 +1401,29 @@ async def cb_pref(client, q):
         if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
         avail = set()
         for _, eps in (series.get("seasons") or {}).items():
-            for _, files in eps.items():
-                for f in files:
-                    if f.get("quality"): avail.add(f["quality"])
+            for _, qmap in eps.items():
+                for q_key in qmap.keys():
+                    avail.add(q_key)
         al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
         if not al: return await q.answer("⚠️ ɴᴏ ǫᴜᴀʟɪᴛɪᴇꜱ", show_alert=True)
         cur = await _get_prefs(slug)
         s["pref_working"] = list(cur)
-        await _safe_edit(q, _view_quality_picker(series.get("title"), al, cur),
-                          kb_quality_picker(slug, al, cur))
+        await _safe_edit(q,
+            _view_quality_picker(series.get("title"), al, cur),
+            kb_quality_picker(slug, al, cur))
         await q.answer()
     except Exception as e: logger.exception(f"[AI] pref: {e}")
+
+
+def _view_quality_picker(title, avail, cur):
+    return "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🎯 <b>{fb('QUALITY PREFS')}</b>",
+        DIV, "",
+        f"🎬 <b>{_esc(title)}</b>", "",
+        f"📊 {sc('found')} · <code>{', '.join(avail) or 'none'}</code>",
+        f"✅ {sc('keeping')} · <code>{', '.join(cur) or 'none'}</code>",
+    ])
 
 
 @Client.on_callback_query(filters.regex(r"^ai:pref_tog:([a-z0-9_]+):(\w+)$"), group=-430)
@@ -1452,9 +1439,9 @@ async def cb_pref_tog(client, q):
         series = (s.get("catalog_data") or {}).get(slug) or {}
         avail = set()
         for _, eps in (series.get("seasons") or {}).items():
-            for _, files in eps.items():
-                for f in files:
-                    if f.get("quality"): avail.add(f["quality"])
+            for _, qmap in eps.items():
+                for q_key in qmap.keys():
+                    avail.add(q_key)
         al = sorted(avail, key=lambda x: QUALITY_RANK.get(x, 0), reverse=True)
         await _safe_edit(q, _view_quality_picker(series.get("title"), al, w),
                           kb_quality_picker(slug, al, w))
@@ -1474,12 +1461,9 @@ async def cb_pref_save(client, q):
         ok = await _set_prefs(slug, title, w)
         await q.answer("✅ ꜱᴀᴠᴇᴅ" if ok else "❌ ꜰᴀɪʟᴇᴅ")
         if not ok: return
-        await _safe_edit(q,
-            _view_series_result({"title": title, "seasons": series.get("seasons")},
-                                w, s.get("current_index", 1),
-                                s.get("current_total", 1)),
-            kb_scan_result(slug, s.get("current_index", 1),
-                            s.get("current_total", 1)))
+        await _show_series(client, q.message.chat.id, q.message.id, slug,
+                            s.get("current_index", 1),
+                            s.get("current_total", 1))
     except Exception as e: logger.exception(f"[AI] pref_save: {e}")
 
 
@@ -1538,10 +1522,12 @@ async def cb_all(client, q):
             status = await q.message.edit_text(_view_scanning(0, 0),
                                                 parse_mode=ParseMode.HTML)
         except Exception: status = q.message
-        cat = await _scan_library(client, q.message.chat.id, status.id)
-        if cat is None: return
+
+        titles = await _discover_all_series()
+        cat = await _build_catalog_from_titles(titles)
+        await _set_setting("total_series", len(cat.data))
+
         all_s = cat.list_series()
-        await _set_setting("total_series", len(all_s))
         if not all_s:
             try:
                 await client.edit_message_text(chat_id=q.message.chat.id,
@@ -1549,6 +1535,7 @@ async def cb_all(client, q):
                     parse_mode=ParseMode.HTML)
             except Exception: pass
             return
+
         sess = _SESSIONS.setdefault(q.from_user.id, {})
         sess["catalog_data"] = cat.data
         comp = {s.get("title_slug") for s in await _list_completed()}
@@ -1603,58 +1590,95 @@ async def cb_unmark(client, q):
     except Exception as e: logger.exception(f"[AI] unmark: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\d+)$"), group=-430)
+# ═══════════════════════════════════════════════════════════════════════════
+# DELETE FILE
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(
+    filters.regex(r"^ai:del_pick:([a-z0-9_]+):(\d+):(\d+):(\w+):(\d+)$"),
+    group=-430)
 async def cb_del_pick(client, q):
     try:
         slug = q.matches[0].group(1)
         sn = int(q.matches[0].group(2))
         ep_raw = int(q.matches[0].group(3))
-        idx = int(q.matches[0].group(4))
+        qual = q.matches[0].group(4)
+        idx = int(q.matches[0].group(5))
         ep = ep_raw if ep_raw > 0 else None
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
         if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        files = ((series.get("seasons") or {}).get(sn) or {}).get(ep, [])
-        if idx < 0 or idx >= len(files):
-            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        await _safe_edit(q,
-            _view_confirm_delete(series.get("title"), sn, ep, files[idx]),
-            kb_confirm_delete(slug, sn, ep, idx))
+        qmap = ((series.get("seasons") or {}).get(sn) or {}).get(ep, {})
+        f = qmap.get(qual)
+        if not f: return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
+                                          show_alert=True)
+        ep_label = f"S{sn:02d}" + (f"E{ep:02d}" if ep else "")
+        langs = "+".join(f.get("languages", [])) or "?"
+        size = _fmt_size(f.get("file_size", 0))
+        text = "\n".join([
+            f"⚠️ <b>{fb('CONFIRM DELETE')}</b>",
+            DIV, "",
+            f"🎬 <b>{_esc(series.get('title'))}</b> · <code>{ep_label}</code>",
+            f"🎯 {sc('quality')} · <code>{qual}</code>",
+            f"🌍 {sc('languages')} · <code>{langs}</code>",
+            f"📦 {sc('size')} · <code>{size}</code>",
+            "",
+            DIV2, "",
+            f"❗ <b>{sc('this cannot be undone')}</b>",
+        ])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ YES, DELETE",
+                callback_data=f"ai:del_go:{slug}:{sn}:"
+                               f"{ep if ep is not None else 0}:{qual}:{idx}")],
+            [InlineKeyboardButton("❌ CANCEL", callback_data=f"ai:epq:{slug}:{sn}:"
+                                                              f"{ep if ep is not None else 0}")],
+        ])
+        await _safe_edit(q, text, kb)
         await q.answer()
-    except Exception as e: logger.exception(f"[AI] del_pick: {e}")
+    except Exception as e:
+        logger.exception(f"[AI] del_pick: {e}")
 
 
-@Client.on_callback_query(filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\d+)$"), group=-430)
+@Client.on_callback_query(
+    filters.regex(r"^ai:del_go:([a-z0-9_]+):(\d+):(\d+):(\w+):(\d+)$"),
+    group=-430)
 async def cb_del_go(client, q):
     try:
         slug = q.matches[0].group(1)
         sn = int(q.matches[0].group(2))
         ep_raw = int(q.matches[0].group(3))
-        idx = int(q.matches[0].group(4))
+        qual = q.matches[0].group(4)
+        idx = int(q.matches[0].group(5))
         ep = ep_raw if ep_raw > 0 else None
         s = _get_session(q.from_user.id)
         if not s or not s.get("catalog_data"):
             return await q.answer("⏱️ ꜱᴇꜱꜱɪᴏɴ ᴇxᴘɪʀᴇᴅ", show_alert=True)
         series = s["catalog_data"].get(slug)
         if not series: return await q.answer("⚠️ ɴᴏᴛ ꜰᴏᴜɴᴅ", show_alert=True)
-        files = ((series.get("seasons") or {}).get(sn) or {}).get(ep, [])
-        if idx < 0 or idx >= len(files):
-            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ", show_alert=True)
-        fid = files[idx].get("file_id") or ""
+        qmap = ((series.get("seasons") or {}).get(sn) or {}).get(ep, {})
+        f = qmap.get(qual)
+        if not f: return await q.answer("⚠️ ǫᴜᴀʟɪᴛʏ ɴᴏᴛ ꜰᴏᴜɴᴅ",
+                                          show_alert=True)
+        fid = f.get("file_id") or ""
         if not fid: return await q.answer("⚠️ ɴᴏ ꜰɪʟᴇ ɪᴅ", show_alert=True)
         ok = await _delete_file_record(fid)
         if not ok: return await q.answer("❌ ᴅᴇʟᴇᴛᴇ ꜰᴀɪʟᴇᴅ", show_alert=True)
-        files.pop(idx)
-        s["catalog_data"][slug]["seasons"][sn][ep] = files
+
+        # Remove from catalog
+        del s["catalog_data"][slug]["seasons"][sn][ep][qual]
+        # Update file_count
+        s["catalog_data"][slug]["file_count"] = max(
+            0, s["catalog_data"][slug]["file_count"] - 1)
+
         await q.answer("🗑️ ᴅᴇʟᴇᴛᴇᴅ")
-        for f in files: f["_score"] = _score(f)
-        prefs = await _get_prefs(slug)
-        await _safe_edit(q,
-            _view_episode_files(series.get("title"), sn, ep, files, prefs),
-            kb_episode_files(slug, sn, ep, files))
-    except Exception as e: logger.exception(f"[AI] del_go: {e}")
+
+        # Re-render the episode quality picker
+        await cb_epq(client, q)
+    except Exception as e:
+        logger.exception(f"[AI] del_go: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1749,4 +1773,4 @@ async def _boot(client, message):
     except Exception as e: logger.warning(f"[AI] boot: {e}")
 
 
-logger.info("🎛️ AI LIBRARIAN v3 LOADED")
+logger.info("🎛️ AI LIBRARIAN v4 LOADED — same engine as series group")
